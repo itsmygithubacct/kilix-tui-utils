@@ -15,6 +15,7 @@ BIN="$PREFIX/bin"
 TOOLS=(
     "calculator:kilix-calculator"
     "cpu:kilix-cpu"
+    "temps:kilix-temps"
     "memory:kilix-memory"
     "disk:kilix-disk"
     "system:kilix-system"

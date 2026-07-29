@@ -1,10 +1,11 @@
-"""Every tool renders, handles input, and stays inside its surface.
+"""Every shared-core text tool renders, handles input, and stays in bounds.
 
 These are contract tests rather than deep per-tool tests: each tool must import
 without a terminal, render headlessly at an awkward size without raising, clip
 to its surface, and quit when told. That is what makes a tool safe to put behind
 a desktop menu, and it is the check most likely to catch a regression in the
-shared core.
+shared core. The framebuffer memory and temperature dashboards have dedicated
+suites because their renderer and event-loop contracts are deliberately richer.
 """
 import importlib.util
 import os
@@ -18,7 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from kilix_tui import app, keys as keymap, proc  # noqa: E402
 
 TOOLS = [
-    "calculator", "cpu", "memory", "disk", "system", "volume",
+    "calculator", "cpu", "disk", "system", "volume",
     "file", "package", "session_log", "weather", "music", "plebian_control",
     "rollout_resume", "switcher",
 ]

@@ -9,8 +9,11 @@ transcript — installs or updates the agents themselves.
 from __future__ import annotations
 
 import curses
+from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
+import shutil
 import sys
 
 sys.path.insert(0, os.path.join(
@@ -18,7 +21,10 @@ sys.path.insert(0, os.path.join(
     "src"))
 
 from kilix_tui import app, keys as keymap  # noqa: E402
-from kilix_rollout import config, launch, manage, menu, model, providers  # noqa: E402
+from kilix_rollout import (  # noqa: E402
+    claude, codex, config, kimi, launch, liveness, manage, menu, model, pacing,
+    providers,
+)
 from kilix_rollout.model import RANGES, Session  # noqa: E402
 
 VIEWS = ("candidates", "cut-off", "idle", "live", "all")
@@ -55,11 +61,17 @@ def visible(sessions: list[Session], view: str, agent: str) -> list[Session]:
 
 
 def resolve(sessions: list[Session], selector: str) -> Session:
-    """Find one session by ID or unique ID prefix."""
+    """Find one session by ID/prefix, transcript filename, or full path."""
     needle = selector.strip().casefold()
     if not needle:
         raise SystemExit("kilix-rollout-resume: a session ID is required")
-    matches = [item for item in sessions if item.session_id.casefold().startswith(needle)]
+    expanded = os.path.abspath(os.path.expanduser(selector)).casefold()
+    matches = [
+        item for item in sessions
+        if item.session_id.casefold().startswith(needle)
+        or os.path.basename(item.path).casefold() == needle
+        or os.path.abspath(item.path).casefold() == expanded
+    ]
     if len(matches) == 1:
         return matches[0]
     if not matches:
@@ -243,7 +255,13 @@ def _resume_tmux(state: State) -> bool:
         state.status = "Select a resumable session first."
         return True
     try:
-        name = launch.start_detached(chosen, yolo=state.yolo)
+        pacer = pacing.LaunchPacer(interval=config.launch_gap())
+        remaining = pacer.remaining()
+        if remaining:
+            state.status = (
+                f"Waiting {remaining:.0f}s for the shared rate-limit guard…")
+        name = launch.start_detached(
+            chosen, yolo=state.yolo, pacer=pacer)
     except RuntimeError as error:
         state.status = str(error)
         return True
@@ -372,13 +390,32 @@ def handle(key: int, state: State) -> bool:
 
 # ── command line ─────────────────────────────────────────────────────────────
 
+def _session_dict(item: Session) -> dict[str, object]:
+    try:
+        size = os.path.getsize(item.path)
+    except OSError:
+        size = 0
+    return {
+        "provider": item.provider,
+        "session_id": item.session_id,
+        "state": item.state,
+        "resumable": item.resumable,
+        "project": item.project,
+        "cwd": item.cwd,
+        "cwd_exists": bool(item.cwd and os.path.isdir(item.cwd)),
+        "title": item.title,
+        "updated": item.updated,
+        "updated_at": datetime.fromtimestamp(
+            item.updated, timezone.utc).isoformat(),
+        "path": item.path,
+        "size_bytes": size,
+        "live_pids": list(item.pids),
+    }
+
+
 def _print_sessions(sessions: list[Session], as_json: bool) -> None:
     if as_json:
-        print(json.dumps([{
-            "provider": item.provider, "session_id": item.session_id,
-            "state": item.state, "project": item.project, "cwd": item.cwd,
-            "title": item.title, "updated": item.updated, "path": item.path,
-        } for item in sessions], indent=2))
+        print(json.dumps([_session_dict(item) for item in sessions], indent=2))
         return
     if not sessions:
         print("(no saved sessions)")
@@ -388,6 +425,52 @@ def _print_sessions(sessions: list[Session], as_json: bool) -> None:
         print(f"{item.state.upper():<8}{item.provider:<7}{item.age():>4}  "
               f"{item.project[:16]:<16}  {item.short_id:<13}  "
               f"{item.title or '(no recorded prompt)'}")
+
+
+def _filter_sessions(
+    sessions: list[Session],
+    *,
+    state: str = "all",
+    query: str = "",
+) -> list[Session]:
+    if state not in VIEWS:
+        raise RuntimeError(
+            f"unknown state '{state}'; use " + ", ".join(VIEWS))
+    chosen = visible(sessions, state, "all")
+    needle = query.strip().casefold()
+    if not needle:
+        return chosen
+    return [
+        item for item in chosen
+        if needle in "\n".join((
+            item.provider, item.session_id, item.project, item.cwd,
+            item.title, item.path)).casefold()
+    ]
+
+
+def _cmd_show(item: Session, as_json: bool) -> int:
+    record = _session_dict(item)
+    if as_json:
+        print(json.dumps(record, indent=2))
+        return 0
+    fields = (
+        ("Agent", record["provider"]),
+        ("Session", record["session_id"]),
+        ("State", record["state"]),
+        ("Resumable", "yes" if record["resumable"] else "no"),
+        ("Updated", record["updated_at"]),
+        ("Project", record["project"]),
+        ("Working directory", record["cwd"] or "-"),
+        ("Directory exists", "yes" if record["cwd_exists"] else "no"),
+        ("Transcript", record["path"]),
+        ("Size", f"{record['size_bytes']} bytes"),
+        ("Live PIDs", ", ".join(map(str, record["live_pids"])) or "-"),
+        ("Conversation", record["title"] or "-"),
+    )
+    width = max(len(label) for label, _ in fields)
+    for label, value in fields:
+        print(f"{label.ljust(width)}  {value}")
+    return 0
 
 
 def _cmd_status(as_json: bool) -> int:
@@ -436,115 +519,452 @@ def _cmd_update(key: str) -> int:
     return manage.run_update(item)
 
 
-def _cmd_restore(sessions: list[Session], limit: int, gap: float,
-                 yolo: bool = False) -> int:
+def _cmd_restore(
+    sessions: list[Session],
+    limit: int,
+    gap: float,
+    yolo: bool = False,
+    *,
+    dry_run: bool = False,
+    as_json: bool = False,
+) -> int:
     chosen = [item for item in sessions if item.resumable][:limit]
     if not chosen:
-        print("(nothing to restore)")
+        print("[]" if as_json else "(nothing to restore)")
         return 0
     chosen.reverse()          # oldest first, so names follow the timeline
     span = gap * max(0, len(chosen) - 1)
-    print(f"Restoring {len(chosen)} session(s), {gap:.0f}s apart "
-          f"(about {span / 60:.0f}m total).")
-    if yolo:
-        print("  approval prompts disabled for every agent in this batch.")
-    results = launch.restore_all(chosen, gap=gap, yolo=yolo)
-    for result in results:
-        item = result["session"]
-        mark = "started" if result["ok"] else "failed "
-        print(f"  {mark} {item.provider:<7}{item.short_id}  {result['detail']}")
+    pacer = pacing.LaunchPacer(interval=gap)
+    if dry_run:
+        taken = launch.tmux_sessions()
+        plans = []
+        for index, item in enumerate(chosen):
+            plan = launch.resume_plan(
+                item, detached=True, yolo=yolo, taken=taken)
+            taken.add(str(plan["tmux_name"]))
+            plans.append({
+                "order": index + 1,
+                "wait_before": gap if index else round(pacer.remaining(), 3),
+                **plan,
+            })
+        if as_json:
+            print(json.dumps({"dry_run": True, "gap": gap, "plans": plans}, indent=2))
+        else:
+            print(f"Dry run: {len(plans)} session(s), {gap:.0f}s apart "
+                  f"(about {span / 60:.0f}m total).")
+            for plan in plans:
+                print(f"  {plan['order']:>2}. {plan['provider']:<7}"
+                      f"{str(plan['session_id'])[:13]} -> "
+                      f"{plan['tmux_name']}  {plan['command_text']}")
+        return 0
+    if not as_json:
+        print(f"Restoring {len(chosen)} session(s), {gap:.0f}s apart "
+              f"(about {span / 60:.0f}m total).")
+        if yolo:
+            print("  approval prompts disabled for every agent in this batch.")
+    announced: set[str] = set()
+
+    def report_wait(remaining: float, item: Session) -> None:
+        if item.session_id in announced:
+            return
+        announced.add(item.session_id)
+        print(f"  waiting {remaining:.0f}s before {item.provider} "
+              f"{item.short_id} (shared rate-limit guard)", file=sys.stderr)
+
+    results = launch.restore_all(
+        chosen, gap=gap, yolo=yolo, pacer=pacer, on_wait=report_wait)
+    if as_json:
+        print(json.dumps([{
+            "session": _session_dict(result["session"]),
+            "ok": result["ok"],
+            "detail": result["detail"],
+        } for result in results], indent=2))
+    else:
+        for result in results:
+            item = result["session"]
+            mark = "started" if result["ok"] else "failed "
+            print(f"  {mark} {item.provider:<7}{item.short_id}  {result['detail']}")
     return 0 if any(result["ok"] for result in results) else 1
+
+
+def _take_flag(arguments: list[str], *names: str) -> bool:
+    found = False
+    for name in names:
+        while name in arguments:
+            arguments.remove(name)
+            found = True
+    return found
+
+
+def _take_value(
+    arguments: list[str],
+    *names: str,
+    default=None,
+    convert=str,
+):
+    matches = [(arguments.index(name), name) for name in names if name in arguments]
+    if not matches:
+        return default
+    index, name = min(matches)
+    if index + 1 >= len(arguments):
+        raise RuntimeError(f"{name} requires a value")
+    raw = arguments[index + 1]
+    del arguments[index:index + 2]
+    try:
+        return convert(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"invalid value for {name}: {raw}") from None
+
+
+def _configured_program(value: str, label: str) -> str:
+    candidate = Path(value).expanduser()
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate.absolute())
+    found = shutil.which(value)
+    if found:
+        return str(Path(found).absolute())
+    raise RuntimeError(f"could not find {label}: {value}")
+
+
+def _cmd_configure(arguments: list[str], as_json: bool) -> int:
+    updates: dict[str, object] = {}
+    for key in ("tmux", "claude", "codex", "kimi"):
+        value = _take_value(arguments, f"--{key}", default="")
+        clear = _take_flag(arguments, f"--clear-{key}")
+        if value and clear:
+            raise RuntimeError(
+                f"--{key} and --clear-{key} cannot be used together")
+        if value:
+            updates[key] = _configured_program(value, key)
+        elif clear:
+            updates[key] = None
+    gap = _take_value(arguments, "--gap", "--interval", default=None, convert=float)
+    clear_gap = _take_flag(arguments, "--clear-gap", "--clear-interval")
+    if gap is not None and clear_gap:
+        raise RuntimeError("--gap and --clear-gap cannot be used together")
+    if gap is not None:
+        if gap < config.DEFAULT_GAP:
+            raise RuntimeError(
+                f"--gap must be at least {config.DEFAULT_GAP:.0f} seconds")
+        updates["gap"] = gap
+    elif clear_gap:
+        updates["gap"] = None
+    if arguments:
+        raise RuntimeError("unexpected configure argument(s): " + " ".join(arguments))
+
+    destination = config.config_path()
+    if updates:
+        config.write_config(updates)
+    settings = config.load_config()
+    payload = {"path": str(destination), "settings": settings}
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Configuration: {destination}")
+        if not settings:
+            print("(no overrides; PATH and the shared Kilix settings are used)")
+        for key in sorted(settings):
+            print(f"{key.ljust(7)}  {settings[key]}")
+    return 0
+
+
+def _doctor_rows() -> list[dict[str, object]]:
+    applications = Path(
+        os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))
+    ) / "applications"
+    binary = Path(
+        os.environ.get("XDG_BIN_HOME", str(Path.home() / ".local/bin"))
+    ) / "kilix-rollout-resume"
+    roots = (
+        ("Claude transcripts", Path(claude.home()) / "projects"),
+        ("Codex transcripts", Path(codex.home()) / "sessions"),
+        ("Kimi transcripts", Path(kimi.home()) / "sessions"),
+    )
+    rows: list[dict[str, object]] = [
+        {"check": label, "value": str(path), "ok": path.exists(),
+         "required": False}
+        for label, path in roots
+    ]
+    for item in providers.PROVIDERS:
+        path = config.resolve_program(item.key, item.command)
+        rows.append({
+            "check": item.label,
+            "value": path or config.configured_program(item.key, item.command),
+            "ok": bool(path),
+            "required": False,
+            "kind": "agent",
+        })
+    tmux = config.resolve_program("tmux", "tmux")
+    rows.extend((
+        {"check": "tmux", "value": tmux or config.configured_program("tmux", "tmux"),
+         "ok": bool(tmux), "required": True},
+        {"check": "installed command", "value": str(binary),
+         "ok": binary.exists() or binary.is_symlink(), "required": False},
+        {"check": "Kilix-95 entry",
+         "value": str(applications / "kilix-rollout-resume.desktop"),
+         "ok": (applications / "kilix-rollout-resume.desktop").is_file(),
+         "required": False},
+        {"check": "user configuration", "value": str(config.config_path()),
+         "ok": config.config_path().is_file(), "required": False},
+    ))
+    return rows
+
+
+def _cmd_doctor(as_json: bool) -> int:
+    rows = _doctor_rows()
+    if as_json:
+        print(json.dumps(rows, indent=2))
+    else:
+        width = max(len(str(row["check"])) for row in rows)
+        for row in rows:
+            marker = "ok" if row["ok"] else "MISSING"
+            print(f"{str(row['check']).ljust(width)}  {marker:7}  {row['value']}")
+    required_ok = all(row["ok"] for row in rows if row.get("required"))
+    any_agent = any(row["ok"] for row in rows if row.get("kind") == "agent")
+    return 0 if required_ok and any_agent else 1
+
+
+def _cmd_prune(as_json: bool) -> int:
+    directory = os.path.join(claude.home(), "sessions")
+    removed = liveness.prune_registry(directory)
+    if as_json:
+        print(json.dumps({"directory": directory, "removed": removed}, indent=2))
+    elif not removed:
+        print(f"No stale Claude registry entries in {directory}.")
+    else:
+        for item in removed:
+            print(f"removed PID {item['pid']}: {item['path']}")
+    return 0
+
+
+def _print_help() -> None:
+    print(__doc__.strip())
+    print(
+        "\nCommands:\n"
+        "  list|ls                 list saved sessions\n"
+        "  show <id>               show one session in detail\n"
+        "  resume <id>             hand this terminal to one agent\n"
+        "  restore [id ...]        restore several sessions in detached tmux\n"
+        "  doctor                  check transcripts, agents, tmux, and launchers\n"
+        "  configure               show or set agent/tmux paths and launch gap\n"
+        "  prune                   remove stale Claude live-session descriptors\n"
+        "  install|update <agent>  manage an agent; status reports all agents\n"
+        "  sync-menu               refresh Kilix-95 entries\n"
+        "\nSelection: --agent <name>, --since <90m|24h|7d>, --all-time, "
+        "--state <state>, --query <text>, --limit <n>\n"
+        "Resume:    --detached, --attach, --name <name>, --cwd <path>, "
+        "--dry-run, --force-live\n"
+        "Claude:    --fork, --permission-mode <mode>, --model <name>, "
+        "--prompt <text>\n"
+        "Safety:    --yolo, --no-yolo; JSON: --json\n"
+        "Agents:    " + ", ".join(item.key for item in providers.PROVIDERS)
+    )
 
 
 def main(argv: list[str]) -> int:
     arguments = list(argv)
-    as_json = "--json" in arguments
-    assume_yes = "--yes" in arguments
+    as_json = _take_flag(arguments, "--json")
+    assume_yes = _take_flag(arguments, "--yes", "-y")
     yolo = config.yolo_default()
-    if "--yolo" in arguments:
+    if _take_flag(arguments, "--yolo", "--dangerously-skip-permissions"):
         yolo = True
-    if "--no-yolo" in arguments:
+    if _take_flag(arguments, "--no-yolo"):
         yolo = False
-    arguments = [item for item in arguments
-                 if item not in ("--json", "--yes", "--yolo", "--no-yolo")]
 
-    agent_filter = None
-    if "--agent" in arguments:
-        index = arguments.index("--agent")
-        agent_filter = [arguments[index + 1]]
-        del arguments[index:index + 2]
-
+    agent = _take_value(arguments, "--agent", default="")
+    agent_filter = [agent] if agent and agent != "all" else None
     since = RANGES[model.DEFAULT_RANGE][1]
-    if "--all-time" in arguments:
+    if _take_flag(arguments, "--all-time"):
         since = 0.0
-        arguments.remove("--all-time")
-    if "--since" in arguments:
-        index = arguments.index("--since")
-        since = parse_duration(arguments[index + 1])
-        del arguments[index:index + 2]
+    since_text = _take_value(arguments, "--since", default="")
+    if since_text:
+        since = parse_duration(since_text)
 
-    command = arguments[0] if arguments else ""
-
+    command = arguments.pop(0) if arguments else ""
     if command in ("-h", "--help", "help"):
-        print(__doc__.strip())
-        print("\nCommands: list, resume <id>, restore, install <agent>, "
-              "update <agent>, status, sync-menu"
-              "\nOptions:  --agent <name>, --since <90m|24h|7d>, --all-time, "
-              "--yolo, --no-yolo, --json, --yes"
-              "\nAgents:   " + ", ".join(item.key for item in providers.PROVIDERS))
+        _print_help()
+        return 0
+    if command in ("--version", "version"):
+        version_file = Path(__file__).resolve().parents[2] / "VERSION"
+        version = version_file.read_text(encoding="utf-8").strip()
+        print(f"kilix-rollout-resume {version}")
         return 0
     if command == "status":
+        if arguments:
+            raise RuntimeError("status takes no positional arguments")
         return _cmd_status(as_json)
-    if command == "install":
-        if len(arguments) < 2:
-            print("usage: kilix-rollout-resume install <agent>", file=sys.stderr)
-            return 2
-        return _cmd_install(arguments[1], assume_yes)
-    if command == "update":
-        if len(arguments) < 2:
-            print("usage: kilix-rollout-resume update <agent>", file=sys.stderr)
-            return 2
-        return _cmd_update(arguments[1])
+    if command in ("install", "update"):
+        if len(arguments) != 1:
+            raise RuntimeError(
+                f"usage: kilix-rollout-resume {command} <agent>")
+        return (_cmd_install(arguments[0], assume_yes) if command == "install"
+                else _cmd_update(arguments[0]))
     if command == "sync-menu":
+        if arguments:
+            raise RuntimeError("sync-menu takes no positional arguments")
         result = menu.sync(providers.PROVIDERS)
-        for path in result["written"]:
-            print(f"wrote   {path}")
-        for path in result["removed"]:
-            print(f"removed {path}")
+        if as_json:
+            print(json.dumps(result, indent=2))
+        else:
+            for path in result["written"]:
+                print(f"wrote   {path}")
+            for path in result["removed"]:
+                print(f"removed {path}")
         return 0
+    if command == "configure":
+        return _cmd_configure(arguments, as_json)
+    if command == "doctor":
+        if arguments:
+            raise RuntimeError("doctor takes no positional arguments")
+        return _cmd_doctor(as_json)
+    if command == "prune":
+        if arguments:
+            raise RuntimeError("prune takes no positional arguments")
+        return _cmd_prune(as_json)
 
     sessions = providers.discover(agent_filter, since=since)
 
-    if command == "list":
-        _print_sessions(sessions, as_json)
+    if command in ("list", "ls"):
+        state = _take_value(arguments, "--state", default="all")
+        query = _take_value(arguments, "--query", "-q", default="")
+        limit = _take_value(arguments, "--limit", default=100, convert=int)
+        if limit < 1:
+            raise RuntimeError("--limit must be greater than zero")
+        if arguments:
+            raise RuntimeError("unexpected list argument(s): " + " ".join(arguments))
+        _print_sessions(
+            _filter_sessions(sessions, state=state, query=query)[:limit], as_json)
         return 0
+    if command == "show":
+        if len(arguments) != 1:
+            raise RuntimeError("usage: kilix-rollout-resume show <session-id>")
+        return _cmd_show(resolve(sessions, arguments[0]), as_json)
     if command == "resume":
-        if len(arguments) < 2:
-            print("usage: kilix-rollout-resume resume <session-id>", file=sys.stderr)
-            return 2
-        chosen = resolve(sessions, arguments[1])
-        if chosen.state == "live":
-            print(f"kilix-rollout-resume: that session is still running "
-                  f"(PID {', '.join(str(pid) for pid in chosen.pids)})", file=sys.stderr)
-            return 4
+        detached = _take_flag(arguments, "--detached", "--tmux-session")
+        attach = _take_flag(arguments, "--attach")
+        dry_run = _take_flag(arguments, "--dry-run")
+        force_live = _take_flag(arguments, "--force-live")
+        fork = _take_flag(arguments, "--fork")
+        name = _take_value(arguments, "--name", default="")
+        cwd = _take_value(arguments, "--cwd", default="")
+        permission_mode = _take_value(
+            arguments, "--permission-mode", default="")
+        agent_model = _take_value(arguments, "--model", default="")
+        prompt = _take_value(arguments, "--prompt", default="")
+        gap = _take_value(
+            arguments, "--gap", "--interval", default=config.launch_gap(),
+            convert=float)
+        if gap < pacing.MINIMUM_INTERVAL:
+            raise RuntimeError(
+                f"--gap must be at least {pacing.MINIMUM_INTERVAL:.0f} seconds")
+        executable_options = {
+            key: _take_value(arguments, f"--{key}", default="")
+            for key in ("claude", "codex", "kimi")
+        }
+        if len(arguments) != 1:
+            raise RuntimeError("usage: kilix-rollout-resume resume <session-id>")
+        chosen = resolve(sessions, arguments[0])
+        wrong = [key for key, value in executable_options.items()
+                 if value and key != chosen.provider]
+        if wrong:
+            raise RuntimeError(
+                f"--{wrong[0]} does not apply to a {chosen.provider} session")
+        executable = executable_options[chosen.provider]
+        if executable:
+            executable = _configured_program(executable, chosen.provider)
+        detached = detached or attach or bool(name)
+        if attach and as_json:
+            raise RuntimeError("--attach and --json cannot be used together")
+        if as_json and not (detached or dry_run):
+            raise RuntimeError(
+                "--json with a direct handover requires --dry-run or --detached")
+        plan = launch.resume_plan(
+            chosen, detached=detached, name=name, cwd=cwd, yolo=yolo,
+            executable=executable, force_live=force_live, fork=fork,
+            permission_mode=permission_mode, model=agent_model, prompt=prompt)
+        if dry_run:
+            wait = (pacing.LaunchPacer(interval=gap).remaining()
+                    if detached else 0.0)
+            payload = {
+                "dry_run": True,
+                "wait_seconds": round(wait, 3),
+                "gap": gap,
+                **plan,
+            }
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"Session : {plan['session_id']}")
+                print(f"mode    : {'detached tmux' if detached else 'current terminal'}")
+                if detached:
+                    print(f"tmux    : {plan['tmux_name']}")
+                print(f"cwd     : {plan['cwd']}")
+                print(f"command : {plan['command_text']}")
+            return 0
+        if detached:
+            pacer = pacing.LaunchPacer(interval=gap)
+            announced = False
+
+            def report_wait(remaining: float, _interval: float) -> None:
+                nonlocal announced
+                if not announced:
+                    print(f"kilix-rollout-resume: waiting {remaining:.0f}s "
+                          "for the shared rate-limit guard", file=sys.stderr)
+                    announced = True
+
+            created = launch.start_detached(
+                chosen, name=name, cwd=cwd, yolo=yolo, executable=executable,
+                force_live=force_live, fork=fork,
+                permission_mode=permission_mode, model=agent_model,
+                prompt=prompt, pacer=pacer, on_wait=report_wait)
+            if as_json:
+                print(json.dumps({"created": True, **plan}, indent=2))
+            else:
+                print(f"Resumed {chosen.short_id} as tmux session "
+                      f"'{created}' in {plan['cwd']}")
+            if attach:
+                if not sys.stdin.isatty() or not sys.stdout.isatty():
+                    raise RuntimeError("attaching requires an interactive terminal")
+                launch.attach(created)
+            return 0
         if yolo:
             print("kilix-rollout-resume: resuming with "
                   f"{config.yolo_flag(chosen.provider)}", file=sys.stderr)
-        launch.hand_over(chosen, yolo=yolo)
+        launch.hand_over(
+            chosen, cwd=cwd, yolo=yolo, executable=executable,
+            force_live=force_live, fork=fork, permission_mode=permission_mode,
+            model=agent_model, prompt=prompt)
         return 0
     if command == "restore":
-        limit = 10
-        if "--limit" in arguments:
-            limit = int(arguments[arguments.index("--limit") + 1])
-        gap = launch.LAUNCH_GAP
-        if "--gap" in arguments:
-            gap = float(arguments[arguments.index("--gap") + 1])
-        return _cmd_restore(sessions, limit, gap, yolo)
-    if command:
+        dry_run = _take_flag(arguments, "--dry-run")
+        state = _take_value(arguments, "--state", default="candidates")
+        query = _take_value(arguments, "--query", "-q", default="")
+        limit = _take_value(arguments, "--limit", default=10, convert=int)
+        gap = _take_value(
+            arguments, "--gap", "--interval", default=config.launch_gap(),
+            convert=float)
+        if limit < 1:
+            raise RuntimeError("--limit must be greater than zero")
+        if gap < pacing.MINIMUM_INTERVAL:
+            raise RuntimeError(
+                f"--gap must be at least {pacing.MINIMUM_INTERVAL:.0f} seconds")
+        if arguments:
+            selected = []
+            seen = set()
+            for selector in arguments:
+                item = resolve(sessions, selector)
+                if item.session_id not in seen:
+                    selected.append(item)
+                    seen.add(item.session_id)
+        else:
+            selected = _filter_sessions(sessions, state=state, query=query)
+        return _cmd_restore(
+            selected, limit, gap, yolo, dry_run=dry_run, as_json=as_json)
+    if command and command != "tui":
         print(f"kilix-rollout-resume: unknown command '{command}'", file=sys.stderr)
         return 2
 
-    if not sys.stdout.isatty():
+    if command != "tui" and not sys.stdout.isatty():
         _print_sessions(sessions, as_json)
         return 0
 

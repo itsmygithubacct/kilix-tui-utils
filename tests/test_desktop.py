@@ -186,6 +186,15 @@ class ResolutionTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertTrue(plan.argv[1].endswith("tools/calculator/main.py"))
 
+    def test_temperatures_resolve_from_the_unified_checkout(self):
+        item = next(
+            item for item in registry.MACHINE if item.label == "Temperatures"
+        )
+        with mock.patch.object(registry.shutil, "which", return_value=None):
+            plan = registry.resolve(item)
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan.argv[1].endswith("tools/temps/main.py"))
+
     def test_kilix_subcommand_is_the_last_resort(self):
         item = registry.Item("x", command="kilix-bonsai", kilix=("bonsai",))
         with mock.patch.object(registry.shutil, "which", return_value=None), \

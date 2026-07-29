@@ -107,3 +107,51 @@ def registry_owners(directory: str, *, proc_root: str = "/proc") -> dict[str, tu
             continue
         owners.setdefault(session_id.lower(), set()).add(pid)
     return {key: tuple(sorted(pids)) for key, pids in owners.items()}
+
+
+def prune_registry(directory: str, *, proc_root: str = "/proc") -> list[dict[str, object]]:
+    """Remove stale, structurally valid Claude registry descriptors.
+
+    Malformed JSON is left alone for diagnosis.  A parsed descriptor is stale
+    when its PID is gone, was recycled, or no longer matches its recorded
+    process start time.
+    """
+    removed: list[dict[str, object]] = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return removed
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        session_id = record.get("sessionId")
+        try:
+            pid = int(record.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(session_id, str) or not session_id or pid <= 0:
+            continue
+        actual = start_ticks(pid, proc_root=proc_root)
+        recorded = record.get("procStart")
+        live = actual is not None and (
+            recorded is None or str(recorded) == actual)
+        if live:
+            continue
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append({
+            "path": path,
+            "pid": pid,
+            "session_id": session_id.lower(),
+        })
+    return removed

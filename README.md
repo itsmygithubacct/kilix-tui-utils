@@ -13,7 +13,7 @@ collapses that into a single component the coordinated release pins once.
 |---|---|
 | `plebian-os` | OS control: status, update, kiosk/autologin, **power**, health |
 | `kilix-cpu` | Load, per-core use, frequency, heaviest processes |
-| `kilix-memory` | RAM, swap, pressure, heaviest processes |
+| `kilix-memory` | Live RAM, swap, pressure, paging, and process-memory [dashboard](tools/memory/README.md) |
 | `kilix-disk` | Filesystem usage and an interruptible directory scan |
 | `kilix-system` | Static machine facts (`--print` for plain output) |
 | `kilix-volume` | Output volume and sink selection |
@@ -25,7 +25,7 @@ collapses that into a single component the coordinated release pins once.
 | `kilix-weather` | Forecast from Open-Meteo |
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
 | `kilix-music` | Player driving kilix-amp over its control socket |
-| `kilix-temps` | Thermal dashboard *(moving in from its own repo)* |
+| `kilix-temps` | Live temperature, fan, and thermal-headroom [dashboard](tools/temps/README.md) |
 | `kilix-tui` | **The text-native desktop** — see below |
 
 ## The desktop: `kilix-tui`
@@ -65,6 +65,11 @@ KILIX_TUI_UTILS_PREFIX=/usr/local ./install.sh
 
 Each command is a small launcher that runs the tool from this checkout, so
 updating is `git pull` rather than a reinstall.
+
+The pixel interfaces use sibling checkouts of `kitty-frame-presenter`,
+`soft-raster-py`, and `soft-raster`, or normally installed copies of those
+libraries. Their text fallbacks remain available when the graphical
+dependencies are absent.
 
 ## Design
 
@@ -106,7 +111,7 @@ what makes the look testable at all, since its fills are spaces.
 **Two rendering idioms.** Text/curses for anything that is a list you act on, so
 it works over SSH and inside `tmux`. Framebuffer over the Kitty graphics
 protocol for anything whose value is a time series or a shape. `kilix-temps`
-is the framebuffer case and arrives with the move.
+and `kilix-memory` are the framebuffer cases.
 
 ## Going to a page or a pane
 
@@ -188,11 +193,28 @@ done from inside the tool.
 
 ```sh
 kilix-rollout-resume                     # the picker
-kilix-rollout-resume list --since 24h
+kilix-rollout-resume list --since 24h --state candidates --query gpu_terminal
+kilix-rollout-resume show 019faaad       # transcript, cwd, size, state, live PIDs
 kilix-rollout-resume resume 019faaad     # hand this terminal to the agent
+kilix-rollout-resume resume 019faaad --detached --name repair --dry-run
 kilix-rollout-resume restore --limit 5   # several, into detached tmux sessions
+kilix-rollout-resume restore --limit 5 --dry-run --json
+kilix-rollout-resume doctor
+kilix-rollout-resume prune               # stale Claude process descriptors
 kilix-rollout-resume status
 ```
+
+The former Claude-only and Codex-only recovery tools are folded into this
+command. Their useful CLI features remain: named or attached tmux resumes,
+working-directory overrides, live-owner overrides, exact dry-run/JSON plans,
+per-user executable paths, and diagnostics. Claude resumes also accept
+`--fork`, `--permission-mode`, `--model`, and `--prompt`. Configure persistent
+overrides with, for example,
+`kilix-rollout-resume configure --tmux /usr/bin/tmux --gap 45`; the mode-0600
+file is shown by `configure`. Existing standalone Claude/Codex executable and
+launch-interval settings are read as migration fallbacks. The old `tb`
+configuration is intentionally not inherited because the unified tool uses
+tmux directly and does not need the provider-specific logging adapter.
 
 ## Safety properties, enforced by tests
 

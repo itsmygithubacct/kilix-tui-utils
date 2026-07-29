@@ -57,7 +57,8 @@ PROGRAMS = (
 MACHINE = (
     Item("CPU", command="kilix-cpu", sibling="cpu"),
     Item("Memory", command="kilix-memory", sibling="memory"),
-    Item("Temperatures", command="kilix-temps", kilix=("temps",), verb="tab"),
+    Item("Temperatures", command="kilix-temps", sibling="temps",
+         kilix=("temps",), verb="tab"),
     Item("Disk", command="kilix-disk", sibling="disk"),
     Item("System facts", command="kilix-system", sibling="system"),
     Item("Volume", command="kilix-volume", sibling="volume"),

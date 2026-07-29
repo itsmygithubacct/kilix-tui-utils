@@ -8,7 +8,9 @@ into a shell without a yes, and the install commands it would run are exactly
 the ones its vendors document.
 """
 import ast
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -19,7 +21,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_rollout import claude, codex, kimi, launch, manage, menu, providers  # noqa: E402
+from kilix_rollout import (  # noqa: E402
+    claude, codex, config, kimi, launch, liveness, manage, menu, pacing,
+    providers,
+)
 from kilix_rollout.model import Session  # noqa: E402
 
 CLAUDE_ID = "11111111-1111-4111-8111-111111111111"
@@ -309,6 +314,42 @@ class ResumeTests(unittest.TestCase):
             self.assertNotIn("--yolo", argv)
             self.assertNotIn("--dangerously-skip-permissions", argv)
 
+    def test_claude_resume_options_from_the_standalone_tool_are_preserved(self):
+        argv = launch.resume_command(
+            sample("claude"), yolo=True, fork=True,
+            permission_mode="plan", model="opus", prompt="continue carefully")
+        self.assertEqual(argv[:3], ["claude", "--resume", "abc123"])
+        self.assertIn("--fork-session", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertEqual(argv[-5:],
+                         ["--permission-mode", "plan", "--model", "opus",
+                          "continue carefully"])
+
+    def test_claude_only_options_are_rejected_for_other_agents(self):
+        with self.assertRaises(RuntimeError):
+            launch.resume_command(sample("codex"), fork=True)
+
+    def test_dry_run_plan_names_tmux_without_creating_it(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            import subprocess
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, "", "no server")
+
+        original = manage.installed
+        manage.installed = lambda item: "/usr/bin/" + item.command
+        try:
+            plan = launch.resume_plan(
+                sample("codex"), detached=True, name="one.project",
+                runner=runner)
+        finally:
+            manage.installed = original
+        self.assertEqual(plan["tmux_name"], "one_project")
+        self.assertEqual(plan["command"], ["codex", "resume", "abc123"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["tmux", "list-sessions"])
+
     def test_a_detached_launch_carries_the_flag_too(self):
         argv = launch.tmux_argv(sample("kimi", cwd="/tmp"), "name", yolo=True)
         self.assertEqual(argv[0], "tmux")
@@ -484,6 +525,122 @@ class YoloSettingTests(unittest.TestCase):
             self.assertFalse(state.yolo)
         finally:
             tool._ask = saved
+
+
+class PortedFeatureTests(unittest.TestCase):
+    def test_private_unified_configuration_merges_updates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "settings" / "config.json"
+            config.write_config({"claude": "/bin/sh", "gap": 45.0}, path=path)
+            config.write_config({"codex": "/bin/true", "claude": None}, path=path)
+            self.assertEqual(
+                config.load_config(path),
+                {"codex": "/bin/true", "gap": 45.0})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_legacy_agent_and_interval_settings_are_migration_fallbacks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_path = root / "claude.json"
+            codex_path = root / "codex.json"
+            unified_path = root / "unified.json"
+            claude_path.write_text(
+                '{"claude": "/bin/sh", "interval": 60, "tb": "/old/tb"}\n')
+            codex_path.write_text('{"codex": "/bin/true", "tb": "/old/tb"}\n')
+            saved_legacy = config._legacy_paths
+            saved_path = config.config_path
+            config._legacy_paths = lambda: (claude_path, codex_path)
+            config.config_path = lambda: unified_path
+            try:
+                settings = config.load_config()
+            finally:
+                config._legacy_paths = saved_legacy
+                config.config_path = saved_path
+            self.assertEqual(settings["claude"], "/bin/sh")
+            self.assertEqual(settings["codex"], "/bin/true")
+            self.assertEqual(settings["gap"], 60.0)
+            self.assertNotIn("tb", settings)
+
+    def test_prune_removes_only_stale_valid_claude_descriptors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = root / "sessions"
+            proc = root / "proc"
+            registry.mkdir()
+            live_proc = proc / "42"
+            live_proc.mkdir(parents=True)
+            fields = ["42", "(claude test)", "S"] + [
+                str(number) for number in range(4, 53)]
+            fields[21] = "999"
+            (live_proc / "stat").write_text(" ".join(fields) + "\n")
+            (registry / "42.json").write_text(json.dumps({
+                "pid": 42, "sessionId": CLAUDE_ID, "procStart": "999"}))
+            (registry / "43.json").write_text(json.dumps({
+                "pid": 43, "sessionId": CODEX_ID, "procStart": "1000"}))
+            (registry / "broken.json").write_text("{")
+
+            removed = liveness.prune_registry(
+                str(registry), proc_root=str(proc))
+            self.assertEqual([row["pid"] for row in removed], [43])
+            self.assertTrue((registry / "42.json").exists())
+            self.assertTrue((registry / "broken.json").exists())
+            self.assertFalse((registry / "43.json").exists())
+
+    def test_cli_filters_and_detached_dry_run_are_machine_readable(self):
+        tool = load_tool()
+        session = sample("codex")
+        session.session_id = CODEX_ID
+        session.title = "Port this feature"
+        original_discover = tool.providers.discover
+        original_installed = manage.installed
+        original_tmux = launch.tmux_sessions
+        tool.providers.discover = lambda *args, **kwargs: [session]
+        manage.installed = lambda item: "/usr/bin/" + item.command
+        launch.tmux_sessions = lambda **kwargs: set()
+        output = io.StringIO()
+        try:
+            with redirect_stdout(output):
+                code = tool.main([
+                    "resume", CODEX_ID[:8], "--detached", "--dry-run",
+                    "--name", "port.test", "--json"])
+        finally:
+            tool.providers.discover = original_discover
+            manage.installed = original_installed
+            launch.tmux_sessions = original_tmux
+        payload = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["tmux_name"], "port_test")
+        self.assertEqual(payload["command"][:2], ["codex", "resume"])
+
+    def test_launch_pacing_survives_separate_invocations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            now = [100.0]
+            waits = []
+
+            def sleep(seconds):
+                waits.append(seconds)
+                now[0] += seconds
+
+            pacer = pacing.LaunchPacer(
+                interval=30.0,
+                state_file=root / "launches.json",
+                lock_file=root / "launches.lock",
+                clock=lambda: now[0],
+                sleeper=sleep,
+            )
+            with pacer.slot("first"):
+                pass
+            with pacer.slot("second"):
+                pass
+            record = pacing.read_launch_record(root / "launches.json")
+            self.assertAlmostEqual(sum(waits), 30.0)
+            self.assertEqual(record.session_id, "second")
+            self.assertEqual(record.count, 2)
+            self.assertEqual((root / "launches.json").stat().st_mode & 0o777,
+                             0o600)
 
 
 class MenuTests(unittest.TestCase):

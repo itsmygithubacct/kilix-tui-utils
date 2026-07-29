@@ -12,15 +12,15 @@ script, so the agent stays in charge of how it upgrades itself.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 
+from . import config
 from .providers import Provider
 
 
 def installed(item: Provider) -> str:
     """Return the resolved path to the agent's command, or an empty string."""
-    return shutil.which(item.command) or ""
+    return config.resolve_program(item.key, item.command)
 
 
 def version(item: Provider, *, runner=subprocess.run) -> str:
@@ -28,7 +28,7 @@ def version(item: Provider, *, runner=subprocess.run) -> str:
     if not installed(item):
         return ""
     try:
-        result = runner([item.command, "--version"], capture_output=True,
+        result = runner([installed(item), "--version"], capture_output=True,
                         text=True, timeout=20, check=False)
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -68,7 +68,9 @@ def run_update(item: Provider, *, runner=subprocess.run) -> int:
     if not installed(item):
         raise RuntimeError(f"{item.label} is not installed")
     try:
-        result = runner(list(item.update_argv), check=False)
+        argv = list(item.update_argv)
+        argv[0] = installed(item)
+        result = runner(argv, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError(f"could not run the updater: {error}") from error
     return int(result.returncode)
@@ -82,7 +84,7 @@ def status(providers) -> list[dict[str, object]]:
         rows.append({
             "key": item.key,
             "label": item.label,
-            "command": item.command,
+            "command": config.configured_program(item.key, item.command),
             "installed": bool(path),
             "path": path,
         })
