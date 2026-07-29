@@ -21,6 +21,7 @@ collapses that into a single component the coordinated release pins once.
 | `kilix-package` | Installed packages, read-only |
 | `kilix-rollout-resume` | Recover Claude Code, Codex, and Kimi Code sessions; install and update those agents |
 | `kilix-session-log` | Pane transcripts across the live and archived tiers |
+| `kilix-switch` | Go to any page or pane, with a live look at what each one is showing |
 | `kilix-weather` | Forecast from Open-Meteo |
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
 | `kilix-music` | Player driving kilix-amp over its control socket |
@@ -52,11 +53,55 @@ next tool gets it free.
   tools still work over SSH or from a bare checkout.
 - `proc.py` — `/proc` and `/sys` readers shared by the monitors, so they agree
   on what a number means. Readers never raise on a missing path.
+- `kitty_rc.py` — the authenticated client for the terminal's own remote
+  control. It is a convenience, never a privilege: Kilix scopes the credential
+  it hands each pane at the terminal, so a tool asking for anything outside
+  that set is refused even though it holds the credential.
+- `panel.py` / `chrome.py` — an optional second look, described below.
+
+**An optional second look.** `theme.py` carries a second palette — flat colour
+blocks on black, no white, no grey, no borders — and `panel.py` draws in it:
+blocks, elbows, segmented bars, pill buttons, and the numeric identifiers that
+give the layout its texture. `chrome.Page` composes them into a spine on the
+left, a title upper right, and a content well a tool draws into, so a tool that
+opts in gets the whole look for the price of naming its sections.
+
+Two rules keep it from costing anything. Colour is never the only carrier of
+information — the selected row has a `▶`, not just a different background — and
+the whole layer is an *attribute* over unchanged text, so a 16-colour terminal
+or an `ssh` session renders exactly the same characters without it. When the
+surface gets too small to afford a spine, the spine is dropped whole rather than
+squeezed. `KILIX_PANEL=0` turns it off; `KILIX_PANEL=1` forces it on, which is
+what makes the look testable at all, since its fills are spaces.
 
 **Two rendering idioms.** Text/curses for anything that is a list you act on, so
 it works over SSH and inside `tmux`. Framebuffer over the Kitty graphics
 protocol for anything whose value is a time series or a shape. `kilix-temps`
 is the framebuffer case and arrives with the move.
+
+## Going to a page or a pane
+
+`kilix-switch` replaces the terminal's two built-in choosers, which were the
+same thing twice: a numbered list of titles, one for pages and one for panes. A
+title is a poor handle on a pane — several are `bash` and several more are
+whatever directory they started in — so the list told you least exactly when you
+had enough windows to need it.
+
+It shows one tree of pages and their panes, with the process and working
+directory that actually identify a pane, a filter (`/`) across all of it, and a
+live view of what the highlighted pane is currently showing. `Tab` cycles the
+scope between everything, this page, and everywhere else; Kilix binds `F12` to
+open on everything and its tmux-style leader `q` to open on this page.
+
+"This page" means the page the tool is *running* on, resolved from its own
+`KITTY_WINDOW_ID`, not whichever page the terminal currently considers active —
+an overlay takes the focus the moment it opens, so the two are rarely the same
+question.
+
+Renaming and closing are here because a chooser that can see everything and
+change nothing sends you somewhere else to finish the job. Closing always asks
+first, and both go through the terminal's remote control, which refuses them
+outright unless Kilix's scoped credential has been widened to allow them.
 
 ## Recovering coding sessions
 

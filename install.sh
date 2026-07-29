@@ -23,6 +23,7 @@ TOOLS=(
     "package:kilix-package"
     "rollout_resume:kilix-rollout-resume"
     "session_log:kilix-session-log"
+    "switcher:kilix-switch"
     "weather:kilix-weather"
     "music:kilix-music"
     "plebian_control:plebian-os"

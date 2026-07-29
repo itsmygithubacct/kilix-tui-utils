@@ -32,26 +32,60 @@ class TextSurface:
 
     Rendering into this instead of a real terminal is what lets every tool be
     asserted on as plain text.
+
+    It also records the attribute each cell was written with. Plain text is
+    still what `str()` returns and what every existing test compares, but a
+    tool whose layout is made of coloured fills draws mostly spaces — without
+    keeping the attributes there would be nothing headless to assert its shape
+    against. See `attr_shape()`.
     """
 
     height: int = 24
     width: int = 80
     lines: list[str] = field(default_factory=list)
+    attrs: list[list[int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.lines:
             self.lines = [" " * self.width for _ in range(self.height)]
+        if not self.attrs:
+            self.attrs = [[0] * self.width for _ in range(self.height)]
 
     def addstr(self, y: int, x: int, text: str, attr: int = 0) -> None:
-        del attr
         if not (0 <= y < self.height):
             return
         row = self.lines[y]
         text = text[: max(0, self.width - x)]
         self.lines[y] = (row[:x] + text + row[x + len(text):])[: self.width]
+        for offset in range(len(text)):
+            column = x + offset
+            if 0 <= column < self.width:
+                self.attrs[y][column] = attr
 
     def getmaxyx(self) -> tuple[int, int]:
         return self.height, self.width
+
+    def attr_shape(self, legend: dict[int, str] | None = None) -> str:
+        """The surface as one character per cell, keyed by attribute.
+
+        Unstyled cells are spaces; every distinct attribute gets its own
+        character, so a block, an elbow or a spine can be asserted on as a
+        picture rather than as a list of coordinates.
+        """
+        seen: dict[int, str] = dict(legend or {})
+        alphabet = "#=+*o.:~^%$&@!?"
+        out = []
+        for row in self.attrs:
+            line = []
+            for value in row:
+                if not value:
+                    line.append(" ")
+                    continue
+                if value not in seen:
+                    seen[value] = alphabet[len(seen) % len(alphabet)]
+                line.append(seen[value])
+            out.append("".join(line).rstrip())
+        return "\n".join(out).rstrip("\n")
 
     def __str__(self) -> str:
         return "\n".join(line.rstrip() for line in self.lines).rstrip("\n")
@@ -104,7 +138,12 @@ def run(
                 return 0
 
     if os.environ.get("KILIX_TUI_HEADLESS") == "1":
-        print(render_to_text(render, state))
+        # Size to the real terminal rather than the 24x80 the test helper
+        # assumes: a headless run is how a tool gets looked at, and looking at
+        # a wide layout squeezed into 80 columns misrepresents it.
+        import shutil
+        columns, rows = shutil.get_terminal_size(fallback=(80, 24))
+        print(render_to_text(render, state, height=rows, width=columns))
         return 0
     return curses.wrapper(_loop)
 
