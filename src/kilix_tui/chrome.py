@@ -172,12 +172,18 @@ class Page:
             if block_height < 2:
                 break
             colour = theme.PANEL_CYCLE[index % len(theme.PANEL_CYCLE)]
+            is_active = index == active
+            # The active section must be readable without the palette. Swapping
+            # its fill to the primary colour is the whole point of the look, but
+            # colour alone would leave a 16-colour terminal — or anyone who
+            # cannot distinguish these hues — unable to tell which scope is on.
+            text = f"▶{label}" if is_active else f" {label}"
             panel.block(
                 surface, row, 0, block_height, self.spine_width, colour,
-                label=label[: self.spine_width - 2],
+                label=text[: self.spine_width - 2],
                 ident=panel.ident(self.seed, index + 2),
                 round_corners=("tl", "bl"),
-                active=index == active,
+                active=is_active,
             )
             row += block_height + 1
         # Whatever is left of the spine becomes texture rather than a gap.

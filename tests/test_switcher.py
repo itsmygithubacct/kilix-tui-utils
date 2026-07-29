@@ -446,6 +446,19 @@ class PanelTests(unittest.TestCase):
         self.assertTrue(all(not value for row in surface.attrs for value in row))
         self.assertIn("AB", surface.lines[1], "the text must survive anyway")
 
+    def test_the_active_spine_section_is_marked_in_text(self):
+        # Without the palette the fill swap is invisible, so which scope is on
+        # has to survive as a character.
+        os.environ["KILIX_PANEL"] = "0"
+        theme.reset_panel_pairs()
+        page = chrome.Page("T", ["ONE", "TWO", "THREE"])
+        surface = app.TextSurface(height=24, width=100)
+        page.render(surface, 1)
+        text = str(surface)
+        self.assertIn("▶TWO", text)
+        self.assertNotIn("▶ONE", text)
+        self.assertNotIn("▶THREE", text)
+
     def test_the_spine_is_dropped_rather_than_squeezed(self):
         page = chrome.Page("T", ["ONE", "TWO"])
         wide = app.TextSurface(height=24, width=100)
