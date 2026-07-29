@@ -21,6 +21,7 @@ TOOLS=(
     "volume:kilix-volume"
     "file:kilix-file"
     "package:kilix-package"
+    "rollout_resume:kilix-rollout-resume"
     "session_log:kilix-session-log"
     "weather:kilix-weather"
     "music:kilix-music"
@@ -57,6 +58,17 @@ LAUNCHER
 done
 
 printf 'kilix-tui-utils: installed %d commands into %s\n' "$installed" "$BIN"
+
+# Kilix-95 builds its Start menu from XDG application entries. Sync them here so
+# a fresh install shows up in the menu, and so the per-agent update entries match
+# which coding agents are actually present on this machine.
+if [ -f "$HERE/tools/rollout_resume/main.py" ]; then
+    if python3 "$HERE/tools/rollout_resume/main.py" sync-menu >/dev/null 2>&1; then
+        printf 'kilix-tui-utils: synced Kilix-95 start-menu entries\n'
+    else
+        printf 'kilix-tui-utils: note — could not sync start-menu entries\n'
+    fi
+fi
 
 case ":$PATH:" in
     *":$BIN:"*) ;;

@@ -19,6 +19,7 @@ collapses that into a single component the coordinated release pins once.
 | `kilix-volume` | Output volume and sink selection |
 | `kilix-file` | File manager — navigate and open, never delete or move |
 | `kilix-package` | Installed packages, read-only |
+| `kilix-rollout-resume` | Recover Claude Code, Codex, and Kimi Code sessions; install and update those agents |
 | `kilix-session-log` | Pane transcripts across the live and archived tiers |
 | `kilix-weather` | Forecast from Open-Meteo |
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
@@ -57,6 +58,48 @@ it works over SSH and inside `tmux`. Framebuffer over the Kitty graphics
 protocol for anything whose value is a time series or a shape. `kilix-temps`
 is the framebuffer case and arrives with the move.
 
+## Recovering coding sessions
+
+`kilix-rollout-resume` exists because a coding agent's terminal and its
+transcript have separate lifetimes. Claude Code, Codex, and Kimi Code all
+persist a conversation to disk as it happens and all three can reload one by
+ID, so closing a window does not destroy the work — it only makes it hard to
+find. The picker lists all three together and hands the current Kilix tab over
+to the session you choose, so the tab becomes the resumed agent.
+
+Each agent stores conversations differently, and each states its own turn
+boundaries, so the recovery state is read rather than guessed:
+
+- **cut-off** — the transcript stops mid-turn. Codex says so outright (a
+  `task_started` with no `task_complete`); Kimi shows a `step.begin` with no
+  matching end; Claude Code ends on a tool call nothing answered. This is the
+  strongest sign a terminal disappeared rather than the operator leaving.
+- **idle** — the last turn finished. Resumable, but possibly a clean exit.
+- **live** — a process still owns the conversation, so recovery is refused.
+  Codex and Kimi hold their transcript open, which `/proc` proves; Claude Code
+  publishes a file per process, believed only when the process start time still
+  matches, so a recycled PID cannot resurrect a dead session.
+
+A picker is no use without the agent that owns the transcript, so `Tab` opens
+an agent list where `Enter` installs a missing agent or updates an installed
+one. Installs run the vendor's own documented command and show it, and the page
+it came from, before anything happens. Updates delegate to each agent's own
+updater (`claude update`, `codex update`, `kimi upgrade`) rather than
+re-running an install script.
+
+The Start menu tracks reality: the picker entry is always installed, and an
+"Update <agent>" entry is written per agent only while that agent is present,
+and removed when it isn't. `./install.sh` syncs them, and so does an install
+done from inside the tool.
+
+```sh
+kilix-rollout-resume                     # the picker
+kilix-rollout-resume list --since 24h
+kilix-rollout-resume resume 019faaad     # hand this terminal to the agent
+kilix-rollout-resume restore --limit 5   # several, into detached tmux sessions
+kilix-rollout-resume status
+```
+
 ## Safety properties, enforced by tests
 
 These tools are reachable from a desktop menu on an OS whose desktop is a
@@ -75,6 +118,14 @@ terminal, so a few properties are asserted rather than assumed:
 - **The weather tool has no API key and no IP geolocation.** Open-Meteo needs no
   account, the location is configured rather than derived from the address, and
   the last good response is cached so an offline machine still renders.
+- **Session recovery never runs an arbitrary command.** Launching only ever
+  shells out to `tmux`, asserted from the AST and again from the calls a stubbed
+  runner actually receives. An install is a pipe from the network into a shell —
+  the vendors' documented method, and still the most consequential thing here —
+  so the exact command is pinned in a test, printed with its source URL, and
+  never runs without an explicit yes. A live session is never offered for
+  recovery, and batch restores wait between launches so several agents waking up
+  together do not trip one account-wide rate limit.
 - **The control TUI confirms before power and autologin**, and shells out to
   `pleb` / `plebian-os-update` / `systemctl` rather than reimplementing them, so
   the update transaction, lock, and rollback keep one implementation.
