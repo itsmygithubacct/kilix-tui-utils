@@ -31,10 +31,14 @@ collapses that into a single component the coordinated release pins once.
 ## The desktop: `kilix-tui`
 
 `kilix-tui/main.py` (deliberately not under `tools/` — those are what it
-launches) is a desktop provider in the same sense as Kilix 95 and Kilix Cap,
-but made of characters: it runs anywhere text works — a Kilix pane, `ssh`,
-`tmux`, a bare console — and composes the commands above rather than
-containing any application of its own. Six spine sections: Home (status),
+launches) is a desktop provider in the same sense as Kilix 95 and Kilix Cap:
+it composes the commands above rather than containing any application of its
+own. It is **Tango-themed and renders twice**: inside a Kitty-graphics
+terminal it draws real pixels — a large-type sidebar, cards, and a scarlet
+Power section over the stack's blues, whites, and greys, presented through
+the same damage-aware `kitty-frame-presenter` the dashboards use — and
+everywhere else (`ssh`, `tmux`, a bare console, `--text`) the identical
+desktop renders as Tango-coloured text. Six sections: Home (status),
 Programs, Machine, System, Session, and Power — the last being the point: it
 closes the stack's no-desktop-provider power gap with confirmed
 `systemctl`/`loginctl` actions shared verbatim with `plebian-os`

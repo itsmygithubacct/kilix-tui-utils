@@ -17,8 +17,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_desk import desk, registry  # noqa: E402
-from kilix_tui import app, keys as keymap, kitty_rc, privileged, theme  # noqa: E402
+from kilix_desk import desk, graphics, gui, registry, tango  # noqa: E402
+from kilix_tui import app, keys as keymap, kitty_rc, privileged  # noqa: E402
 
 
 def load_entry():
@@ -221,32 +221,120 @@ class LaunchTabTests(unittest.TestCase):
         self.assertNotIn("--keep-focus", run.call_args[0][0])
 
 
-class PanelTests(unittest.TestCase):
-    def test_the_panel_look_is_assertable(self):
-        with mock.patch.dict(os.environ, {"KILIX_PANEL": "1"}):
-            theme.reset_panel_pairs()
-            try:
-                state = make_state()
-                surface = app.TextSurface()
-                desk.render(surface, state)
-                self.assertIn("KILIX TUI", str(surface))
-                self.assertTrue(surface.attr_shape().strip())
-                text = str(surface)
-                for section in desk.SECTIONS:
-                    self.assertIn(section, text)
-            finally:
-                theme.reset_panel_pairs()
+class TangoTextTests(unittest.TestCase):
+    def test_the_text_layout_is_assertable(self):
+        tango.reset()
+        state = make_state()
+        surface = app.TextSurface()
+        desk.render(surface, state)
+        text = str(surface)
+        self.assertIn("KILIX TUI", text)
+        for section in desk.SECTIONS:
+            self.assertIn(section, text)
+        # Headless attributes are synthetic but distinct, so the layout's
+        # styling is a picture, not a guess.
+        self.assertTrue(surface.attr_shape().strip())
 
     def test_the_active_section_is_marked_in_text_not_only_colour(self):
-        with mock.patch.dict(os.environ, {"KILIX_PANEL": "1"}):
-            theme.reset_panel_pairs()
-            try:
-                state = make_state()
-                state.section = 2
-                text = app.render_to_text(desk.render, state)
-                self.assertIn("▶Machine", text.replace(" ", ""))
-            finally:
-                theme.reset_panel_pairs()
+        state = make_state()
+        state.section = 2
+        text = app.render_to_text(desk.render, state)
+        self.assertIn("▶3Machine", text.replace(" ", ""))
+
+    def test_confirm_shows_the_exact_command(self):
+        state = make_state()
+        state.confirm = ("Shut down", ("systemctl", "poweroff"))
+        text = app.render_to_text(desk.render, state)
+        self.assertIn("Confirm: Shut down", text)
+        self.assertIn("$ systemctl poweroff", text)
+
+
+class StubCanvas:
+    def __init__(self, width, height):
+        self.width, self.height = width, height
+        self.texts: list[str] = []
+
+    def fill_rect(self, *args, **kwargs):
+        pass
+
+    def fill_circle(self, *args, **kwargs):
+        pass
+
+    def text(self, x, y, value, color, scale=1):
+        self.texts.append(value)
+
+    def text_shadow(self, x, y, value, color, scale=1):
+        self.texts.append(value)
+
+    def rgb_bytes(self):
+        return b"\0" * (self.width * self.height * 3)
+
+    def close(self):
+        pass
+
+
+class GraphicsTests(unittest.TestCase):
+    def test_kitty_graphics_likely_reads_the_environment(self):
+        self.assertTrue(graphics.kitty_graphics_likely({"KITTY_WINDOW_ID": "4"}))
+        self.assertTrue(graphics.kitty_graphics_likely({"TERM": "xterm-kitty"}))
+        self.assertFalse(graphics.kitty_graphics_likely({"TERM": "xterm"}))
+
+    def test_fonts_step_in_integer_scales(self):
+        self.assertEqual(graphics.font_for(11).scale, 1)
+        self.assertEqual(graphics.font_for(26).scale, 2)
+        self.assertEqual(graphics.font_for(44).scale, 3)
+
+    def test_key_sequences_speak_the_shared_keymap(self):
+        self.assertIn(gui._SEQUENCES[b"\x1b[A"], keymap.UP)
+        self.assertIn(gui._SEQUENCES[b"\x1b[B"], keymap.DOWN)
+        self.assertIn(gui._SEQUENCES[b"\x1b[5~"], keymap.PAGE_UP)
+        self.assertIn(gui._SEQUENCES[b"\x1b[6~"], keymap.PAGE_DOWN)
+
+    def test_renderer_draws_every_screen_headlessly(self):
+        captured: list[StubCanvas] = []
+
+        def factory(width, height):
+            canvas = StubCanvas(width, height)
+            captured.append(canvas)
+            return canvas
+
+        renderer = graphics.DesktopRenderer(canvas_factory=factory)
+        state = make_state()
+        for section in range(len(desk.SECTIONS)):
+            state.section = section
+            frame = renderer.render(state, 100, 30, (960, 560),
+                                    clock="12:00")
+            self.assertEqual(len(frame.rgb), 960 * 560 * 3)
+        drawn = " ".join(text for canvas in captured for text in canvas.texts)
+        self.assertIn("KILIX TUI", drawn)
+        for section in desk.SECTIONS:
+            self.assertIn(section, drawn)
+
+    def test_confirm_overlay_names_the_command(self):
+        canvases: list[StubCanvas] = []
+
+        def factory(width, height):
+            canvas = StubCanvas(width, height)
+            canvases.append(canvas)
+            return canvas
+
+        renderer = graphics.DesktopRenderer(canvas_factory=factory)
+        state = make_state()
+        state.section = desk.SECTIONS.index("Power")
+        state.confirm = ("Shut down", ("systemctl", "poweroff"))
+        renderer.render(state, 100, 30, (960, 560), clock="12:00")
+        drawn = " ".join(text for canvas in canvases for text in canvas.texts)
+        self.assertIn("Confirm: Shut down", drawn)
+        self.assertIn("$ systemctl poweroff", drawn)
+
+    @unittest.skipUnless(graphics.available()[0],
+                         "soft-raster / presenter not available")
+    def test_real_backend_produces_full_frames(self):
+        renderer = graphics.DesktopRenderer()
+        state = make_state()
+        frame = renderer.render(state, 80, 24, (640, 360), clock="12:00")
+        self.assertEqual(len(frame.rgb), 640 * 360 * 3)
+        self.assertNotEqual(frame.rgb.count(b"\0"), len(frame.rgb))
 
 
 if __name__ == "__main__":
