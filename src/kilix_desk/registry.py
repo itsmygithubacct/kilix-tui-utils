@@ -69,6 +69,7 @@ SYSTEM = (
     # run in place: launching them in a page of ours would leave a dead tab
     # behind the one the launcher opens.
     Item("Kilix 95 desktop", kilix=("desktop", "95"), kilix_only=True),
+    Item("Kilix XP desktop", kilix=("desktop", "kilix-xp"), kilix_only=True),
     Item("Kilix Cap desktop", kilix=("desktop", "kilix-cap"), kilix_only=True),
 )
 
