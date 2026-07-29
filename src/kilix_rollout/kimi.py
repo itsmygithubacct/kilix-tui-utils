@@ -129,5 +129,9 @@ def discover(*, root: str = "", proc_root: str = "/proc",
     return sessions
 
 
-def resume_argv(session: Session) -> list[str]:
-    return ["kimi", "--session", session.session_id]
+def resume_argv(session: Session, *, yolo: bool = False) -> list[str]:
+    argv = ["kimi"]
+    if yolo:
+        argv.append("--yolo")
+    argv.extend(("--session", session.session_id))
+    return argv

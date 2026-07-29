@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(
     "src"))
 
 from kilix_tui import app, keys as keymap  # noqa: E402
-from kilix_rollout import launch, manage, menu, model, providers  # noqa: E402
+from kilix_rollout import config, launch, manage, menu, model, providers  # noqa: E402
 from kilix_rollout.model import RANGES, Session  # noqa: E402
 
 VIEWS = ("candidates", "cut-off", "idle", "live", "all")
@@ -76,6 +76,7 @@ class State:
         self.view = 0
         self.agent = 0
         self.window = model.DEFAULT_RANGE
+        self.yolo = config.yolo_default()
         self.selected = 0
         self.agent_row = 0
         self.offset = 0
@@ -127,7 +128,8 @@ def render(surface, state: State) -> None:
     pane = PANES[state.pane]
     surface.addstr(0, 0, (
         f" kilix-rollout-resume   pane:{pane}   view:{VIEWS[state.view]}"
-        f"   agent:{AGENTS[state.agent]}   range:{RANGES[state.window][0]} "
+        f"   agent:{AGENTS[state.agent]}   range:{RANGES[state.window][0]}"
+        f"{'   YOLO' if state.yolo else ''} "
     )[:width - 1], curses.A_REVERSE)
 
     if pane == "agents":
@@ -136,7 +138,7 @@ def render(surface, state: State) -> None:
         _render_sessions(surface, state, height, width)
 
     surface.addstr(height - 2, 0, state.status[:width - 1], curses.A_DIM)
-    footer = (" Enter resume · x tmux · Tab agents · v view · a agent · t range · r refresh · q quit"
+    footer = (" Enter resume · x tmux · y yolo · Tab agents · v view · a agent · t range · q quit"
               if pane == "sessions" else
               " Enter install/update · Tab sessions · m sync menu · r refresh · ? help · q quit")
     surface.addstr(height - 1, 0, footer[:width - 1], curses.A_BOLD)
@@ -231,7 +233,7 @@ def _resume_here(state: State) -> bool:
         state.status = str(error)
         return True
     curses.endwin()
-    launch.hand_over(chosen)          # replaces this process
+    launch.hand_over(chosen, yolo=state.yolo)   # replaces this process
     return False
 
 
@@ -241,11 +243,33 @@ def _resume_tmux(state: State) -> bool:
         state.status = "Select a resumable session first."
         return True
     try:
-        name = launch.start_detached(chosen)
+        name = launch.start_detached(chosen, yolo=state.yolo)
     except RuntimeError as error:
         state.status = str(error)
         return True
     state.status = f"Started detached tmux session '{name}'. Attach with: tmux attach -t {name}"
+    return True
+
+
+def _toggle_yolo(state: State) -> bool:
+    """Turn approval prompts off for launches from this picker.
+
+    Turning it on is confirmed once rather than on every launch: the header
+    keeps saying YOLO for as long as it is on, so the state stays visible
+    without a prompt in front of every resume.
+    """
+    if state.yolo:
+        state.yolo = False
+        state.status = "YOLO off — resumed agents ask before acting."
+        return True
+    flags = ", ".join(sorted({config.yolo_flag(item.key)
+                              for item in providers.PROVIDERS}))
+    if _ask(f"Resume agents with approval prompts disabled ({flags})?"):
+        state.yolo = True
+        state.status = ("YOLO on — resumed agents will run commands without "
+                        "asking. Press y again to turn it off.")
+    else:
+        state.status = "YOLO stays off."
     return True
 
 
@@ -326,6 +350,8 @@ def handle(key: int, state: State) -> bool:
         return _resume_here(state)
     if key == ord("x"):
         return _resume_tmux(state)
+    if key == ord("y"):
+        return _toggle_yolo(state)
     if key == ord("t"):
         state.window = (state.window + 1) % len(RANGES)
         state.selected = 0
@@ -410,7 +436,8 @@ def _cmd_update(key: str) -> int:
     return manage.run_update(item)
 
 
-def _cmd_restore(sessions: list[Session], limit: int, gap: float) -> int:
+def _cmd_restore(sessions: list[Session], limit: int, gap: float,
+                 yolo: bool = False) -> int:
     chosen = [item for item in sessions if item.resumable][:limit]
     if not chosen:
         print("(nothing to restore)")
@@ -419,7 +446,9 @@ def _cmd_restore(sessions: list[Session], limit: int, gap: float) -> int:
     span = gap * max(0, len(chosen) - 1)
     print(f"Restoring {len(chosen)} session(s), {gap:.0f}s apart "
           f"(about {span / 60:.0f}m total).")
-    results = launch.restore_all(chosen, gap=gap)
+    if yolo:
+        print("  approval prompts disabled for every agent in this batch.")
+    results = launch.restore_all(chosen, gap=gap, yolo=yolo)
     for result in results:
         item = result["session"]
         mark = "started" if result["ok"] else "failed "
@@ -430,8 +459,14 @@ def _cmd_restore(sessions: list[Session], limit: int, gap: float) -> int:
 def main(argv: list[str]) -> int:
     arguments = list(argv)
     as_json = "--json" in arguments
-    assume_yes = "--yes" in arguments or "-y" in arguments
-    arguments = [item for item in arguments if item not in ("--json", "--yes", "-y")]
+    assume_yes = "--yes" in arguments
+    yolo = config.yolo_default()
+    if "--yolo" in arguments:
+        yolo = True
+    if "--no-yolo" in arguments:
+        yolo = False
+    arguments = [item for item in arguments
+                 if item not in ("--json", "--yes", "--yolo", "--no-yolo")]
 
     agent_filter = None
     if "--agent" in arguments:
@@ -455,7 +490,7 @@ def main(argv: list[str]) -> int:
         print("\nCommands: list, resume <id>, restore, install <agent>, "
               "update <agent>, status, sync-menu"
               "\nOptions:  --agent <name>, --since <90m|24h|7d>, --all-time, "
-              "--json, --yes"
+              "--yolo, --no-yolo, --json, --yes"
               "\nAgents:   " + ", ".join(item.key for item in providers.PROVIDERS))
         return 0
     if command == "status":
@@ -492,7 +527,10 @@ def main(argv: list[str]) -> int:
             print(f"kilix-rollout-resume: that session is still running "
                   f"(PID {', '.join(str(pid) for pid in chosen.pids)})", file=sys.stderr)
             return 4
-        launch.hand_over(chosen)
+        if yolo:
+            print("kilix-rollout-resume: resuming with "
+                  f"{config.yolo_flag(chosen.provider)}", file=sys.stderr)
+        launch.hand_over(chosen, yolo=yolo)
         return 0
     if command == "restore":
         limit = 10
@@ -501,7 +539,7 @@ def main(argv: list[str]) -> int:
         gap = launch.LAUNCH_GAP
         if "--gap" in arguments:
             gap = float(arguments[arguments.index("--gap") + 1])
-        return _cmd_restore(sessions, limit, gap)
+        return _cmd_restore(sessions, limit, gap, yolo)
     if command:
         print(f"kilix-rollout-resume: unknown command '{command}'", file=sys.stderr)
         return 2

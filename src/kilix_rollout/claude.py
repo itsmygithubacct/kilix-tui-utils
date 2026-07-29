@@ -151,5 +151,8 @@ def discover(*, root: str = "", proc_root: str = "/proc",
     return sessions
 
 
-def resume_argv(session: Session) -> list[str]:
-    return ["claude", "--resume", session.session_id]
+def resume_argv(session: Session, *, yolo: bool = False) -> list[str]:
+    argv = ["claude", "--resume", session.session_id]
+    if yolo:
+        argv.append("--dangerously-skip-permissions")
+    return argv

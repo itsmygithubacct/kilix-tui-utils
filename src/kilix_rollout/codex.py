@@ -129,5 +129,10 @@ def discover(*, root: str = "", proc_root: str = "/proc",
     return sessions
 
 
-def resume_argv(session: Session) -> list[str]:
-    return ["codex", "resume", session.session_id]
+def resume_argv(session: Session, *, yolo: bool = False) -> list[str]:
+    # Codex takes --yolo before the subcommand, not after it.
+    argv = ["codex"]
+    if yolo:
+        argv.append("--yolo")
+    argv.extend(("resume", session.session_id))
+    return argv

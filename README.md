@@ -87,6 +87,26 @@ it came from, before anything happens. Updates delegate to each agent's own
 updater (`claude update`, `codex update`, `kimi upgrade`) rather than
 re-running an install script.
 
+### Skipping approval prompts
+
+A resumed agent normally asks before it acts. `y` in the picker, or `--yolo` on
+the command line, starts it without those prompts — using whichever flag that
+agent actually accepts, since they disagree:
+
+| Agent | Flag |
+|---|---|
+| Claude Code | `--dangerously-skip-permissions` |
+| Codex | `--yolo`, before the subcommand |
+| Kimi Code | `--yolo` |
+
+The default comes from `KILIX_CODING_YOLO` in the shared
+`~/.local/gpu_terminal/settings.conf`, set from **Kilix Settings → Tools**. It
+belongs there rather than in this tool because it decides whether an agent asks
+before it acts, which the user should be able to find and audit next to every
+other stack-wide preference. It is off unless the file says otherwise, turning
+it on in the picker is confirmed once, and the header reads `YOLO` for as long
+as it is on. `--no-yolo` overrides the setting for one command.
+
 The Start menu tracks reality: the picker entry is always installed, and an
 "Update <agent>" entry is written per agent only while that agent is present,
 and removed when it isn't. `./install.sh` syncs them, and so does an install

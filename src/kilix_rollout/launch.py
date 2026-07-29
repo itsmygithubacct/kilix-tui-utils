@@ -25,8 +25,8 @@ from .providers import Provider, provider
 LAUNCH_GAP = 30.0
 
 
-def resume_command(session: Session) -> list[str]:
-    return provider(session.provider).resume_argv(session)
+def resume_command(session: Session, *, yolo: bool = False) -> list[str]:
+    return provider(session.provider).resume_argv(session, yolo=yolo)
 
 
 def working_directory(session: Session) -> str:
@@ -49,11 +49,11 @@ def check_installed(session: Session) -> Provider:
     return item
 
 
-def hand_over(session: Session) -> None:
+def hand_over(session: Session, *, yolo: bool = False) -> None:
     """Replace this process with the resumed agent. Does not return."""
     check_installed(session)
     cwd = working_directory(session)
-    argv = resume_command(session)
+    argv = resume_command(session, yolo=yolo)
     os.chdir(cwd)
     os.execvp(argv[0], argv)
 
@@ -80,19 +80,20 @@ def tmux_sessions(*, runner=subprocess.run) -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def tmux_argv(session: Session, name: str) -> list[str]:
+def tmux_argv(session: Session, name: str, *, yolo: bool = False) -> list[str]:
     return ["tmux", "new-session", "-d", "-s", name, "-c",
-            session.cwd, *resume_command(session)]
+            session.cwd, *resume_command(session, yolo=yolo)]
 
 
-def start_detached(session: Session, *, taken=None, runner=subprocess.run) -> str:
+def start_detached(session: Session, *, taken=None, yolo: bool = False,
+                   runner=subprocess.run) -> str:
     """Start one session in a detached tmux session and return its name."""
     check_installed(session)
     working_directory(session)
     existing = tmux_sessions(runner=runner) if taken is None else set(taken)
     name = tmux_name(session, existing)
     try:
-        result = runner(tmux_argv(session, name), capture_output=True,
+        result = runner(tmux_argv(session, name, yolo=yolo), capture_output=True,
                         text=True, timeout=30, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError(f"tmux could not start the session: {error}") from error
@@ -102,8 +103,9 @@ def start_detached(session: Session, *, taken=None, runner=subprocess.run) -> st
     return name
 
 
-def restore_all(sessions, *, gap: float = LAUNCH_GAP, runner=subprocess.run,
-                sleeper=time.sleep, on_wait=None) -> list[dict[str, object]]:
+def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
+                runner=subprocess.run, sleeper=time.sleep,
+                on_wait=None) -> list[dict[str, object]]:
     """Start several sessions, waiting `gap` seconds between each launch.
 
     The wait happens *before* each launch after the first, and only when the
@@ -123,7 +125,8 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, runner=subprocess.run,
                 sleeper(step)
                 remaining -= step
         try:
-            name = start_detached(session, taken=taken, runner=runner)
+            name = start_detached(session, taken=taken, yolo=yolo,
+                                  runner=runner)
         except RuntimeError as error:
             results.append({"session": session, "ok": False, "detail": str(error)})
             continue

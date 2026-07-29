@@ -292,6 +292,28 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(launch.resume_command(sample("kimi")),
                          ["kimi", "--session", "abc123"])
 
+    def test_yolo_uses_the_flag_each_agent_actually_accepts(self):
+        # Claude Code names it differently, and Codex takes it before the
+        # subcommand — getting either wrong makes the agent refuse to start.
+        self.assertEqual(launch.resume_command(sample("claude"), yolo=True),
+                         ["claude", "--resume", "abc123",
+                          "--dangerously-skip-permissions"])
+        self.assertEqual(launch.resume_command(sample("codex"), yolo=True),
+                         ["codex", "--yolo", "resume", "abc123"])
+        self.assertEqual(launch.resume_command(sample("kimi"), yolo=True),
+                         ["kimi", "--yolo", "--session", "abc123"])
+
+    def test_no_approval_flag_appears_unless_yolo_was_asked_for(self):
+        for key in ("claude", "codex", "kimi"):
+            argv = launch.resume_command(sample(key))
+            self.assertNotIn("--yolo", argv)
+            self.assertNotIn("--dangerously-skip-permissions", argv)
+
+    def test_a_detached_launch_carries_the_flag_too(self):
+        argv = launch.tmux_argv(sample("kimi", cwd="/tmp"), "name", yolo=True)
+        self.assertEqual(argv[0], "tmux")
+        self.assertIn("--yolo", argv)
+
     def test_a_vanished_working_directory_is_refused(self):
         with self.assertRaises(RuntimeError):
             launch.working_directory(sample("claude", cwd="/nonexistent/dir"))
@@ -410,6 +432,59 @@ class ManagementTests(unittest.TestCase):
 
 
 # ── start menu ───────────────────────────────────────────────────────────────
+
+class YoloSettingTests(unittest.TestCase):
+    """The stack-wide setting decides the default; it is never on by accident."""
+
+    def read_with(self, value):
+        from kilix_rollout import config
+        saved = config.theme.setting
+        config.theme.setting = lambda key, default: (
+            value if key == config.YOLO_KEY else default)
+        try:
+            return config.yolo_default()
+        finally:
+            config.theme.setting = saved
+
+    def test_missing_or_off_settings_mean_agents_still_ask(self):
+        for value in ("off", "", "0", "no", "nonsense"):
+            with self.subTest(value=value):
+                self.assertFalse(self.read_with(value))
+
+    def test_the_shared_setting_turns_it_on(self):
+        for value in ("on", "1", "true", "YES", " on "):
+            with self.subTest(value=value):
+                self.assertTrue(self.read_with(value))
+
+    def test_the_key_matches_the_one_the_stack_declares(self):
+        from kilix_rollout import config
+        self.assertEqual(config.YOLO_KEY, "KILIX_CODING_YOLO")
+        self.assertEqual(config.yolo_flag("claude"),
+                         "--dangerously-skip-permissions")
+        self.assertEqual(config.yolo_flag("codex"), "--yolo")
+        self.assertEqual(config.yolo_flag("kimi"), "--yolo")
+
+    def test_turning_yolo_on_in_the_picker_is_confirmed(self):
+        tool = load_tool()
+        state = tool.State()
+        state.yolo = False
+        answers = []
+        saved = tool._ask
+        tool._ask = lambda question: answers.append(question) or False
+        try:
+            tool._toggle_yolo(state)
+            self.assertFalse(state.yolo, "declining must leave it off")
+            self.assertTrue(answers, "enabling yolo must ask first")
+            tool._ask = lambda question: True
+            tool._toggle_yolo(state)
+            self.assertTrue(state.yolo)
+            # Turning it back off needs no confirmation — that direction is safe.
+            tool._ask = lambda question: self.fail("disabling must not prompt")
+            tool._toggle_yolo(state)
+            self.assertFalse(state.yolo)
+        finally:
+            tool._ask = saved
+
 
 class MenuTests(unittest.TestCase):
     def test_update_entries_track_which_agents_are_installed(self):
