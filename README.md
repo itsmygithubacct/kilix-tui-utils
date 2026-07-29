@@ -26,6 +26,31 @@ collapses that into a single component the coordinated release pins once.
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
 | `kilix-music` | Player driving kilix-amp over its control socket |
 | `kilix-temps` | Thermal dashboard *(moving in from its own repo)* |
+| `kilix-tui` | **The text-native desktop** — see below |
+
+## The desktop: `kilix-tui`
+
+`kilix-tui/main.py` (deliberately not under `tools/` — those are what it
+launches) is a desktop provider in the same sense as Kilix 95 and Kilix Cap,
+but made of characters: it runs anywhere text works — a Kilix pane, `ssh`,
+`tmux`, a bare console — and composes the commands above rather than
+containing any application of its own. Six spine sections: Home (status),
+Programs, Machine, System, Session, and Power — the last being the point: it
+closes the stack's no-desktop-provider power gap with confirmed
+`systemctl`/`loginctl` actions shared verbatim with `plebian-os`
+(`src/kilix_tui/privileged.py` is the one list of what "Shut down" runs).
+
+Three verbs, one rule. An entry is drawn in the well, handed the terminal in
+place, or opened in a Kilix page (`kitty_rc.launch_tab`) — and in-place is the
+floor: everything works with no terminal to talk to, and the page affordances
+appear only when `kitty_rc.available()`. Launch resolution follows the
+Start-menu discipline: installed command first, this checkout's own tools
+second, a `kilix` subcommand third, and a foreign source checkout never.
+
+Inside Kilix, select it like the other desktops: `kilix kilix-tui`,
+`kilix desktop kilix-tui`, or `KILIX_DESKTOP_PROVIDER=tui` in the runtime
+config or the shared settings file. When it is the whole session
+(`KILIX_TUI_SESSION=1`), quitting asks first.
 
 ## Install
 

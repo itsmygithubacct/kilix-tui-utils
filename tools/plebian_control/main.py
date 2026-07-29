@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, privileged, proc  # noqa: E402
 
 SECTIONS = ("Status", "Update", "Session", "Power", "Health")
 
@@ -109,12 +109,9 @@ class State:
                 ("Chrome settings", ["kilix-settings"], False),
             ]
         if name == "Power":
-            return [
-                ("Log out of this session", ["loginctl", "terminate-session",
-                                             os.environ.get("XDG_SESSION_ID", "")], True),
-                ("Reboot", ["systemctl", "reboot"], True),
-                ("Shut down", ["systemctl", "poweroff"], True),
-            ]
+            # Shared with the kilix-tui desktop: one list of what "Shut down"
+            # actually runs, however many surfaces offer it.
+            return list(privileged.power_actions())
         if name == "Health":
             return [
                 ("Run pleb doctor", ["pleb", "doctor"], False),

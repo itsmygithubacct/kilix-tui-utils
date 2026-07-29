@@ -291,3 +291,28 @@ def close_page(page_id: int) -> None:
 
 def rename_page(page_id: int, title: str) -> None:
     _run(["set-tab-title", "--match", f"id:{page_id}", title])
+
+
+def launch_tab(
+    argv: list[str] | tuple[str, ...],
+    *,
+    title: str,
+    cwd: str | None = None,
+    keep_focus: bool = True,
+) -> int:
+    """Open `argv` in a new page; return its pane id, or 0 if unreported.
+
+    Fixed argv only, never a shell string — the same discipline Kilix 95's
+    Start menu and Kilix Cap's launchers follow. `keep_focus` leaves the
+    caller focused, which is what a desktop launching a background surface
+    wants; pass False to follow the launch. Raises `Unavailable` when the
+    credential's scope does not include `launch` — that refusal is the
+    terminal's decision and is reported, not worked around.
+    """
+    args = ["launch", "--type=tab", "--tab-title", title]
+    if cwd:
+        args.append(f"--cwd={cwd}")
+    if keep_focus:
+        args.append("--keep-focus")
+    out = _run([*args, "--", *argv]).strip()
+    return int(out) if out.isdigit() else 0
