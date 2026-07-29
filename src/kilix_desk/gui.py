@@ -9,10 +9,13 @@ full repaint when it exits.
 """
 from __future__ import annotations
 
+import fcntl
 import os
+import re
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import termios
@@ -47,7 +50,12 @@ class TerminalSession:
     def enter(self) -> None:
         self._attributes = termios.tcgetattr(self.fd)
         tty.setcbreak(self.fd)
-        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b]2;Kilix TUI\x07")
+        # 1002/1006: button events, SGR-encoded. 1016: pixel coordinates,
+        # which is native for a desktop drawn in pixels; a terminal without it
+        # keeps reporting cells and the click mapping handles either.
+        sys.stdout.write(
+            "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"
+            "\x1b[?1002h\x1b[?1006h\x1b[?1016h\x1b]2;Kilix TUI\x07")
         sys.stdout.flush()
 
     def leave(self) -> None:
@@ -55,7 +63,9 @@ class TerminalSession:
             if self._attributes is not None:
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, self._attributes)
         finally:
-            sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l\x1b]2;\x07")
+            sys.stdout.write(
+                "\x1b[?1016l\x1b[?1006l\x1b[?1002l"
+                "\x1b[0m\x1b[?25h\x1b[?1049l\x1b]2;\x07")
             sys.stdout.flush()
 
     def __enter__(self) -> "TerminalSession":
@@ -64,6 +74,9 @@ class TerminalSession:
 
     def __exit__(self, *_exc: object) -> None:
         self.leave()
+
+
+_MOUSE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
 
 class GraphicalDesktop:
@@ -75,6 +88,9 @@ class GraphicalDesktop:
         self.running = True
         self.redraw = True
         self.clear_screen = True
+        self._cells = (100, 30)
+        self._render_px = (1000, 600)
+        self._raw_px = (1000, 600)
         # The desktop lends the terminal out through the same runner the
         # curses session uses; only the suspend/resume differs.
         state.runner = self._suspended_run
@@ -113,6 +129,18 @@ class GraphicalDesktop:
         size = shutil.get_terminal_size((100, 30))
         pixels = terminal_pixel_size(sys.stdout.fileno(), size.columns,
                                      size.lines)
+        self._cells = (size.columns, size.lines)
+        self._render_px = pixels
+        try:
+            packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ,
+                                 b"\0" * 8)
+            _rows, _cols, raw_w, raw_h = struct.unpack("HHHH", packed)
+            if raw_w and raw_h:
+                self._raw_px = (raw_w, raw_h)
+            else:
+                self._raw_px = pixels
+        except (OSError, struct.error):
+            self._raw_px = pixels
         frame = self.renderer.render(self.state, size.columns, size.lines,
                                      pixels)
         if self.display is None:
@@ -125,8 +153,65 @@ class GraphicalDesktop:
         self.redraw = False
         self.clear_screen = False
 
+    # ── mouse ────────────────────────────────────────────────────────────────
+
+    def _to_render(self, x: int, y: int) -> tuple[int, int]:
+        """Map a report (pixels with 1016, cells without) onto the frame."""
+        columns, rows = self._cells
+        render_w, render_h = self._render_px
+        raw_w, raw_h = self._raw_px
+        if x > columns + 1 or y > rows + 1:
+            return (int(x * render_w / max(1, raw_w)),
+                    int(y * render_h / max(1, raw_h)))
+        return (int((x - 0.5) * render_w / max(1, columns)),
+                int((y - 0.5) * render_h / max(1, rows)))
+
+    def _click(self, x: int, y: int) -> None:
+        if self.state.confirm is not None:
+            return                    # power confirmations stay on the keys
+        px, py = self._to_render(x, y)
+        for kind, index, (x1, y1, x2, y2) in reversed(self.renderer.hits):
+            if not (x1 <= px <= x2 and y1 <= py <= y2):
+                continue
+            if kind == "section":
+                self.running = (handle(ord("1") + index, self.state)
+                                and self.running)
+            elif kind == "entry":
+                if (self.state.focus == "entries"
+                        and index == self.state.selected):
+                    self.running = handle(10, self.state) and self.running
+                else:
+                    self.state.focus = "entries"
+                    self.state.selected = index
+            self.redraw = True
+            return
+
+    def _mouse(self, button: int, x: int, y: int, press: bool) -> None:
+        if button in (64, 65):        # wheel, reported as presses
+            key = 259 if button == 64 else 258
+            if self.state.entries():
+                self.state.focus = "entries"
+            self.running = handle(key, self.state) and self.running
+            self.redraw = True
+            return
+        if press and button & 3 == 0 and not button & 32:
+            self._click(x, y)
+
     def _handle_bytes(self, data: bytes) -> None:
+        data = getattr(self, "_pending", b"") + data
+        self._pending = b""
         while data and self.running:
+            if data.startswith(b"\x1b[<") and not _MOUSE.match(data):
+                # A mouse report split across reads: keep it for the rest.
+                if len(data) < 24:
+                    self._pending = data
+                    return
+            mouse = _MOUSE.match(data)
+            if mouse:
+                self._mouse(int(mouse.group(1)), int(mouse.group(2)),
+                            int(mouse.group(3)), mouse.group(4) == b"M")
+                data = data[mouse.end():]
+                continue
             matched = False
             for sequence, key in _SEQUENCES.items():
                 if data.startswith(sequence):
@@ -180,7 +265,7 @@ class GraphicalDesktop:
                             readable = []
                         if readable:
                             try:
-                                data = os.read(sys.stdin.fileno(), 64)
+                                data = os.read(sys.stdin.fileno(), 512)
                             except OSError:
                                 data = b""
                             if data:

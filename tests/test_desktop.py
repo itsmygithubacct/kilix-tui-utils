@@ -73,10 +73,100 @@ class ContractTests(unittest.TestCase):
         state = make_state()
         desk.handle(ord("2"), state)
         self.assertEqual(desk.SECTIONS[state.section], "Programs")
+        self.assertEqual(state.focus, "entries")
         desk.handle(ord("\t"), state)
         self.assertEqual(desk.SECTIONS[state.section], "Machine")
         desk.handle(ord("6"), state)
         self.assertEqual(desk.SECTIONS[state.section], "Power")
+
+
+class NavigationTests(unittest.TestCase):
+    def test_arrows_drive_the_focused_column(self):
+        state = make_state()
+        self.assertEqual(state.focus, "sections")
+        desk.handle(258, state)                               # down
+        self.assertEqual(desk.SECTIONS[state.section], "Programs")
+        desk.handle(261, state)                               # right: dive in
+        self.assertEqual(state.focus, "entries")
+        desk.handle(258, state)
+        self.assertEqual(state.selected, 1)
+        desk.handle(260, state)                               # left: back out
+        self.assertEqual(state.focus, "sections")
+
+    def test_escape_walks_out_one_level_at_a_time(self):
+        state = make_state()
+        desk.handle(ord("3"), state)                          # Machine, entries
+        self.assertTrue(desk.handle(27, state))               # -> Home
+        self.assertEqual(state.section, 0)
+        self.assertEqual(state.focus, "sections")
+        self.assertFalse(desk.handle(27, state))              # -> quit
+
+    def test_home_and_end_jump_within_the_list(self):
+        state = make_state()
+        desk.handle(ord("3"), state)
+        desk.handle(360, state)                               # end
+        self.assertEqual(state.selected, len(state.entries()) - 1)
+        desk.handle(262, state)                               # home
+        self.assertEqual(state.selected, 0)
+
+    def test_selection_stays_visible_when_the_list_scrolls(self):
+        self.assertEqual(desk.visible_window(10, 4, 0), 0)
+        self.assertEqual(desk.visible_window(10, 4, 3), 0)
+        self.assertEqual(desk.visible_window(10, 4, 7), 4)
+        self.assertEqual(desk.visible_window(10, 4, 9), 6)
+        self.assertEqual(desk.visible_window(3, 8, 2), 0)
+
+
+class SubmenuTests(unittest.TestCase):
+    def test_games_drilldown_lists_and_flips_toggles(self):
+        quiet_calls = []
+        state = make_state(quiet=lambda argv: quiet_calls.append(argv) or 0)
+        games = [("kilix-pong", "Kilix Pong", True),
+                 ("doom", "Doom", False)]
+        with mock.patch.object(registry, "games", return_value=games), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state.section = desk.SECTIONS.index("Programs")
+            state.focus = "entries"
+            entries = state.entries()
+            index = next(i for i, e in enumerate(entries)
+                         if e.submenu == "games")
+            state.selected = index
+            desk.handle(10, state)                            # descend
+            self.assertEqual(state.submenu, "games")
+            listed = state.entries()
+            self.assertEqual([e.label for e in listed],
+                             ["Kilix Pong", "Doom"])
+            self.assertEqual([e.hint for e in listed], ["on", "off"])
+            desk.handle(10, state)                            # flip Kilix Pong
+            self.assertEqual(
+                quiet_calls,
+                [("/opt/kilix/kilix", "games", "disable", "kilix-pong")])
+            self.assertTrue(desk.handle(27, state))           # Esc pops
+            self.assertIsNone(state.submenu)
+
+    def test_submenus_degrade_without_a_kilix_checkout(self):
+        state = make_state()
+        state.submenu = "games"
+        with mock.patch.object(registry, "games", return_value=None):
+            entries = state.entries()
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].argv)
+
+
+class TextMouseTests(unittest.TestCase):
+    def test_render_records_the_hit_map(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Machine")
+        state.focus = "entries"
+        app.render_to_text(desk.render, state)
+        self.assertTrue(state.text_hits["sections"])
+        self.assertEqual(state.text_hits["bar_row"], 1)
+        self.assertGreater(state.text_hits["visible"], 0)
+
+    def test_mouse_key_is_safe_without_curses(self):
+        state = make_state()
+        self.assertTrue(desk.handle(desk.KEY_MOUSE, state))
 
 
 class ResolutionTests(unittest.TestCase):
@@ -117,7 +207,7 @@ class ResolutionTests(unittest.TestCase):
         # registry offers no path-based resolution for them.
         for section in registry.SECTIONS.values():
             for item in section:
-                if item.sibling is None:
+                if item.sibling is None and not item.submenu:
                     self.assertTrue(item.command or item.kilix)
 
 
@@ -181,6 +271,7 @@ class PowerTests(unittest.TestCase):
         calls = []
         state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
         state.section = desk.SECTIONS.index("Power")
+        state.focus = "entries"
         state.selected = 1                                    # Reboot
         desk.handle(list(keymap.SELECT)[0], state)
         self.assertEqual(calls, [])
@@ -327,6 +418,81 @@ class GraphicsTests(unittest.TestCase):
         self.assertIn("Confirm: Shut down", drawn)
         self.assertIn("$ systemctl poweroff", drawn)
 
+    def test_renderer_records_hits_for_the_mouse(self):
+        renderer = graphics.DesktopRenderer(
+            canvas_factory=lambda w, h: StubCanvas(w, h))
+        state = make_state()
+        state.section = desk.SECTIONS.index("Machine")
+        renderer.render(state, 100, 30, (960, 560), clock="12:00")
+        kinds = {kind for kind, _i, _box in renderer.hits}
+        self.assertEqual(kinds, {"section", "entry"})
+        sections = [i for kind, i, _box in renderer.hits
+                    if kind == "section"]
+        self.assertEqual(sections, list(range(len(desk.SECTIONS))))
+
+
+class PixelMouseTests(unittest.TestCase):
+    def _desktop(self):
+        desktop = object.__new__(gui.GraphicalDesktop)
+        desktop.state = make_state()
+        desktop.renderer = mock.Mock(hits=[])
+        desktop.running = True
+        desktop.redraw = False
+        desktop._cells = (100, 30)
+        desktop._render_px = (1000, 600)
+        desktop._raw_px = (2000, 1200)
+        desktop._pending = b""
+        return desktop
+
+    def test_sgr_reports_parse_in_pixels_and_cells(self):
+        desktop = self._desktop()
+        # 1016 pixel coordinates scale by the raw-to-render ratio…
+        self.assertEqual(desktop._to_render(1000, 600), (500, 300))
+        # …and plain 1006 cell coordinates map through the cell grid.
+        self.assertEqual(desktop._to_render(50, 15), (495, 290))
+
+    def test_click_selects_then_opens(self):
+        desktop = self._desktop()
+        opened = []
+        desktop.state.runner = lambda argv: opened.append(tuple(argv)) or 0
+        desktop.renderer.hits = [
+            ("section", 2, (0, 100, 200, 140)),
+            ("entry", 1, (220, 100, 900, 140)),
+        ]
+        with mock.patch.object(gui, "handle",
+                               wraps=desk.handle) as wrapped:
+            desktop._handle_bytes(b"\x1b[<0;600;240M")        # pixel coords
+            self.assertEqual(desktop.state.focus, "entries")
+            self.assertEqual(desktop.state.selected, 1)
+            desktop._handle_bytes(b"\x1b[<0;600;240M")        # second click
+            wrapped.assert_any_call(10, desktop.state)
+
+    def test_wheel_moves_the_selection(self):
+        desktop = self._desktop()
+        desktop.state.section = desk.SECTIONS.index("Power")
+        desktop.state.focus = "entries"
+        desktop.state.selected = 0
+        desktop._handle_bytes(b"\x1b[<65;10;10M")             # wheel down
+        self.assertEqual(desktop.state.selected, 1)
+
+    def test_split_mouse_reports_are_buffered(self):
+        desktop = self._desktop()
+        desktop._handle_bytes(b"\x1b[<0;60")
+        self.assertEqual(desktop._pending, b"\x1b[<0;60")
+        desktop.renderer.hits = [("entry", 0, (0, 0, 1000, 600))]
+        desktop._handle_bytes(b"0;240M")
+        self.assertEqual(desktop._pending, b"")
+        self.assertEqual(desktop.state.focus, "entries")
+
+    def test_clicks_are_ignored_while_a_confirmation_is_open(self):
+        desktop = self._desktop()
+        desktop.state.confirm = ("Shut down", ("systemctl", "poweroff"))
+        desktop.renderer.hits = [("entry", 0, (0, 0, 1000, 600))]
+        desktop._handle_bytes(b"\x1b[<0;500;300M")
+        self.assertIsNotNone(desktop.state.confirm)
+
+
+class GraphicsBackendTests(unittest.TestCase):
     @unittest.skipUnless(graphics.available()[0],
                          "soft-raster / presenter not available")
     def test_real_backend_produces_full_frames(self):

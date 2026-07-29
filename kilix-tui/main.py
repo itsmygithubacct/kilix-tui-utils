@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
                       file=sys.stderr)
                 return 1
             # The floor: fall through to the text session.
-    return app.run(desk.render, state, handle=desk.handle)
+    return app.run(desk.render, state, handle=desk.handle, mouse=True)
 
 
 if __name__ == "__main__":

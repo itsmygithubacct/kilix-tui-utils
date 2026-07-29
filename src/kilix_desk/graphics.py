@@ -21,7 +21,8 @@ import time
 from typing import Any, Mapping, TextIO
 
 from . import tango
-from .desk import SECTIONS, Entry, State
+from .desk import SECTIONS, State, entry_hint, footer as footer_text, \
+    visible_window
 
 Color = tuple[int, int, int]
 Box = tuple[int, int, int, int]
@@ -242,7 +243,10 @@ _ASCII = str.maketrans({
     "\N{BULLET}": "|", "\N{HORIZONTAL ELLIPSIS}": "~",
     "\N{EM DASH}": "-", "\N{EN DASH}": "-",
     "\N{BLACK RIGHT-POINTING TRIANGLE}": ">",
+    "\N{BLACK RIGHT-POINTING SMALL TRIANGLE}": ">",
+    "\N{BLACK LEFT-POINTING SMALL TRIANGLE}": "<",
     "\N{UPWARDS ARROW}": "^", "\N{DOWNWARDS ARROW}": "v",
+    "\N{LEFTWARDS ARROW}": "<", "\N{RIGHTWARDS ARROW}": ">",
     "\N{MIDDLE DOT}": ".",
 })
 
@@ -343,6 +347,8 @@ class DesktopRenderer:
             self._canvas = lambda w, h: module.Canvas(w, h, library=library)
         else:
             self._canvas = canvas_factory
+        # (kind, index, box) hit targets from the last frame, for the mouse.
+        self.hits: list[tuple[str, int, Box]] = []
 
     # Geometry is derived from one scale factor so the layout breathes with
     # the pane instead of truncating: fonts step down to 1x, the sidebar
@@ -353,6 +359,7 @@ class DesktopRenderer:
                clock: str | None = None) -> GraphicsFrame:
         width, height = pixel_size
         canvas = self._canvas(width, height)
+        self.hits = []
         try:
             draw = Draw(canvas)
             scale = max(0.72, min(1.6, width / 1150.0, height / 640.0))
@@ -423,13 +430,20 @@ class DesktopRenderer:
         index_font = font_for(10 * scale)
         row_h = max(28, min(int(52 * scale),
                             (bottom - top) // max(1, len(SECTIONS))))
+        focused = state.focus == "sections"
         for index, name in enumerate(SECTIONS):
             row_top = top + index * row_h
             row = (left, row_top + 2, right, row_top + row_h - 4)
             active = index == state.section
             danger = name == "Power"
+            self.hits.append(("section", index, row))
             if active:
-                fill = tango.RED if danger else tango.BLUE
+                # The focused column glows; the unfocused one keeps a deep
+                # fill, so the eye always knows which list the arrows drive.
+                if focused:
+                    fill = tango.RED if danger else tango.BLUE
+                else:
+                    fill = tango.RED_DEEP if danger else tango.BLUE_DEEP
                 draw.rounded(row, max(4, int(9 * scale)), fill)
                 draw.fill((left, row[1] + 3, left + max(3, int(4 * scale)),
                            row[3] - 3),
@@ -455,7 +469,11 @@ class DesktopRenderer:
         accent = tango.RED if name == "Power" else tango.BLUE_BRIGHT
         draw.text((left + pad, top + pad // 2, right - pad,
                    top + pad // 2 + head.height + 4),
-                  name.upper(), head, accent)
+                  state.breadcrumb().upper(), head, accent)
+        if state.submenu:
+            draw.text((left + pad, top + pad // 2, right - pad,
+                       top + pad // 2 + head.height + 4),
+                      "< back", head, tango.GREY, align="right")
         rule_y = top + pad // 2 + head.height + max(6, int(8 * scale))
         draw.hline(left + pad, right - pad, rule_y, tango.CARD_EDGE,
                    max(1, int(scale)))
@@ -520,31 +538,39 @@ class DesktopRenderer:
         state.selected = max(0, min(state.selected, len(entries) - 1))
         label = font_for(26 * scale, bold=False)
         hint_font = font_for(11 * scale)
+        focused = state.focus == "entries"
         row_h = max(26, min(int(46 * scale),
-                            (bottom - top) // max(1, len(entries))))
-        for index, entry in enumerate(entries):
-            row_top = top + index * row_h
-            if row_top + row_h > bottom + 2:
-                break
+                            (bottom - top) // max(1, min(len(entries), 12))))
+        capacity = max(1, (bottom - top) // row_h)
+        offset = visible_window(len(entries), capacity, state.selected)
+        for line in range(min(capacity, len(entries) - offset)):
+            index = offset + line
+            entry = entries[index]
+            row_top = top + line * row_h
             row = (left, row_top + 2, right, row_top + row_h - 3)
+            self.hits.append(("entry", index, row))
             selected = index == state.selected
             danger = entry.confirm
             if selected:
-                fill = tango.RED_DEEP if danger else tango.BLUE
+                if focused:
+                    fill = tango.RED_DEEP if danger else tango.BLUE
+                else:
+                    fill = tango.ROW_ALT
                 draw.rounded(row, max(4, int(8 * scale)), fill)
             pad = max(10, int(16 * scale))
-            if entry.argv is None:
+            hint = entry_hint(entry)
+            if entry.argv is None and not entry.submenu:
                 color = tango.GREY_DARK if not selected else tango.SILVER
-                hint, hint_color = entry.reason, tango.GREY_DARK
+                hint_color = tango.GREY_DARK
             else:
                 color = tango.WHITE if selected else tango.SILVER
-                if entry.verb == "tab":
-                    hint, hint_color = "opens a page", tango.BLUE_BRIGHT
+                if entry.hint == "on" or entry.submenu or entry.verb == "tab":
+                    hint_color = tango.BLUE_BRIGHT
                 elif entry.confirm:
-                    hint, hint_color = "confirms", tango.RED_BRIGHT
+                    hint_color = tango.RED_BRIGHT
                 else:
-                    hint, hint_color = "", tango.GREY
-            if selected:
+                    hint_color = tango.GREY
+            if selected and focused:
                 hint_color = tango.WHITE
                 marker_w = max(3, int(4 * scale))
                 draw.fill((row[0] + 3, row[1] + 3, row[0] + 3 + marker_w,
@@ -555,6 +581,11 @@ class DesktopRenderer:
             if hint:
                 draw.text((row[0] + pad, row[1], row[2] - pad, row[3]),
                           hint, hint_font, hint_color, align="right")
+        if len(entries) > capacity:
+            more = font_for(10 * scale)
+            draw.text((left, bottom - more.height, right, bottom),
+                      f"{offset + 1}-{offset + capacity} / {len(entries)}",
+                      more, tango.GREY_DARK, align="right")
 
     def _confirm(self, draw: Draw, screen: Box, state: State,
                  scale: float) -> None:
@@ -587,9 +618,7 @@ class DesktopRenderer:
         pad = max(10, int(18 * scale))
         top = height - footer_h
         draw.hline(0, width, top, tango.HEADER, footer_h)
-        hints = ("y confirm · any other key cancels" if state.confirm
-                 else "1-6 section · Tab next · Up/Down · Enter open"
-                      " · r refresh · q quit")
+        hints = footer_text(state)
         draw.text((pad, top, width - pad, height), hints, font, tango.GREY)
         # The brand tag is decoration, so it is what gives way when the two
         # will not both fit.

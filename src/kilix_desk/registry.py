@@ -30,6 +30,7 @@ class Item:
     kilix: tuple[str, ...] = ()      # `kilix <subcommand>` fallback
     verb: str = "inplace"
     kilix_only: bool = False         # hidden outside a Kilix session
+    submenu: str = ""                # opens a drill-down list instead
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,9 @@ PROGRAMS = (
     Item("Coding agents", command="kilix-rollout-resume",
          sibling="rollout_resume"),
     Item("Model store", command="kilix-bonsai", kilix=("bonsai",), verb="tab"),
-    Item("Games", kilix=("games",), verb="tab", kilix_only=True),
+    Item("Web browser", kilix=("browse",), verb="tab", kilix_only=True),
+    Item("Games", submenu="games"),
+    Item("Screensavers", submenu="screensavers", kilix_only=True),
     Item("Music", command="kilix-music", sibling="music"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
@@ -65,6 +68,7 @@ MACHINE = (
 SYSTEM = (
     Item("OS control", command="plebian-os", sibling="plebian_control"),
     Item("Chrome settings", command="kilix-settings", kilix=("settings",)),
+    Item("Screen sharing", kilix=("share",), verb="tab", kilix_only=True),
     # `kilix desktop <name>` opens its own page and returns at once, so these
     # run in place: launching them in a page of ours would leave a dead tab
     # behind the one the launcher opens.
@@ -74,10 +78,13 @@ SYSTEM = (
 )
 
 SESSION = (
-    Item("Session logs", command="kilix-session-log", sibling="session_log"),
+    Item("New terminal", kilix=("new-tab",), kilix_only=True),
+    Item("New pane", kilix=("new-pane",), kilix_only=True),
     Item("Switcher", command="kilix-switch", sibling="switcher",
          kilix_only=True),
+    Item("Session logs", command="kilix-session-log", sibling="session_log"),
     Item("PTY sessions", kilix=("pty",), kilix_only=True),
+    Item("Mux terminal", kilix=("mux",), kilix_only=True),
     Item("Tmux manager", command="tmux-tui"),
 )
 
@@ -90,6 +97,55 @@ SECTIONS: dict[str, tuple[Item, ...]] = {
     "System": SYSTEM,
     "Session": SESSION,
 }
+
+
+def _sdk_settings():
+    """`kilix_sdk.settings`, or None — resolved the way `theme.py` does."""
+    import importlib
+    source = os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
+        os.path.expanduser("~"), "gpu_terminal")
+    for home in (os.environ.get("KILIX_HOME", ""),
+                 os.path.join(source, "kilix")):
+        config = os.path.join(home, "config") if home else ""
+        if config and os.path.isdir(os.path.join(config, "kilix_sdk")):
+            if config not in sys.path:
+                sys.path.insert(0, config)
+            try:
+                return importlib.import_module("kilix_sdk.settings")
+            except Exception:
+                return None
+    return None
+
+
+def games() -> list[tuple[str, str, bool]] | None:
+    """(id, label, enabled) for every stack game, or None without Kilix.
+
+    This is `kilix games list`, absorbed: the shared availability toggles the
+    text menu prints are a list the desktop can show and flip directly.
+    """
+    sdk = _sdk_settings()
+    if sdk is None:
+        return None
+    try:
+        availability = sdk.game_availability()
+        return [(game_id, label, bool(availability.get(game_id, True)))
+                for game_id, label in sdk.GAME_TOGGLE_IDS]
+    except Exception:
+        return None
+
+
+def screensavers() -> list[str]:
+    """The screensaver names a Kilix checkout ships, `kilix screensaver X`."""
+    source = os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
+        os.path.expanduser("~"), "gpu_terminal")
+    home = os.environ.get("KILIX_HOME") or os.path.join(source, "kilix")
+    directory = os.path.join(home, "config", "screensavers")
+    try:
+        names = sorted(name[:-2] for name in os.listdir(directory)
+                       if name.endswith(".c"))
+    except OSError:
+        return []
+    return names
 
 
 def kilix_command() -> list[str] | None:

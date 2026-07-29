@@ -110,16 +110,23 @@ def run(
     *,
     handle: Callable[[int, Any], bool] | None = None,
     tick_ms: int | None = None,
+    mouse: bool = False,
 ) -> int:
     """Run a tool interactively until it quits.
 
     `handle` returns False to exit. `tick_ms` makes the loop wake up on its own
-    so a monitoring tool can refresh without input.
+    so a monitoring tool can refresh without input. `mouse` reports clicks and
+    the wheel as `curses.KEY_MOUSE` for `handle` to interpret via `getmouse`.
     """
 
     def _loop(stdscr: Any) -> int:
         curses.curs_set(0)
         stdscr.keypad(True)
+        if mouse:
+            try:
+                curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            except Exception:
+                pass
         if tick_ms:
             stdscr.timeout(tick_ms)
         while True:
