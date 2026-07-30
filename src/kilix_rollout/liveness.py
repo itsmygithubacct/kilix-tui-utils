@@ -109,6 +109,53 @@ def registry_owners(directory: str, *, proc_root: str = "/proc") -> dict[str, tu
     return {key: tuple(sorted(pids)) for key, pids in owners.items()}
 
 
+def registry_records(
+    directory: str,
+    *,
+    proc_root: str = "/proc",
+) -> dict[str, tuple[dict[str, object], ...]]:
+    """Return validated Claude registry metadata grouped by session ID."""
+    found: dict[str, list[dict[str, object]]] = {}
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return {}
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        session_id = record.get("sessionId")
+        try:
+            pid = int(record.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(session_id, str) or not session_id or pid <= 0:
+            continue
+        actual = start_ticks(pid, proc_root=proc_root)
+        recorded = record.get("procStart")
+        if actual is None or (
+                recorded is not None and str(recorded) != actual):
+            continue
+        found.setdefault(session_id.lower(), []).append({
+            "pid": pid,
+            "cwd": str(record.get("cwd") or ""),
+            "status": str(record.get("status") or ""),
+            "name": str(record.get("name") or ""),
+            "version": str(record.get("version") or ""),
+            "entrypoint": str(record.get("entrypoint") or ""),
+        })
+    return {
+        session_id: tuple(sorted(items, key=lambda item: int(item["pid"])))
+        for session_id, items in found.items()
+    }
+
+
 def prune_registry(directory: str, *, proc_root: str = "/proc") -> list[dict[str, object]]:
     """Remove stale, structurally valid Claude registry descriptors.
 

@@ -57,8 +57,13 @@ def head_records(path: str, limit: int = 64) -> Iterator[dict]:
                 yield record
 
 
-def tail_records(path: str, limit: int = 200) -> Iterator[dict]:
-    """Yield parsed records newest first, bounded so a huge file stays cheap."""
+def tail_records(path: str, limit: int | None = 200) -> Iterator[dict]:
+    """Yield parsed records newest first.
+
+    ``limit=None`` keeps memory bounded while allowing a caller to continue
+    until it has recovered every required field from an unusually sparse
+    transcript.
+    """
     seen = 0
     for raw in reverse_lines(path):
         record = load(raw)
@@ -66,7 +71,7 @@ def tail_records(path: str, limit: int = 200) -> Iterator[dict]:
             continue
         yield record
         seen += 1
-        if seen >= limit:
+        if limit is not None and seen >= limit:
             return
 
 

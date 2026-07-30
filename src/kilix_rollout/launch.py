@@ -12,11 +12,13 @@ them back to back.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 from . import config
@@ -101,6 +103,14 @@ def check_installed(session: Session, executable: str = "") -> Provider:
 
 
 def _check_live(session: Session, force_live: bool) -> None:
+    if session.state == "orphaned":
+        raise RuntimeError(
+            f"session {session.short_id} has no transcript left on disk; "
+            "its conversation cannot be reloaded")
+    if session.state == "invalid":
+        raise RuntimeError(
+            session.invalid_reason
+            or "session has no valid ID and cannot be resumed")
     if session.state == "live" and not force_live:
         detail = f" (PID {', '.join(str(pid) for pid in session.pids)})" if session.pids else ""
         raise RuntimeError(
@@ -152,7 +162,69 @@ def requested_tmux_name(session: Session, requested: str, taken=()) -> str:
     return name
 
 
-def tmux_sessions(*, runner=subprocess.run) -> set[str]:
+def _program(value: str, label: str) -> str:
+    candidate = os.path.abspath(os.path.expanduser(value)) if value else ""
+    if candidate and os.path.isfile(candidate):
+        return candidate
+    found = shutil.which(value) if value else ""
+    if found:
+        return found
+    raise RuntimeError(f"could not find {label}: {value or label}")
+
+
+def _tb_prefix(tb: str) -> list[str]:
+    path = _program(tb, "tb")
+    if os.access(path, os.X_OK):
+        return [path]
+    if path.endswith(".py"):
+        return [sys.executable, path]
+    raise RuntimeError(f"tmux backend is not executable: {path}")
+
+
+def _tb_json(
+    tb: str,
+    arguments: list[str],
+    *,
+    runner=subprocess.run,
+    timeout: float = 20,
+) -> object:
+    command = [*_tb_prefix(tb), "--json", *arguments]
+    try:
+        result = runner(
+            command, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"tmux backend failed: {error}") from error
+    raw = (result.stdout or result.stderr or "").strip()
+    try:
+        envelope = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"invalid response from tmux backend: {raw or 'no output'}") from error
+    if not isinstance(envelope, dict):
+        raise RuntimeError("tmux backend returned an invalid JSON envelope")
+    if result.returncode != 0 or not envelope.get("ok"):
+        if envelope.get("code") == "ENOSERVER":
+            raise RuntimeError("no tmux server is running")
+        raise RuntimeError(str(
+            envelope.get("error") or f"tmux backend exited {result.returncode}"))
+    return envelope.get("data")
+
+
+def tmux_sessions(*, tb: str = "", runner=subprocess.run) -> set[str]:
+    if tb:
+        try:
+            data = _tb_json(tb, ["ls"], runner=runner)
+        except RuntimeError as error:
+            if "no tmux server" in str(error):
+                return set()
+            raise
+        if not isinstance(data, list):
+            raise RuntimeError(
+                "tmux backend returned an unexpected session list")
+        return {
+            str(item["name"]) for item in data
+            if isinstance(item, dict) and item.get("name")
+        }
     tmux = config.configured_program("tmux", "tmux")
     try:
         result = runner([tmux, "list-sessions", "-F", "#{session_name}"],
@@ -175,12 +247,22 @@ def tmux_argv(
     permission_mode: str = "",
     model: str = "",
     prompt: str = "",
+    tb: str = "",
+    no_log: bool = False,
 ) -> list[str]:
-    tmux = config.configured_program("tmux", "tmux")
     chosen_cwd = working_directory(session, cwd)
     command = resume_command(
         session, yolo=yolo, executable=executable, fork=fork,
         permission_mode=permission_mode, model=model, prompt=prompt)
+    if tb:
+        argv = [
+            *_tb_prefix(tb), "--json", "new", name,
+            "--cwd", chosen_cwd, "--cmd", shlex.join(command),
+        ]
+        if no_log:
+            argv.append("--no-log")
+        return argv
+    tmux = config.configured_program("tmux", "tmux")
     return [tmux, "new-session", "-d", "-s", name, "-c", chosen_cwd, *command]
 
 
@@ -197,6 +279,8 @@ def resume_plan(
     permission_mode: str = "",
     model: str = "",
     prompt: str = "",
+    tb: str = "",
+    no_log: bool = False,
     taken=None,
     runner=subprocess.run,
 ) -> dict[str, object]:
@@ -210,13 +294,15 @@ def resume_plan(
     chosen_name = ""
     tmux_command: list[str] = []
     if detached:
-        existing = tmux_sessions(runner=runner) if taken is None else set(taken)
+        existing = (
+            tmux_sessions(tb=tb, runner=runner)
+            if taken is None else set(taken))
         chosen_name = (requested_tmux_name(session, name, existing)
                        if name else tmux_name(session, existing))
         tmux_command = tmux_argv(
             session, chosen_name, yolo=yolo, cwd=chosen_cwd,
             executable=executable, fork=fork, permission_mode=permission_mode,
-            model=model, prompt=prompt)
+            model=model, prompt=prompt, tb=tb, no_log=no_log)
     return {
         "provider": session.provider,
         "session_id": session.session_id,
@@ -226,6 +312,8 @@ def resume_plan(
         "detached": detached,
         "tmux_name": chosen_name,
         "tmux_command": tmux_command,
+        "tmux_backend": "tb" if tb else "tmux",
+        "pane_logging": bool(tb and not no_log),
     }
 
 
@@ -242,6 +330,8 @@ def start_detached(
     permission_mode: str = "",
     model: str = "",
     prompt: str = "",
+    tb: str = "",
+    no_log: bool = False,
     pacer=None,
     on_wait=None,
     runner=subprocess.run,
@@ -250,22 +340,38 @@ def start_detached(
     _check_live(session, force_live)
     check_installed(session, executable)
     working_directory(session, cwd)
-    existing = tmux_sessions(runner=runner) if taken is None else set(taken)
+    existing = (
+        tmux_sessions(tb=tb, runner=runner)
+        if taken is None else set(taken))
     chosen_name = (requested_tmux_name(session, name, existing)
                    if name else tmux_name(session, existing))
     argv = tmux_argv(
         session, chosen_name, yolo=yolo, cwd=cwd, executable=executable,
-        fork=fork, permission_mode=permission_mode, model=model, prompt=prompt)
+        fork=fork, permission_mode=permission_mode, model=model, prompt=prompt,
+        tb=tb, no_log=no_log)
 
     def create():
         try:
-            result = runner(argv, capture_output=True, text=True, timeout=30,
-                            check=False)
+            result = runner(
+                argv, capture_output=True, text=True, timeout=30, check=False)
         except (OSError, subprocess.SubprocessError) as error:
             raise RuntimeError(f"tmux could not start the session: {error}") from error
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip() or "tmux failed"
             raise RuntimeError(detail)
+        if tb:
+            raw = (result.stdout or result.stderr or "").strip()
+            try:
+                envelope = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"invalid response from tmux backend: {raw or 'no output'}"
+                ) from error
+            if not isinstance(envelope, dict) or not envelope.get("ok"):
+                raise RuntimeError(str(
+                    envelope.get("error", "tmux backend failed")
+                    if isinstance(envelope, dict)
+                    else "tmux backend returned an invalid JSON envelope"))
 
     if pacer is None:
         create()
@@ -275,15 +381,26 @@ def start_detached(
     return chosen_name
 
 
-def attach(name: str) -> None:
+def attach(name: str, *, tb: str = "") -> None:
     """Replace this process with a tmux attachment. Does not return."""
+    if tb:
+        prefix = _tb_prefix(tb)
+        os.execvp(prefix[0], [*prefix, "attach", name])
     tmux = config.configured_program("tmux", "tmux")
     os.execvp(tmux, [tmux, "attach-session", "-t", name])
 
 
 def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
+                tb: str = "", no_log: bool = False,
+                executables: dict[str, str] | None = None,
+                force_live: bool = False,
+                fork: bool = False,
+                permission_mode: str = "",
+                model: str = "",
+                prompt: str = "",
                 runner=subprocess.run, sleeper=time.sleep,
-                on_wait=None, pacer=None) -> list[dict[str, object]]:
+                on_wait=None, on_result=None,
+                pacer=None) -> list[dict[str, object]]:
     """Start several sessions, waiting `gap` seconds between each launch.
 
     The wait happens *before* each launch after the first, and only when the
@@ -291,7 +408,8 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
     next one should not be made to pay for it.
     """
     results: list[dict[str, object]] = []
-    taken = tmux_sessions(runner=runner)
+    executables = executables or {}
+    taken = tmux_sessions(tb=tb, runner=runner)
     started = 0
     for session in sessions:
         if pacer is None and started and gap > 0:
@@ -303,9 +421,20 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
                 sleeper(step)
                 remaining -= step
         try:
+            claude_options = {
+                "fork": fork if session.provider == "claude" else False,
+                "permission_mode": (
+                    permission_mode if session.provider == "claude" else ""),
+                "model": model if session.provider == "claude" else "",
+                "prompt": prompt if session.provider == "claude" else "",
+            }
             if pacer is None:
                 name = start_detached(session, taken=taken, yolo=yolo,
-                                      runner=runner)
+                                      executable=executables.get(
+                                          session.provider, ""),
+                                      force_live=force_live,
+                                      tb=tb, no_log=no_log, runner=runner,
+                                      **claude_options)
             else:
                 callback = (
                     (lambda remaining, _interval, item=session:
@@ -313,11 +442,20 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
                     if on_wait is not None else None)
                 name = start_detached(
                     session, taken=taken, yolo=yolo, runner=runner,
-                    pacer=pacer, on_wait=callback)
+                    executable=executables.get(session.provider, ""),
+                    force_live=force_live,
+                    tb=tb, no_log=no_log, pacer=pacer, on_wait=callback,
+                    **claude_options)
         except RuntimeError as error:
-            results.append({"session": session, "ok": False, "detail": str(error)})
+            result = {"session": session, "ok": False, "detail": str(error)}
+            results.append(result)
+            if on_result is not None:
+                on_result(result, len(results), len(sessions))
             continue
         taken.add(name)
         started += 1
-        results.append({"session": session, "ok": True, "detail": name})
+        result = {"session": session, "ok": True, "detail": name}
+        results.append(result)
+        if on_result is not None:
+            on_result(result, len(results), len(sessions))
     return results

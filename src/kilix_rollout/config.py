@@ -21,7 +21,7 @@ YOLO_KEY = "KILIX_CODING_YOLO"
 
 DEFAULT_GAP = 30.0
 _TRUE = frozenset({"on", "1", "true", "yes"})
-_PROGRAM_KEYS = frozenset({"tmux", "claude", "codex", "kimi"})
+_PROGRAM_KEYS = frozenset({"tmux", "tb", "claude", "codex", "kimi"})
 _NUMBER_KEYS = frozenset({"gap"})
 _CONFIG_KEYS = _PROGRAM_KEYS | _NUMBER_KEYS
 
@@ -104,8 +104,9 @@ def load_config(path: Path | None = None) -> dict[str, object]:
 
     With the default path, useful settings from the retired provider-specific
     tools are inherited until the user writes a unified configuration.
-    ``tb`` is deliberately not inherited: it is a different command-line
-    interface, while the unified tool talks directly to tmux.
+    The optional ``tb`` adapter is inherited too. Native tmux remains the
+    default, while users who relied on tmux-cli pane logging retain that
+    behavior by keeping their existing configuration.
     """
     if path is not None:
         return _read(path.expanduser(), strict=True)
@@ -121,6 +122,9 @@ def load_config(path: Path | None = None) -> dict[str, object]:
     for key in ("codex",):
         if key in codex_settings:
             settings[key] = codex_settings[key]
+    legacy_tb = claude_settings.get("tb") or codex_settings.get("tb")
+    if isinstance(legacy_tb, str) and legacy_tb:
+        settings["tb"] = legacy_tb
     interval = claude_settings.get("interval")
     if isinstance(interval, (int, float)):
         settings["gap"] = float(interval)
@@ -188,10 +192,19 @@ def configured_program(key: str, default: str) -> str:
         f"KILIX_ROLLOUT_RESUME_{key.upper()}")
     if environment:
         return environment
-    legacy_environment = os.environ.get(
-        f"{key.upper()}_ROLLOUT_RESUME_{key.upper()}")
-    if legacy_environment:
-        return legacy_environment
+    if key == "tb":
+        for name in (
+            "CLAUDE_ROLLOUT_RESUME_TB",
+            "CODEX_ROLLOUT_RESUME_TB",
+            "TMUX_CLI",
+        ):
+            if os.environ.get(name):
+                return os.environ[name]
+    else:
+        legacy_environment = os.environ.get(
+            f"{key.upper()}_ROLLOUT_RESUME_{key.upper()}")
+        if legacy_environment:
+            return legacy_environment
     value = load_config().get(key)
     return str(value) if isinstance(value, str) and value else default
 
@@ -200,17 +213,31 @@ def resolve_program(key: str, default: str) -> str:
     """Resolve a configured program to an executable path, or return ``""``."""
     value = configured_program(key, default)
     candidate = Path(value).expanduser()
-    if candidate.is_file() and os.access(candidate, os.X_OK):
+    if candidate.is_file() and (
+            os.access(candidate, os.X_OK)
+            or (key == "tb" and candidate.suffix == ".py")):
         return str(candidate.absolute())
     return shutil.which(value) or ""
 
 
 def launch_gap() -> float:
     raw = os.environ.get("KILIX_ROLLOUT_RESUME_GAP")
+    origin = "KILIX_ROLLOUT_RESUME_GAP"
+    if raw is None:
+        # Keep the retired Claude tool's environment override useful during
+        # migration, just as load_config() keeps its saved interval useful.
+        raw = os.environ.get("CLAUDE_ROLLOUT_RESUME_INTERVAL")
+        origin = "CLAUDE_ROLLOUT_RESUME_INTERVAL"
     if raw is None:
         raw = load_config().get("gap", DEFAULT_GAP)
+        origin = "the configured launch interval"
     try:
         gap = float(raw)
     except (TypeError, ValueError):
-        return DEFAULT_GAP
-    return max(0.0, gap)
+        raise RuntimeError(
+            f"invalid launch interval from {origin}: {raw}") from None
+    if gap < DEFAULT_GAP:
+        raise RuntimeError(
+            f"launch interval from {origin} must be at least "
+            f"{DEFAULT_GAP:.0f} seconds")
+    return gap

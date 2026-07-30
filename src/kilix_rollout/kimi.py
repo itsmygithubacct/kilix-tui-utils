@@ -92,10 +92,29 @@ def _prompt_text(value) -> str:
 
 
 def discover(*, root: str = "", proc_root: str = "/proc",
-             since: float = 0.0) -> list[Session]:
+             since: float = 0.0,
+             selectors: tuple[str, ...] = ()) -> list[Session]:
     base = root or home()
     oldest = model.cutoff(since)
     entries = _index(base)
+    if selectors:
+        selected = []
+        for entry in entries:
+            session_id = str(entry.get("sessionId") or "")
+            directory = str(entry.get("sessionDir") or "")
+            wire = wire_path(directory)
+            absolute = os.path.abspath(wire).casefold()
+            name = os.path.basename(wire).casefold()
+            if any(
+                session_id.casefold().startswith(selector.strip().casefold())
+                or name == selector.strip().casefold()
+                or absolute == os.path.abspath(
+                    os.path.expanduser(selector)).casefold()
+                for selector in selectors
+                if selector.strip()
+            ):
+                selected.append(entry)
+        entries = selected
     wires = [wire_path(str(entry.get("sessionDir"))) for entry in entries]
     owners = liveness.open_by(wires, proc_root=proc_root)
 

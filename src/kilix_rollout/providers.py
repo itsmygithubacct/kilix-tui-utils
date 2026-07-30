@@ -70,16 +70,42 @@ def provider(key: str) -> Provider:
         raise KeyError(f"unknown agent '{key}'; use one of: {known}") from None
 
 
-def discover(keys=None, **options) -> list[Session]:
+def discover(
+    keys=None,
+    *,
+    since: float = 0.0,
+    roots: dict[str, str] | None = None,
+    include_archived: bool = False,
+    include_orphans: bool = True,
+    proc_root: str = "/proc",
+    selectors: tuple[str, ...] = (),
+) -> list[Session]:
     """Collect sessions from every selected agent, newest first.
 
     One agent being absent or mid-write must not hide the others, so a failing
     provider contributes nothing rather than raising.
     """
     chosen = PROVIDERS if keys is None else [provider(key) for key in keys]
+    roots = roots or {}
     found: list[Session] = []
     for item in chosen:
         try:
+            options = {
+                "root": roots.get(item.key, ""),
+                "proc_root": proc_root,
+                "since": since,
+                "selectors": selectors,
+            }
+            if item.key == "claude":
+                projects = roots.get("claude_projects", "")
+                if projects:
+                    options["projects_root"] = projects
+                options["include_orphans"] = include_orphans
+            elif item.key == "codex":
+                sessions = roots.get("codex_sessions", "")
+                if sessions:
+                    options["sessions_root"] = sessions
+                options["include_archived"] = include_archived
             found.extend(item.discover(**options))
         except OSError:
             continue

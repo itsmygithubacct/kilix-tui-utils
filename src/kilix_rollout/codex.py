@@ -1,30 +1,39 @@
-"""Codex rollouts.
-
-One JSONL rollout per session under a dated directory tree. Codex states its
-own turn boundaries: every turn emits `task_started` and, when it finishes,
-`task_complete` — so a rollout whose latest turn event is `task_started` was
-interrupted, with no inference needed.
-"""
+"""Codex rollout discovery, including active and archived sessions."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
+from pathlib import Path
 import re
 
 from . import jsonl, liveness, model
 from .model import Session
 
 _UUID = re.compile(
-    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
-
-
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.I,
+)
 def home() -> str:
     return os.environ.get("CODEX_HOME") or os.path.join(
         os.path.expanduser("~"), ".codex")
 
 
+def _timestamp(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except ValueError:
+        return None
+
+
 def _message_text(value) -> str:
     if isinstance(value, str):
-        return jsonl.condense(value)
+        return jsonl.condense(value, 500)
     if isinstance(value, list):
         pieces = []
         for item in value:
@@ -34,32 +43,27 @@ def _message_text(value) -> str:
                 candidate = item.get("text") or item.get("input_text")
                 if isinstance(candidate, str):
                     pieces.append(candidate)
-        return jsonl.condense(" ".join(pieces))
+        return jsonl.condense(" ".join(pieces), 500)
     return ""
 
 
-def _rollouts(sessions_dir: str) -> list[str]:
-    found: list[str] = []
-    for current, _, names in os.walk(sessions_dir):
-        for name in names:
-            if name.startswith("rollout-") and name.endswith(".jsonl"):
-                found.append(os.path.join(current, name))
-    return found
+def _first_meta(path: str) -> dict[str, object]:
+    for record in jsonl.head_records(path, 256):
+        if record.get("type") != "session_meta":
+            continue
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            return {"timestamp": record.get("timestamp"), **payload}
+    return {}
 
 
-#: Codex writes a record per tool call and per output chunk, so the last thing
-#: the operator typed can sit a long way behind the end of a busy rollout. The
-#: scan still stops as soon as it has everything — only prompt-less rollouts
-#: pay for the depth.
-_TAIL = 1200
-
-
-def _inspect(path: str) -> tuple[str, str, str]:
-    """Return (state, cwd, title) from the tail of a rollout."""
-    state = ""
+def _inspect(path: str) -> dict[str, object]:
+    """Return the latest cwd, messages, and explicit turn boundary."""
     cwd = ""
     prompt = ""
-    for record in jsonl.tail_records(path, _TAIL):
+    agent_message = ""
+    turn_event = ""
+    for record in jsonl.tail_records(path, None):
         kind = record.get("type")
         payload = record.get("payload")
         payload = payload if isinstance(payload, dict) else {}
@@ -69,68 +73,149 @@ def _inspect(path: str) -> tuple[str, str, str]:
                 cwd = value
         elif kind == "event_msg":
             event = payload.get("type")
-            if not state and event in ("task_started", "task_complete"):
-                state = "cut-off" if event == "task_started" else "idle"
+            if not turn_event and event in ("task_started", "task_complete"):
+                turn_event = str(event)
             if not prompt and event == "user_message":
                 prompt = _message_text(payload.get("message") or payload.get("text"))
-        if state and cwd and prompt:
+            if not agent_message and event == "agent_message":
+                agent_message = _message_text(payload.get("message"))
+        if cwd and prompt and agent_message and turn_event:
             break
-    if not cwd:
-        for record in jsonl.head_records(path):
-            if record.get("type") == "session_meta":
-                payload = record.get("payload")
-                if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
-                    cwd = payload["cwd"]
-                break
-    return state or "idle", cwd, prompt
+    return {
+        "cwd": cwd,
+        "prompt": prompt,
+        "agent_message": agent_message,
+        "turn_event": turn_event,
+    }
 
 
-def _session_id(path: str) -> str:
+def _session_id(path: str, meta: dict[str, object]) -> str:
+    raw = meta.get("id") or meta.get("session_id")
+    if isinstance(raw, str) and raw:
+        return raw.lower()
     matches = _UUID.findall(os.path.basename(path))
-    if matches:
-        return matches[-1].lower()
-    for record in jsonl.head_records(path):
-        if record.get("type") == "session_meta":
-            payload = record.get("payload")
-            if isinstance(payload, dict):
-                value = payload.get("id") or payload.get("session_id")
-                if isinstance(value, str):
-                    return value.lower()
-            break
-    return ""
+    return matches[-1].lower() if matches else ""
 
 
-def discover(*, root: str = "", proc_root: str = "/proc",
-             since: float = 0.0) -> list[Session]:
-    base = root or home()
+def _rollouts(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    try:
+        return sorted(root.rglob("rollout-*.jsonl"))
+    except OSError:
+        return []
+
+
+def _matches_selector(
+    path: Path,
+    *,
+    session_id: str,
+    selectors: tuple[str, ...],
+) -> bool:
+    absolute = str(path.absolute()).casefold()
+    name = path.name.casefold()
+    for selector in selectors:
+        needle = selector.strip().casefold()
+        if not needle:
+            continue
+        expanded = str(Path(selector).expanduser().absolute()).casefold()
+        if (session_id.casefold().startswith(needle)
+                or name == needle
+                or absolute == expanded):
+            return True
+    return False
+
+
+def discover(
+    *,
+    root: str = "",
+    sessions_root: str = "",
+    include_archived: bool = False,
+    proc_root: str = "/proc",
+    since: float = 0.0,
+    selectors: tuple[str, ...] = (),
+) -> list[Session]:
+    """Discover active rollouts and, when requested, ``archived_sessions``."""
+    base = Path(root or home()).expanduser()
+    active = Path(sessions_root).expanduser() if sessions_root else base / "sessions"
+    roots: list[tuple[Path, bool]] = [(active, False)]
+    if include_archived:
+        archive = (
+            base / "archived_sessions"
+            if not sessions_root else active.parent / "archived_sessions"
+        )
+        roots.append((archive, True))
+
     oldest = model.cutoff(since)
-    paths = []
-    for path in _rollouts(os.path.join(base, "sessions")):
-        try:
-            updated = os.stat(path).st_mtime
-        except OSError:
-            continue
-        if oldest and updated < oldest:
-            continue              # stat-first, so old rollouts are never parsed
-        paths.append((path, updated))
+    candidates: list[tuple[str, float, bool, dict[str, object]]] = []
+    for directory, archived in roots:
+        for path in _rollouts(directory):
+            try:
+                updated = path.stat().st_mtime
+            except OSError:
+                continue
+            if oldest and updated < oldest:
+                continue
+            filename_ids = _UUID.findall(path.name)
+            filename_id = filename_ids[-1].lower() if filename_ids else ""
+            if (selectors and filename_id
+                    and not _matches_selector(
+                        path, session_id=filename_id, selectors=selectors)):
+                # As in the retired resolver, a standard filename is enough
+                # to reject an unrelated rollout without opening it.
+                continue
+            meta = _first_meta(str(path)) if selectors and not filename_id else {}
+            session_id = filename_id or _session_id(str(path), meta)
+            if selectors and not _matches_selector(
+                    path, session_id=session_id, selectors=selectors):
+                continue
+            candidates.append((str(path), updated, archived, meta))
+    candidates.sort(key=lambda item: item[1], reverse=True)
 
-    owners = liveness.open_by([path for path, _ in paths], proc_root=proc_root)
+    owners = liveness.open_by(
+        [path for path, _, _, _ in candidates], proc_root=proc_root)
     sessions: list[Session] = []
-    for path, updated in paths:
-        session_id = _session_id(path)
-        if not session_id:
-            continue
-        state, cwd, title = _inspect(path)
+    for path, updated, archived, cached_meta in candidates:
+        meta = cached_meta or _first_meta(path)
+        session_id = _session_id(path, meta)
+        display_id = session_id or Path(path).stem
+        details = _inspect(path)
         pids = owners.get(path, ())
+        event = str(details["turn_event"])
+        state = (
+            "invalid" if not session_id else
+            "live" if pids else
+            "cut-off" if event == "task_started" else
+            "idle"
+        )
+        original_cwd = (
+            str(meta.get("cwd")) if isinstance(meta.get("cwd"), str) else "")
+        cwd = str(details["cwd"]) or original_cwd
         sessions.append(Session(
-            provider="codex", session_id=session_id, path=path, cwd=cwd,
-            title=title, updated=updated,
-            state="live" if pids else state, pids=pids))
+            provider="codex",
+            session_id=display_id,
+            path=path,
+            cwd=cwd,
+            original_cwd=original_cwd,
+            title=str(details["prompt"]),
+            updated=updated,
+            state=state,
+            pids=pids,
+            started=_timestamp(meta.get("timestamp")),
+            last_user_message=str(details["prompt"]),
+            last_agent_message=str(details["agent_message"]),
+            last_turn_event=event,
+            version=str(meta.get("cli_version") or ""),
+            entrypoint=str(meta.get("source") or ""),
+            archived=archived,
+            invalid_reason=(
+                "no session ID was found in metadata or the filename"
+                if not session_id else ""),
+        ))
     return sessions
 
 
 def resume_argv(session: Session, *, yolo: bool = False) -> list[str]:
-    # Codex takes --yolo before the subcommand, not after it.
     argv = ["codex"]
     if yolo:
         argv.append("--yolo")
