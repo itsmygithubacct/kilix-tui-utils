@@ -107,6 +107,33 @@ class Renderer:
             return plain
         return text + " " * (width - len(visible))
 
+    def _shell(
+        self,
+        width: int,
+        *,
+        active: int,
+        summary: str,
+        summary_alert: bool = False,
+    ) -> list[str]:
+        identity = self._style(" KILIX TUI", "1;97")
+        title = self._style("Memory ", "2;37")
+        gap = max(1, width - len(strip_ansi(identity)) - len(strip_ansi(title)))
+        navigation = []
+        for index, label in enumerate(("Monitor", "Help")):
+            item = f"{'▶' if index == active else ' '}{index + 1} {label} "
+            navigation.append(self._style(
+                item, "1;97;44" if index == active else "2;37"))
+        return [
+            self._line(identity + " " * gap + title, width),
+            self._line(" " + "".join(navigation), width),
+            self._line(self._style("─" * max(0, width - 1), "2;37"), width),
+            self._line(
+                " " + self._style(
+                    display_text(summary), "91" if summary_alert else "2;37"),
+                width,
+            ),
+        ]
+
     def _help(self, width: int, height: int) -> str:
         entries = [
             ("q / Esc", "quit and restore the terminal"),
@@ -117,19 +144,26 @@ class Renderer:
             ("PgUp/PgDn", "scroll by a page"),
             ("h / ?", "close this help"),
         ]
-        lines = [
-            self._style(" KILIX MEMORY // HELP ", "1;96"),
-            "",
-            *[f"  {key:<12} {description}" for key, description in entries],
-            "",
-            "  Monitoring only: no process-control or reclaim actions.",
-        ]
-        top = max(0, (height - len(lines)) // 2)
-        result = [" " * width for _ in range(top)]
-        for line in lines:
-            padding = max(0, (width - len(strip_ansi(line))) // 2)
-            result.append(self._line(" " * padding + line, width))
-        return "\n".join(result[:height])
+        lines = self._shell(
+            width, active=1,
+            summary="HELP · Keyboard reference · monitoring only",
+        )
+        for key, description in entries:
+            if len(lines) >= height - 2:
+                break
+            lines.append(self._line(f"  {key:<12} {description}", width))
+        if len(lines) < height - 1:
+            lines.append(self._line(
+                "  Monitoring only: no process-control or reclaim actions.",
+                width,
+            ))
+        while len(lines) < height - 1:
+            lines.append(" " * width)
+        lines.append(self._line(
+            self._style(" 1 monitor · h/? close help · q quit ", "2;37"),
+            width,
+        ))
+        return "\n".join(lines[:height])
 
     def render(
         self,
@@ -144,22 +178,32 @@ class Renderer:
             return self._help(width, height)
         snapshot = model.current
         if snapshot is None:
-            return self._line("Kilix Memory: waiting for a sample", width)
+            lines = self._shell(
+                width, active=0, summary="Waiting for a memory sample",
+                summary_alert=True,
+            )
+            while len(lines) < height - 1:
+                lines.append(" " * width)
+            lines.append(self._line(
+                self._style(" q quit · h help ", "2;37"), width))
+            return "\n".join(lines[:height])
         memory = snapshot.memory
         pressure = snapshot.pressure
         rates = model.rates
         status = "PAUSED" if options.paused else f"LIVE {options.interval:.1f}s"
-        header_left = self._style("KILIX // MEMORY", "1;97")
-        header_right = (
-            f"{display_text(snapshot.hostname)}  {status}  "
-            f"{snapshot.timestamp.strftime('%H:%M:%S')}"
+        lines = self._shell(
+            width,
+            active=0,
+            summary=(
+                f"{display_text(snapshot.hostname)} · {status} · "
+                f"{snapshot.timestamp.strftime('%H:%M:%S')}"
+            ),
+            summary_alert=bool(options.notice),
         )
-        gap = max(1, width - len(strip_ansi(header_left)) - len(header_right))
-        lines = [self._line(header_left + " " * gap + header_right, width)]
 
-        used_color = "91" if memory.used_percent >= 90 else (
-            "93" if memory.used_percent >= 75 else "92"
-        )
+        # The main Kilix palette is blue, red, white, and grey.  Red is the
+        # only warning colour; ordinary measurements stay blue.
+        used_color = "91" if memory.used_percent >= 90 else "94"
         used = self._style(
             f"{format_bytes(memory.used)} / {format_bytes(memory.total)} "
             f"({memory.used_percent:4.1f}%)",
@@ -168,7 +212,7 @@ class Renderer:
         available = self._style(
             f"{format_bytes(memory.available)} "
             f"({memory.available_percent:4.1f}%)",
-            "96",
+            "94",
         )
         swap = (
             f"{format_bytes(memory.swap_used)} / {format_bytes(memory.swap_total)} "
@@ -176,12 +220,14 @@ class Renderer:
             if memory.swap_total
             else "not configured"
         )
-        lines.append(self._line(f" Used {used}   Available {available}", width))
-        lines.append(self._line(f" Swap {swap}", width))
+        details = [
+            self._line(f" Used {used}   Available {available}", width),
+            self._line(f" Swap {swap}", width),
+        ]
 
         bar_width = max(10, width - 22)
         used_bar = meter(memory.used_percent / 100.0, bar_width)
-        lines.append(
+        details.append(
             self._line(
                 f" RAM  {self._style(used_bar, used_color)} "
                 f"{memory.used_percent:5.1f}%",
@@ -192,7 +238,7 @@ class Renderer:
             f"{name} {format_bytes(value, short=True)}"
             for name, value in memory.composition
         )
-        lines.append(self._line(f" {composition}", width))
+        details.append(self._line(f" {composition}", width))
 
         pressure_text = (
             f"some {pressure.some.avg10:.2f}%  full {pressure.full.avg10:.2f}%"
@@ -205,26 +251,28 @@ class Renderer:
             f"Swap in/out {format_rate(rates.swap_in_bytes_per_second)}/"
             f"{format_rate(rates.swap_out_bytes_per_second)}"
         )
-        lines.append(self._line(activity, width))
+        details.append(self._line(activity, width))
 
         graph_width = max(8, width - 19)
         used_history = [point.used_percent for point in model.history]
         pressure_history = [point.pressure_some for point in model.history]
-        lines.append(
+        details.append(
             self._line(
                 f" Used history     {self._style(sparkline(used_history, graph_width), '94')}",
                 width,
             )
         )
-        lines.append(
+        details.append(
             self._line(
-                f" PSI some avg10  {self._style(sparkline(pressure_history, graph_width), '95')}",
+                f" PSI some avg10  {self._style(sparkline(pressure_history, graph_width), '94')}",
                 width,
             )
         )
+        # Always preserve a process heading and footer at the minimum height.
+        lines.extend(details[:max(0, height - len(lines) - 2)])
 
         rows = model.ordered_processes(options.sort_mode)
-        table_space = max(1, height - len(lines) - 2)
+        table_space = max(0, height - len(lines) - 2)
         maximum_scroll = max(0, len(rows) - table_space)
         options.scroll = max(0, min(options.scroll, maximum_scroll))
         shown = rows[options.scroll : options.scroll + table_space]
@@ -260,5 +308,7 @@ class Renderer:
             f"q quit · space pause · r reset · s sort [{options.sort_mode}] "
             "· ↑↓ scroll · h help"
         )
-        lines.append(self._line(self._style(footer, "2"), width))
+        while len(lines) < height - 1:
+            lines.append(" " * width)
+        lines.append(self._line(self._style(" " + footer, "2;37"), width))
         return "\n".join(lines[:height])

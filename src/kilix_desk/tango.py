@@ -1,11 +1,8 @@
 """The desktop's Tango palette, for pixels and for plain text.
 
-The desktop wears Kilix's own colours — Tango blues, reds, whites and greys —
-rather than the theatrical panel look the smaller tools opted into. One module
-holds both renderings of that decision: RGB triples for the pixel renderer,
-and curses attributes for the text fallback, resolved lazily the same way
-`theme.panel_pairs` resolves so headless renders still get distinct,
-assertable attributes.
+The desktop wears Kilix's own colours — Tango blues, reds, whites and greys.
+One module holds both renderings of that decision: RGB triples for the pixel
+renderer and curses attributes for the text fallback.
 """
 from __future__ import annotations
 
@@ -35,10 +32,10 @@ GREY_DARK = (85, 87, 83)       # Tango aluminium 5
 # Five roles are all the text layout needs. Pairs are allocated on first use
 # and only when curses is actually running; a headless render gets stable
 # synthetic values instead, so `attr_shape()` can assert the layout without a
-# terminal — the same bargain `theme.panel_pairs` makes for the panel look.
+# terminal.
 
 _ATTRS: dict[str, int] | None = None
-_PAIR_BASE = 48    # clear of the panel look's 32.. block
+_PAIR_BASE = 16
 
 
 def _resolve() -> dict[str, int]:

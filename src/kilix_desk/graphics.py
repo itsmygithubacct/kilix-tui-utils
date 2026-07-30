@@ -415,7 +415,7 @@ class DesktopRenderer:
         draw.text((pad, 0, width // 2, header_h - 4), "KILIX TUI", title,
                   tango.WHITE)
         release = next((v for k, v in state.status if k == "release"), "")
-        strap = f"PLEBIAN-OS {release}".strip() + "  //  TEXT DESKTOP"
+        strap = f"PLEBIAN-OS {release}".strip() + " · DESKTOP"
         draw.text((pad + title.width("KILIX TUI") + pad, 0,
                    width - pad - small.width(clock) - pad, header_h - 4),
                   strap, small, tango.GREY)

@@ -37,17 +37,13 @@ TEXT = (224, 232, 242)
 MUTED = (132, 150, 171)
 DIM = (83, 103, 128)
 BLUE = (65, 156, 224)
-CYAN = (58, 206, 211)
-GREEN = (138, 226, 52)
-YELLOW = (252, 211, 77)
-ORANGE = (245, 121, 0)
 RED = (239, 65, 65)
 WHITE = (247, 250, 252)
 
 LEVEL_COLORS: dict[Level, Color] = {
-    Level.NORMAL: GREEN,
-    Level.WARM: YELLOW,
-    Level.HOT: ORANGE,
+    Level.NORMAL: BLUE,
+    Level.WARM: BORDER_BRIGHT,
+    Level.HOT: RED,
     Level.CRITICAL: RED,
 }
 
@@ -686,7 +682,7 @@ class GraphicalRenderer:
         self._text(
             draw,
             (left + 18, top + 4, right // 2, bottom - 4),
-            "KILIX // TEMPS",
+            "KILIX TUI",
             title_font,
             WHITE,
         )
@@ -847,7 +843,7 @@ class GraphicalRenderer:
                 cpu_value,
                 f"load {metrics.load_1:.2f}  {metrics.load_5:.2f}  {metrics.load_15:.2f}",
                 cpu_ratio,
-                CYAN,
+                BLUE,
                 None,
                 100.0,
             )
@@ -1068,7 +1064,7 @@ class GraphicalRenderer:
             "System pulse",
             f"{sample.metrics.cpu_count} threads",
             scale,
-            color=CYAN,
+            color=BLUE,
         )
         label = self._font(8 * scale, bold=True)
         value = self._font(9 * scale)
@@ -1076,7 +1072,7 @@ class GraphicalRenderer:
         row_h = max(24, int(31 * scale))
         metrics = sample.metrics
         gauges = [
-            ("CPU", metrics.cpu_percent, CYAN),
+            ("CPU", metrics.cpu_percent, BLUE),
             ("MEM", metrics.memory_percent, BLUE),
         ]
         for name, number, color in gauges:
@@ -1105,7 +1101,7 @@ class GraphicalRenderer:
             spec = fan_names.get(key)
             name = spec.label if spec else key
             self._text(draw, (left + pad, y, right - pad - 80, y + row_h), f"FAN  {name}", value, MUTED)
-            self._text(draw, (right - pad - 80, y, right - pad, y + row_h), f"{rpm:,} RPM", value, CYAN, align="right")
+            self._text(draw, (right - pad - 80, y, right - pad, y + row_h), f"{rpm:,} RPM", value, BLUE, align="right")
             y += row_h
 
     def _process_panel(
@@ -1126,7 +1122,7 @@ class GraphicalRenderer:
             "Heat sources",
             "CPU consumers",
             scale,
-            color=ORANGE,
+            color=RED,
         )
         body = self._font(9 * scale)
         small = self._font(8 * scale)
@@ -1149,12 +1145,12 @@ class GraphicalRenderer:
                 break
             instances = f" ×{process.instances}" if process.instances > 1 else ""
             self._text(draw, (left + pad, y, right - pad - 55, y + row_h // 2 + 3), process.name + instances, body, TEXT)
-            self._text(draw, (right - pad - 52, y, right - pad, y + row_h // 2 + 3), f"{process.cpu_percent:.0f}%", small, ORANGE, align="right")
+            self._text(draw, (right - pad - 52, y, right - pad, y + row_h // 2 + 3), f"{process.cpu_percent:.0f}%", small, RED, align="right")
             self._bar(
                 draw,
                 (left + pad, y + row_h - 6, right - pad, y + row_h - 2),
                 process.cpu_percent / max(1.0, maximum),
-                ORANGE,
+                RED,
                 background=(43, 32, 28),
             )
             y += row_h
@@ -1201,7 +1197,7 @@ class GraphicalRenderer:
         controls = "q quit   space pause   r reset   +/− rate   ↑↓ scroll   s sort   u unit   l log   h help"
         self._text(draw, (left + 4, top, right - 180, bottom), controls, font, MUTED)
         log = options.notice or ("CSV LOG ON" if options.logging else "CSV LOG OFF")
-        self._text(draw, (right - 180, top, right - 4, bottom), log, font, CYAN if options.logging else DIM, align="right")
+        self._text(draw, (right - 180, top, right - 4, bottom), log, font, BLUE if options.logging else DIM, align="right")
 
     def _compact(
         self,
@@ -1280,7 +1276,7 @@ class GraphicalRenderer:
         title = self._font(18 * scale, bold=True)
         key_font = self._font(9 * scale, bold=True)
         body = self._font(9 * scale)
-        self._text(draw, (left + 22, top + 14, box[2] - 22, top + 52), "KILIX TEMPS // HELP", title, WHITE)
+        self._text(draw, (left + 22, top + 14, box[2] - 22, top + 52), "KILIX TUI · TEMPERATURE HELP", title, WHITE)
         entries = [
             ("q / Esc", "quit and restore the terminal"),
             ("Space", "pause or resume sampling"),
@@ -1298,7 +1294,7 @@ class GraphicalRenderer:
         for key, description in entries:
             if y + row_h > box[3] - 58:
                 break
-            self._text(draw, (left + 22, y, left + 22 + key_width, y + row_h), key, key_font, CYAN)
+            self._text(draw, (left + 22, y, left + 22 + key_width, y + row_h), key, key_font, BLUE)
             self._text(draw, (left + 30 + key_width, y, box[2] - 22, y + row_h), description, body, TEXT)
             y += row_h
         policy = (
@@ -1306,7 +1302,7 @@ class GraphicalRenderer:
             f"HOT {options.temperature_unit.absolute(model.thresholds.hot):.0f}{options.temperature_unit.symbol}   "
             f"LIMIT {options.temperature_unit.absolute(model.thresholds.critical):.0f}{options.temperature_unit.symbol}"
         )
-        self._text(draw, (left + 22, box[3] - 51, box[2] - 22, box[3] - 31), policy, key_font, YELLOW)
+        self._text(draw, (left + 22, box[3] - 51, box[2] - 22, box[3] - 31), policy, key_font, WHITE)
         self._text(draw, (left + 22, box[3] - 30, box[2] - 22, box[3] - 10), "Monitoring only — Kilix Temps never throttles, kills jobs, or powers off.", body, MUTED)
 
     def render(

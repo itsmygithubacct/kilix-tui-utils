@@ -193,6 +193,10 @@ class DashboardApp:
                 actions.append("sort")
             elif chr(byte) in ("h", "H", "?"):
                 actions.append("help")
+            elif chr(byte) == "1":
+                actions.append("monitor")
+            elif chr(byte) == "2":
+                actions.append("show_help")
             elif chr(byte) in ("j", "J"):
                 actions.append("down")
             elif chr(byte) in ("k", "K"):
@@ -209,6 +213,10 @@ class DashboardApp:
                 self._cycle_sort()
             elif action == "help":
                 self.options.help_visible = not self.options.help_visible
+            elif action == "monitor":
+                self.options.help_visible = False
+            elif action == "show_help":
+                self.options.help_visible = True
             elif action == "up":
                 self._scroll(-1)
             elif action == "down":

@@ -1,8 +1,8 @@
 # Kilix Memory
 
-Kilix Memory is a read-only Linux memory dashboard for terminals. It combines
-a dense, Glances-style overview with a native pixel UI when Kitty graphics are
-available:
+Kilix Memory is a read-only Linux memory dashboard for terminals. Its default
+interface is the canonical Kilix text TUI; an optional native pixel view is
+available with `--graphics`:
 
 - RAM used/available and a physical-memory composition
 - swap use and swap-in/swap-out rates
@@ -30,8 +30,7 @@ cd ~/.local/gpu_terminal/sources/kilix-tui-utils
 python3 tools/memory/main.py --graphics
 ```
 
-Automatic display selection uses graphics inside Kilix/Kitty and ANSI
-elsewhere:
+Text mode is the default everywhere; graphics is explicit:
 
 ```bash
 python3 tools/memory/main.py
@@ -76,7 +75,7 @@ checkouts at `../kitty-frame-presenter`, `../soft-raster-py`, and
 --history SAMPLES        graph history length
 --sort rss|pid|name|user initial process order
 --graphics               require the Kitty pixel UI
---text                   force ANSI
+--text                   explicitly select the default text TUI
 --once                   emit one dashboard frame
 --json                   emit one machine-readable snapshot
 --demo                    use animated synthetic data

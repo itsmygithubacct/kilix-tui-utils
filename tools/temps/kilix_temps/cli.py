@@ -12,7 +12,6 @@ from .app import AppConfig, DashboardApp, default_log_path
 from .graphics import (
     GraphicalRenderer,
     graphics_available,
-    kitty_graphics_likely,
 )
 from .model import ThresholdConfig, ThermalModel
 from .render import FrameOptions, Renderer, strip_ansi
@@ -45,12 +44,12 @@ def _parser() -> argparse.ArgumentParser:
     display.add_argument(
         "--graphics",
         action="store_true",
-        help="require the Kitty pixel dashboard instead of automatic detection",
+        help="require the optional Kitty pixel dashboard",
     )
     display.add_argument(
         "--text",
         action="store_true",
-        help="use the ANSI text dashboard even when Kitty graphics are available",
+        help="use the canonical text interface (the default)",
     )
     units = parser.add_mutually_exclusive_group()
     units.add_argument(
@@ -241,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("interactive mode requires a terminal; use --once or --json")
 
-    use_graphics = args.graphics or (not args.text and kitty_graphics_likely())
+    use_graphics = args.graphics
     if use_graphics:
         available, reason = graphics_available()
         if not available and args.graphics:

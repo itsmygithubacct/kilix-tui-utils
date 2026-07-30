@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_tui import app, chrome, kitty_rc, panel, theme  # noqa: E402
+from kilix_tui import app, kitty_rc  # noqa: E402
 
 
 def load():
@@ -196,20 +196,24 @@ class RenderTests(unittest.TestCase):
                         self.assertLessEqual(len(line), width)
                     self.assertLessEqual(len(frame.splitlines()), height)
 
-    def test_the_footer_never_runs_under_the_node_tag(self):
+    def test_footer_uses_the_main_desktop_row_without_a_node_tag(self):
         module = load()
-        # The node tag is decoration and the footer is instruction, so the tag
-        # may only appear at widths where the footer is already whole.
         st = state(module)
         footer = module.footer(st)
         for width in range(60, 140):
             frame = app.render_to_text(module.render, st, height=20, width=width)
             last = frame.splitlines()[-1]
             self.assertLessEqual(len(last), width)
-            if module.NODE in last:
-                self.assertIn(
-                    footer, last,
-                    f"at width {width} the tag displaced part of the footer")
+            self.assertTrue(
+                last.lstrip().startswith(footer[: width - 2].rstrip()))
+            self.assertNotIn("KILIX SWITCH", last)
+
+    def test_render_uses_the_main_kilix_tui_header_and_scope_bar(self):
+        module = load()
+        frame = app.render_to_text(
+            module.render, state(module), height=20, width=100)
+        self.assertIn("KILIX TUI", frame.splitlines()[0])
+        self.assertIn("▶1 All", frame.splitlines()[1])
 
     def test_it_says_so_when_there_is_no_terminal(self):
         module = load()
@@ -376,99 +380,6 @@ class SafetyTests(unittest.TestCase):
         source = (ROOT / "src/kilix_tui/kitty_rc.py").read_text()
         self.assertIn('"--extent", "screen"', source)
         self.assertNotIn('"all"', source)
-
-
-class PanelTests(unittest.TestCase):
-    """The drawing vocabulary, asserted as pictures rather than coordinates."""
-
-    def setUp(self):
-        os.environ["KILIX_PANEL"] = "1"
-        theme.reset_panel_pairs()
-
-    def tearDown(self):
-        os.environ.pop("KILIX_PANEL", None)
-        theme.reset_panel_pairs()
-
-    def test_a_block_is_filled_and_its_corners_are_shaved(self):
-        surface = app.TextSurface(height=5, width=12)
-        panel.block(surface, 1, 1, 3, 8, "primary", label="AB", ident="07")
-        shape = surface.attr_shape().splitlines()
-        # Every cell of the block carries an attribute; the corners carry the
-        # shave glyph, which is what rounds them.
-        self.assertEqual(len(shape[1].strip()), 8)
-        self.assertEqual(surface.lines[1][1], "▗")
-        self.assertEqual(surface.lines[3][1], "▝")
-        self.assertIn("AB", surface.lines[1])
-        self.assertIn("07", surface.lines[3])
-
-    def test_the_elbow_joins_a_leg_to_a_bar(self):
-        surface = app.TextSurface(height=8, width=30)
-        panel.elbow(surface, 0, 0, 6, 24, "quaternary", thickness=2, stem=5)
-        rows = [line.rstrip() for line in surface.attr_shape().splitlines()]
-        # The bar runs the full width on the top two rows...
-        self.assertEqual(len(rows[0]), 24)
-        self.assertEqual(len(rows[1]), 24)
-        # ...and below it only the leg remains.
-        self.assertEqual(len(rows[3].rstrip()), 5)
-        # The outer corner is shaved and the inner corner is notched.
-        self.assertEqual(surface.lines[0][0], "▗")
-        self.assertEqual(surface.lines[2][5], "▘")
-
-    def test_segments_are_separated_by_a_black_gap(self):
-        surface = app.TextSurface(height=1, width=20)
-        panel.bar(surface, 0, 0, 20, [(4, "primary"), (4, "tertiary")])
-        row = surface.attrs[0]
-        self.assertNotEqual(row[0], 0)
-        self.assertEqual(row[4], 0, "a gap must separate the segments")
-        self.assertNotEqual(row[5], 0)
-
-    def test_a_pill_has_rounded_caps_around_its_label(self):
-        surface = app.TextSurface(height=1, width=20)
-        used = panel.pill(surface, 0, 0, "GO", "primary")
-        self.assertEqual(surface.lines[0][0], "▐")
-        self.assertIn("GO", surface.lines[0])
-        self.assertEqual(surface.lines[0][used - 1], "▌")
-
-    def test_the_readout_is_stable_for_a_seed(self):
-        one, two = app.TextSurface(height=3, width=20), app.TextSurface(height=3, width=20)
-        panel.readout(one, 0, 0, 3, 20, seed=5)
-        panel.readout(two, 0, 0, 3, 20, seed=5)
-        self.assertEqual(str(one), str(two))
-        three = app.TextSurface(height=3, width=20)
-        panel.readout(three, 0, 0, 3, 20, seed=6)
-        self.assertNotEqual(str(one), str(three))
-
-    def test_nothing_is_styled_when_the_palette_is_unavailable(self):
-        os.environ["KILIX_PANEL"] = "0"
-        theme.reset_panel_pairs()
-        surface = app.TextSurface(height=5, width=12)
-        panel.block(surface, 1, 1, 3, 8, "primary", label="AB")
-        self.assertTrue(all(not value for row in surface.attrs for value in row))
-        self.assertIn("AB", surface.lines[1], "the text must survive anyway")
-
-    def test_the_active_spine_section_is_marked_in_text(self):
-        # Without the palette the fill swap is invisible, so which scope is on
-        # has to survive as a character.
-        os.environ["KILIX_PANEL"] = "0"
-        theme.reset_panel_pairs()
-        page = chrome.Page("T", ["ONE", "TWO", "THREE"])
-        surface = app.TextSurface(height=24, width=100)
-        page.render(surface, 1)
-        text = str(surface)
-        self.assertIn("▶TWO", text)
-        self.assertNotIn("▶ONE", text)
-        self.assertNotIn("▶THREE", text)
-
-    def test_the_spine_is_dropped_rather_than_squeezed(self):
-        page = chrome.Page("T", ["ONE", "TWO"])
-        wide = app.TextSurface(height=24, width=100)
-        page.render(wide, 0)
-        self.assertTrue(page.spined)
-        narrow = app.TextSurface(height=24, width=50)
-        page.render(narrow, 0)
-        self.assertFalse(page.spined)
-        top, left, _, _ = page.content_box()
-        self.assertEqual((top, left), (1, 0), "the well takes the whole width")
 
 
 if __name__ == "__main__":

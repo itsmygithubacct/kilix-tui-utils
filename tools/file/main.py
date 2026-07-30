@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 
 class State:
@@ -76,27 +76,34 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, f"Kilix Files — {state.cwd}"[: width - 1])
-    visible = max(1, height - 4)
+    body = shell.draw(
+        surface,
+        title="Files",
+        sections=("Browse",),
+        summary=state.cwd,
+        footer="Enter open · Backspace up · r refresh · q quit",
+    )
+    visible = max(1, body.height - int(bool(state.message)))
     start = max(0, min(state.selected - visible // 2,
                        max(0, len(state.entries) - visible)))
     for index, item in enumerate(state.entries[start:start + visible]):
-        row = 2 + index
-        marker = ">" if start + index == state.selected else " "
+        row = body.top + index
+        selected = start + index == state.selected
+        marker = "▶" if selected else " "
         name = str(item["name"]) + ("/" if item["dir"] else "")
         size = "" if item["dir"] else proc.human_bytes(int(item["size"]))
         stamp = (time.strftime("%Y-%m-%d %H:%M",
                                time.localtime(float(item["mtime"])))
                  if item["mtime"] else "")
         perms = stat_module.filemode(int(item["mode"])) if item["mode"] else ""
-        surface.addstr(row, 0,
-                       f"{marker} {name:<34.34} {size:>9} {stamp:>16} "
-                       f"{perms}"[: width - 1])
+        shell.put(
+            surface, row, body.left,
+            f"{marker} {name:<34.34} {size:>9} {stamp:>16} {perms}",
+            shell.tango.attr("selected") if selected else 0,
+        )
     if state.message:
-        surface.addstr(height - 2, 0, state.message[: width - 1])
-    surface.addstr(height - 1, 0,
-                   "Enter open · Backspace up · r refresh · q quit"[: width - 1])
+        shell.put(surface, body.bottom - 1, body.left, state.message,
+                  shell.tango.attr("accent"))
 
 
 def main(argv: list[str] | None = None) -> int:

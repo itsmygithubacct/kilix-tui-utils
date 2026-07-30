@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 
 class State:
@@ -67,32 +67,42 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, "Kilix Disk"[: width - 1])
-    row = 2
+    scanning = f" · largest in {state.scan_root}" if state.scan_root else ""
+    body = shell.draw(
+        surface,
+        title="Disk",
+        sections=("Filesystems",),
+        summary=f"{len(state.rows)} mounted filesystems{scanning}",
+        footer="↑/↓ select · Enter scan · r refresh · q quit",
+    )
+    row = body.top
     for index, (device, mountpoint, total, used, _free) in enumerate(state.rows):
-        if row >= height - 3:
+        if row >= body.bottom - (2 if state.scan_results else 0):
             break
-        marker = ">" if index == state.selected else " "
+        marker = "▶" if index == state.selected else " "
         fraction = used / total if total else 0
-        surface.addstr(row, 0,
-                       f"{marker} {mountpoint:<22.22} "
-                       f"{proc.human_bytes(used):>8}/{proc.human_bytes(total):<8} "
-                       f"{fraction * 100:4.0f}% {proc.bar(fraction, max(0, width - 56))}"[: width - 1])
+        shell.put(
+            surface, row, body.left,
+            f"{marker} {mountpoint:<22.22} "
+            f"{proc.human_bytes(used):>8}/{proc.human_bytes(total):<8} "
+            f"{fraction * 100:4.0f}% "
+            f"{proc.bar(fraction, max(0, body.width - 56))}",
+            shell.tango.attr("selected") if index == state.selected else 0,
+        )
         row += 1
     if state.scan_results:
         row += 1
         label = "" if state.scan_done else " (partial)"
-        surface.addstr(row, 0, f"largest in {state.scan_root}{label}"[: width - 1])
+        shell.put(surface, row, body.left,
+                  f"largest in {state.scan_root}{label}",
+                  shell.tango.attr("title"))
         row += 1
         for name, size in state.scan_results:
-            if row >= height - 1:
+            if row >= body.bottom:
                 break
-            surface.addstr(row, 2,
-                           f"{proc.human_bytes(size):>9}  {name}"[: width - 3])
+            shell.put(surface, row, body.left + 1,
+                      f"{proc.human_bytes(size):>9}  {name}")
             row += 1
-    surface.addstr(height - 1, 0,
-                   "↑/↓ select · Enter scan · r refresh · q quit"[: width - 1])
 
 
 def main(argv: list[str] | None = None) -> int:

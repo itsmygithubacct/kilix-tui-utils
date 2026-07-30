@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 ENDPOINT = "https://api.open-meteo.com/v1/forecast"
 CODES = {
@@ -112,42 +112,60 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, f"Kilix Weather — {state.place or 'no location'}"[: width - 1])
-    if not (state.lat or state.lon):
-        surface.addstr(2, 0, "Set a location to use this tool:"[: width - 1])
-        surface.addstr(3, 0,
-                       "  kilix settings --set weather_lat=51.5 weather_lon=-0.12"[: width - 1])
-        surface.addstr(4, 0,
-                       "The location is configured, never derived from your IP."[: width - 1])
-        surface.addstr(height - 1, 0, "q quit"[: width - 1])
-        return
+    configured = bool(state.lat or state.lon)
     stamp = (time.strftime("%Y-%m-%d %H:%M", time.localtime(state.fetched_at))
              if state.fetched_at else "never")
-    surface.addstr(1, 0, f"{state.status} · last updated {stamp}"[: width - 1])
+    body = shell.draw(
+        surface,
+        title="Weather",
+        sections=("Forecast",),
+        summary=(
+            f"{state.place} · {state.status} · updated {stamp}"
+            if configured else "No location configured"
+        ),
+        footer="r refresh · q quit" if configured else "q quit",
+        summary_role=(
+            "alert" if not configured or state.status.startswith("offline")
+            else "muted"
+        ),
+    )
+    if not (state.lat or state.lon):
+        shell.put(surface, body.top, body.left,
+                  "Set a location to use this tool:")
+        shell.put(
+            surface, body.top + 1, body.left + 1,
+            "kilix settings --set weather_lat=51.5 weather_lon=-0.12",
+            shell.tango.attr("accent"),
+        )
+        shell.put(surface, body.top + 2, body.left,
+                  "The location is configured, never derived from your IP.",
+                  shell.tango.attr("muted"))
+        return
     data = state.data or {}
     current = data.get("current", {})
     if current:
         code = int(current.get("weather_code", -1))
-        surface.addstr(3, 0,
-                       f"{current.get('temperature_2m', '?')}°C  "
-                       f"{CODES.get(code, 'unknown')}  "
-                       f"humidity {current.get('relative_humidity_2m', '?')}%  "
-                       f"wind {current.get('wind_speed_10m', '?')} km/h"[: width - 1])
+        shell.put(
+            surface, body.top, body.left,
+            f"{current.get('temperature_2m', '?')}°C  "
+            f"{CODES.get(code, 'unknown')}  "
+            f"humidity {current.get('relative_humidity_2m', '?')}%  "
+            f"wind {current.get('wind_speed_10m', '?')} km/h",
+            shell.tango.attr("accent"),
+        )
     daily = data.get("daily", {})
     times = daily.get("time", [])
-    row = 5
+    row = body.top + 2
     for index, day in enumerate(times):
-        if row >= height - 1:
+        if row >= body.bottom:
             break
         high = daily.get("temperature_2m_max", [None] * len(times))[index]
         low = daily.get("temperature_2m_min", [None] * len(times))[index]
         code = daily.get("weather_code", [-1] * len(times))[index]
-        surface.addstr(row, 0,
-                       f"{day}  {low:>5}°  {high:>5}°  "
-                       f"{CODES.get(int(code), '')}"[: width - 1])
+        shell.put(surface, row, body.left,
+                  f"{day}  {low:>5}°  {high:>5}°  "
+                  f"{CODES.get(int(code), '')}")
         row += 1
-    surface.addstr(height - 1, 0, "r refresh · q quit"[: width - 1])
 
 
 def main(argv: list[str] | None = None) -> int:

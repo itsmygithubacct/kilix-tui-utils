@@ -12,18 +12,12 @@ from .units import TemperatureUnit
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SPARKS = "▁▂▃▄▅▆▇█"
 
-TANGO_BG = (29, 31, 33)
 TANGO_FG = (211, 215, 207)
 TANGO_BLUE = (52, 101, 164)
 TANGO_BRIGHT_BLUE = (114, 159, 207)
-TANGO_GREEN = (138, 226, 52)
-TANGO_YELLOW = (252, 233, 79)
-TANGO_ORANGE = (245, 121, 0)
 TANGO_RED = (239, 41, 41)
-TANGO_CYAN = (52, 226, 226)
 TANGO_DIM = (136, 138, 133)
 WHITE = (238, 238, 236)
-BLACK = (29, 31, 33)
 
 
 def strip_ansi(value: str) -> str:
@@ -108,18 +102,10 @@ class Theme:
 
     def level_color(self, level: Level) -> tuple[int, int, int]:
         return {
-            Level.NORMAL: TANGO_GREEN,
-            Level.WARM: TANGO_YELLOW,
-            Level.HOT: TANGO_ORANGE,
+            Level.NORMAL: TANGO_BRIGHT_BLUE,
+            Level.WARM: TANGO_BLUE,
+            Level.HOT: TANGO_RED,
             Level.CRITICAL: TANGO_RED,
-        }[level]
-
-    def level_background(self, level: Level) -> tuple[int, int, int]:
-        return {
-            Level.NORMAL: (34, 68, 20),
-            Level.WARM: (92, 76, 0),
-            Level.HOT: (135, 58, 0),
-            Level.CRITICAL: (145, 0, 0),
         }[level]
 
 
@@ -178,33 +164,42 @@ class Renderer:
         self.theme = Theme(color)
         self.hostname = socket.gethostname()
 
-    def _border(self, text: str) -> str:
-        return self.theme.paint(text, foreground=TANGO_BRIGHT_BLUE)
-
-    def _box_top(self, title: str, width: int) -> str:
-        title_width = max(1, width - 4)
-        clipped_title = fit(title, title_width).rstrip()
-        title_text = f" {clipped_title} "
-        remaining = max(0, width - 2 - visible_len(title_text))
-        return self._border("┌" + title_text + "─" * remaining + "┐")
-
-    def _box_bottom(self, width: int) -> str:
-        return self._border("└" + "─" * max(0, width - 2) + "┘")
-
-    def _box_line(self, content: str, width: int) -> str:
-        return self._border("│") + fit(content, max(0, width - 2)) + self._border("│")
-
-    def _headers(self, model: ThermalModel, sample: Sample, width: int, options: FrameOptions) -> list[str]:
-        clock = sample.timestamp.strftime("%Y-%m-%d  %H:%M:%S")
-        title = " KILIX TEMPS  //  THERMAL WATCH "
-        host = f"{self.hostname}  {clock} "
-        first = align_lr(title, host, width)
-        first = self.theme.paint(first, foreground=WHITE, background=TANGO_BLUE, bold=True)
+    def _shell(
+        self,
+        model: ThermalModel,
+        sample: Sample,
+        width: int,
+        options: FrameOptions,
+        *,
+        active: int = 0,
+        summary_override: str = "",
+    ) -> list[str]:
+        identity = self.theme.paint(" KILIX TUI", foreground=WHITE, bold=True)
+        title = self.theme.paint("Temperatures ", foreground=TANGO_DIM, dim=True)
+        first = align_lr(identity, title, width)
+        tabs = []
+        for index, label in enumerate(("Monitor", "Help")):
+            item = f"{'▶' if index == active else ' '}{index + 1} {label} "
+            tabs.append(self.theme.paint(
+                item,
+                foreground=WHITE if index == active else TANGO_DIM,
+                background=TANGO_BLUE if index == active else None,
+                bold=index == active,
+                dim=index != active,
+            ))
+        navigation = fit(" " + "".join(tabs), width)
+        divider = self.theme.paint(
+            fit("─" * max(0, width - 1), width),
+            foreground=TANGO_DIM,
+            dim=True,
+        )
 
         level = model.overall_level
         risk = model.most_at_risk
-        if risk is None or risk.current is None:
-            summary = " NO SENSOR DATA  //  waiting for readable Linux thermal sensors"
+        if summary_override:
+            summary = summary_override
+        elif risk is None or risk.current is None:
+            summary = "No sensor data · waiting for readable Linux thermal sensors"
         else:
             unit = options.temperature_unit
             current = unit.absolute(risk.current)
@@ -213,20 +208,25 @@ class Renderer:
             trend = risk.trend_per_minute
             trend_text = ""
             if trend is not None:
-                trend_text = f"  trend {unit.delta(trend):+.1f}{unit.symbol}/min"
+                trend_text = f" · trend {unit.delta(trend):+.1f}{unit.symbol}/min"
             summary = (
-                f" {level.label:<8} // {risk.sensor.display_name}  {current:5.1f}{unit.symbol}"
-                f"  limit {critical:.1f}{unit.symbol}  headroom {headroom:.1f}°{trend_text}"
+                f"{level.label} · {risk.sensor.display_name} "
+                f"{current:.1f}{unit.symbol} · limit {critical:.1f}{unit.symbol}"
+                f" · headroom {headroom:.1f}°{trend_text}"
             )
         mode = "PAUSED" if options.paused else f"LIVE {options.interval:.1f}s"
-        second = align_lr(summary, f"{mode} ", width)
-        second = self.theme.paint(
-            second,
-            foreground=WHITE if level >= Level.HOT else TANGO_FG,
-            background=self.theme.level_background(level),
-            bold=level >= Level.HOT,
+        context = "" if summary_override else (
+            f"{self.hostname} · {mode} · "
+            f"{sample.timestamp.strftime('%H:%M:%S')}"
         )
-        return [first, second]
+        fourth = align_lr(" " + summary, context + " ", width)
+        fourth = self.theme.paint(
+            fourth,
+            foreground=TANGO_RED if level >= Level.HOT else TANGO_DIM,
+            bold=level >= Level.HOT,
+            dim=level < Level.HOT,
+        )
+        return [first, navigation, divider, fourth]
 
     def _column_header(self, width: int) -> tuple[str, str]:
         inner = width - 2
@@ -305,7 +305,7 @@ class Renderer:
         )
         return fit(row, inner)
 
-    def _sensor_box(
+    def _sensor_lines(
         self,
         model: ThermalModel,
         width: int,
@@ -319,29 +319,30 @@ class Renderer:
         start = scroll + 1 if states else 0
         end = scroll + len(shown)
         title = (
-            f"THERMAL SENSORS  //  {start}-{end} of {len(states)}"
-            f"  //  {options.temperature_unit.symbol}  //  sort: {options.sort_mode}"
+            f" Thermal sensors · {start}-{end} of {len(states)}"
+            f" · {options.temperature_unit.symbol} · sort {options.sort_mode}"
         )
-        lines = [self._box_top(title, width)]
+        lines = [
+            self.theme.paint(fit(title, width), foreground=WHITE, bold=True)
+        ]
         layout, header = self._column_header(width)
-        lines.append(self._box_line(self.theme.paint(header, foreground=TANGO_DIM, bold=True), width))
+        lines.append(self.theme.paint(
+            fit(" " + header, width), foreground=TANGO_DIM, bold=True))
         for state in shown:
             lines.append(
-                self._box_line(
-                    self._sensor_row(
-                        state, layout, width, options.temperature_unit
-                    ),
+                fit(
+                    " " + self._sensor_row(
+                        state, layout, width, options.temperature_unit),
                     width,
                 )
             )
         missing_rows = rows - len(shown)
         for index in range(missing_rows):
             message = "No readable sensors" if not states and index == 0 else ""
-            lines.append(self._box_line(message, width))
-        lines.append(self._box_bottom(width))
+            lines.append(fit(" " + message, width))
         return lines
 
-    def _cooling_box(
+    def _cooling_lines(
         self,
         sample: Sample,
         fan_specs: list[FanSensor],
@@ -364,12 +365,15 @@ class Renderer:
             fan = fan_names.get(key)
             label = fan.label if fan is not None else key
             fan_parts.append(f"{label} {rpm:,} RPM")
-        fan_text = "  |  ".join(fan_parts) if fan_parts else "fan telemetry unavailable"
+        fan_text = " · ".join(fan_parts) if fan_parts else "fan telemetry unavailable"
         uptime = f"up {format_duration(metrics.uptime_seconds)}"
-        content = f" {cpu_text} {cpu_bar}  {load}{memory}  |  {fan_text}  |  {uptime}"
+        content = (
+            f" {cpu_text} {cpu_bar} · {load}{memory} · {fan_text} · {uptime}"
+        )
         lines = [
-            self._box_top("COOLING & LOAD", width),
-            self._box_line(content, width),
+            self.theme.paint(
+                fit(" Cooling & load", width), foreground=WHITE, bold=True),
+            fit(content, width),
         ]
         if include_processes:
             if metrics.top_processes:
@@ -379,15 +383,14 @@ class Renderer:
                     process_parts.append(
                         f"{process.name}{instances} {process.cpu_percent:.0f}%"
                     )
-                processes = "  |  ".join(process_parts)
+                processes = " · ".join(process_parts)
                 process_line = f" heat sources  {processes}"
             else:
                 process_line = " heat sources  collecting a 2-second CPU baseline…"
-            lines.append(self._box_line(process_line, width))
-        lines.append(self._box_bottom(width))
+            lines.append(fit(process_line, width))
         return lines
 
-    def _alerts_box(
+    def _alert_lines(
         self,
         model: ThermalModel,
         sample: Sample,
@@ -399,10 +402,10 @@ class Renderer:
             action = self.theme.paint(action, foreground=TANGO_RED, bold=True)
         elif model.overall_level == Level.WARM:
             action = "Thermals are elevated; watch the trend and cooling response."
-            action = self.theme.paint(action, foreground=TANGO_YELLOW)
+            action = self.theme.paint(action, foreground=TANGO_BLUE)
         else:
             action = "Thermal headroom is healthy."
-            action = self.theme.paint(action, foreground=TANGO_GREEN)
+            action = self.theme.paint(action, foreground=TANGO_BRIGHT_BLUE)
         latest = ""
         if model.alerts:
             alert = model.alerts[0]
@@ -415,24 +418,27 @@ class Renderer:
         else:
             latest = "  No HOT/CRITICAL crossings this session."
         return [
-            self._box_top("THERMAL GUARD", width),
-            self._box_line(" " + action + latest, width),
-            self._box_bottom(width),
+            self.theme.paint(
+                fit(" Thermal guard", width), foreground=WHITE, bold=True),
+            fit(" " + action + latest, width),
         ]
 
     def _footer(self, width: int, options: FrameOptions) -> str:
-        keys = " q quit  space pause  r reset  +/- sample  ↑↓ scroll  s sort  u unit  l log  h help "
+        keys = " q quit · space pause · r reset · +/- sample · ↑↓ scroll · s sort · u unit · l log · h help "
         if width < 82:
-            keys = " q quit  space pause  r reset  u unit  ↑↓ scroll  h help "
+            keys = " q quit · space pause · r reset · u unit · ↑↓ scroll · h help "
         log_state = options.notice or ("LOG ON" if options.logging else "LOG OFF")
         return self.theme.paint(
             align_lr(keys, f"{log_state} ", width),
-            foreground=TANGO_FG,
-            background=(46, 52, 54),
+            foreground=TANGO_DIM,
+            dim=True,
         )
 
     def _help(self, model: ThermalModel, sample: Sample, width: int, height: int, options: FrameOptions) -> str:
-        lines = self._headers(model, sample, width, options)
+        lines = self._shell(
+            model, sample, width, options, active=1,
+            summary_override="Keyboard reference · monitoring only",
+        )
         body = [
             ("q / Esc", "quit and restore the terminal"),
             ("Space", "pause or resume sampling"),
@@ -453,14 +459,12 @@ class Renderer:
             ("Driver limits", "Lower exported limits win; the dashboard never raises them."),
             ("Safety", "Monitoring only: it never kills jobs, throttles CPUs, or powers off."),
         ]
-        lines.append(self._box_top("HELP", width))
-        available = max(1, height - len(lines) - 2)
+        available = max(0, height - len(lines) - 1)
         for key, description in body[:available]:
-            content = f" {key:<20} {description}" if key else ""
-            lines.append(self._box_line(content, width))
-        while len(lines) < height - 2:
-            lines.append(self._box_line("", width))
-        lines.append(self._box_bottom(width))
+            content = f"  {key:<20} {description}" if key else ""
+            lines.append(fit(content, width))
+        while len(lines) < height - 1:
+            lines.append(" " * width)
         lines.append(self._footer(width, options))
         return "\n".join(lines[:height])
 
@@ -476,32 +480,36 @@ class Renderer:
         if width < 40 or height < 10:
             width = max(1, width)
             height = max(1, height)
-            message = fit("Kilix Temps", width, align="center")
-            requirement = fit("pane needs 40 x 10", width, align="center")
-            lines = [" " * width for _ in range(height)]
-            if height:
-                lines[max(0, height // 2 - 1)] = self.theme.paint(
-                    message, foreground=WHITE, background=TANGO_BLUE, bold=True
-                )
-            if height >= 2:
-                lines[min(height - 1, height // 2)] = requirement
+            lines = self._shell(
+                model, sample, width, options,
+                summary_override="pane needs 40 x 10",
+            )[:height]
+            while len(lines) < height - 1:
+                lines.append(" " * width)
+            if len(lines) < height:
+                lines.append(fit(" q quit", width))
             return "\n".join(lines)
         if options.help_visible:
             return self._help(model, sample, width, height, options)
 
-        lines = self._headers(model, sample, width, options)
-        show_alerts = height >= 22
-        show_processes = height >= 16
-        cooling_lines = 4 if show_processes else 3
-        fixed = 2 + 3 + (3 if show_alerts else 0) + cooling_lines + 1
-        sensor_rows = max(1, height - fixed)
-        lines.extend(self._sensor_box(model, width, sensor_rows, options))
+        lines = self._shell(model, sample, width, options)
+        show_alerts = height >= 18
+        show_processes = height >= 14
+        cooling_count = 3 if show_processes else 2
+        alert_count = 2 if show_alerts else 0
+        sensor_rows = max(
+            1,
+            height - len(lines) - 1 - 2 - cooling_count - alert_count,
+        )
+        lines.extend(self._sensor_lines(
+            model, width, sensor_rows, options))
         lines.extend(
-            self._cooling_box(sample, fan_specs, width, include_processes=show_processes)
+            self._cooling_lines(
+                sample, fan_specs, width, include_processes=show_processes)
         )
         if show_alerts:
-            lines.extend(self._alerts_box(model, sample, width, options))
-        lines.append(self._footer(width, options))
-        while len(lines) < height:
+            lines.extend(self._alert_lines(model, sample, width, options))
+        while len(lines) < height - 1:
             lines.append(" " * width)
+        lines.append(self._footer(width, options))
         return "\n".join(lines[:height])

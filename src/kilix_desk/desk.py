@@ -25,7 +25,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
-from kilix_tui import keys as keymap, kitty_rc, privileged
+from kilix_tui import keys as keymap, kitty_rc, privileged, shell
 
 from . import facts, registry, tango
 
@@ -253,56 +253,60 @@ def render(surface, state: State) -> None:
     height, width = surface.getmaxyx()
     state.text_hits = {"bar_row": 1, "sections": []}
     release = next((v for k, v in state.status if k == "release"), "")
-    _put(surface, 0, 1, "KILIX TUI"[: width - 2], tango.attr("title"))
     strap = f"Plebian-OS {release}".rstrip()
-    _put(surface, 0, max(2, width - len(strap) - 1), strap[: width - 2],
-         tango.attr("muted"))
-
-    # The section bar carries a text marker as well as the highlight, so the
-    # active section survives a monochrome terminal.
-    col = 1
+    if state.confirm is not None:
+        summary = f"Confirm: {state.confirm[0]}"
+        summary_role = "danger"
+    elif state.message:
+        summary = state.message
+        summary_role = "accent"
+    else:
+        summary = state.breadcrumb()
+        summary_role = "muted"
+    roles = []
     for index, name in enumerate(SECTIONS):
         active = index == state.section
-        marker = "▶" if active else " "
-        text = f"{marker}{index + 1} {name} "
-        if col + len(text) >= width:
-            break
         if active and state.focus == "sections":
-            attr = tango.attr("danger" if name == "Power" else "selected")
+            roles.append("danger" if name == "Power" else "selected")
         elif active:
-            attr = tango.attr("accent")
+            roles.append("accent")
         elif name == "Power":
-            attr = tango.attr("alert")
+            roles.append("alert")
         else:
-            attr = tango.attr("muted")
-        _put(surface, 1, col, text, attr)
-        state.text_hits["sections"].append((col, col + len(text), index))
-        col += len(text)
-    _put(surface, 2, 0, "─" * max(0, width - 1), tango.attr("muted"))
+            roles.append("muted")
+    body = shell.draw(
+        surface,
+        title=strap,
+        sections=SECTIONS,
+        active=state.section,
+        summary=summary,
+        footer=footer(state),
+        tab_roles=roles,
+        summary_role=summary_role,
+    )
 
-    top = 3
-    if state.submenu:
-        _put(surface, top, 1, f"◂ {state.breadcrumb()}"[: width - 2],
-             tango.attr("accent"))
-        top += 1
-    body_height = max(0, height - top - 2)
+    # Keep the mouse hit map tied to the same measured tab strings.
+    column = body.left
+    for index, name in enumerate(SECTIONS):
+        text = f"{'▶' if index == state.section else ' '}{index + 1} {name} "
+        if column + len(text) >= width:
+            break
+        state.text_hits["sections"].append(
+            (column, column + len(text), index))
+        column += len(text)
+
     if state.confirm is not None:
         label, argv = state.confirm
-        _put(surface, top, 2, f"Confirm: {label}"[: width - 3],
+        _put(surface, body.top, body.left + 1, f"Confirm: {label}"[: body.width - 1],
              tango.attr("danger"))
         if argv:
-            _put(surface, top + 1, 2, f"$ {' '.join(argv)}"[: width - 3],
+            _put(surface, body.top + 1, body.left + 1,
+                 f"$ {' '.join(argv)}"[: body.width - 1],
                  tango.attr("muted"))
     elif SECTIONS[state.section] == "Home" and not state.submenu:
-        _draw_home(surface, state, top, body_height, width)
+        _draw_home(surface, state, body.top, body.height, width)
     else:
-        _draw_entries(surface, state, top, body_height, width)
-
-    if state.message and state.confirm is None:
-        _put(surface, height - 2, 1, state.message[: width - 2],
-             tango.attr("accent"))
-    _put(surface, height - 1, 1, footer(state)[: width - 2],
-         tango.attr("muted"))
+        _draw_entries(surface, state, body.top, body.height, width)
 
 
 # ── input ────────────────────────────────────────────────────────────────────

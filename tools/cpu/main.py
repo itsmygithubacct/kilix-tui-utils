@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 
 class State:
@@ -26,34 +26,54 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
     one, five, fifteen = proc.loadavg()
-    surface.addstr(0, 0, "Kilix CPU"[: width - 1])
-    surface.addstr(1, 0, state.model[: width - 1])
-    surface.addstr(3, 0, f"total {state.usage:5.1f}%  "
-                         f"{proc.bar(state.usage / 100, max(0, width - 24))}"[: width - 1])
-    surface.addstr(4, 0, f"load  {one:.2f} {five:.2f} {fifteen:.2f}   "
-                         f"up {proc.human_duration(proc.uptime_seconds())}"[: width - 1])
-    row = 6
+    body = shell.draw(
+        surface,
+        title="CPU",
+        sections=("Overview",),
+        summary=state.model,
+        footer=keymap.FOOTER,
+    )
+    shell.put(
+        surface, body.top, body.left,
+        f"total {state.usage:5.1f}%  "
+        f"{proc.bar(state.usage / 100, max(0, body.width - 24))}",
+        shell.tango.attr("accent"),
+    )
+    shell.put(
+        surface, body.top + 1, body.left,
+        f"load  {one:.2f} {five:.2f} {fifteen:.2f}   "
+        f"up {proc.human_duration(proc.uptime_seconds())}",
+        shell.tango.attr("muted"),
+    )
+    row = body.top + 3
     speeds = proc.cpu_mhz()
     for index, value in enumerate(state.cores):
-        if row >= height - 12:
+        if row >= max(body.top, body.bottom - 10):
             break
         mhz = f"{speeds[index]:7.0f}MHz" if index < len(speeds) else ""
-        surface.addstr(row, 0, f"cpu{index:<3} {value:5.1f}% "
-                               f"{proc.bar(value / 100, max(0, width - 30))} {mhz}"[: width - 1])
+        shell.put(
+            surface, row, body.left,
+            f"cpu{index:<3} {value:5.1f}% "
+            f"{proc.bar(value / 100, max(0, body.width - 30))} {mhz}",
+        )
         row += 1
     row += 1
-    if row < height - 2:
-        surface.addstr(row, 0, "heaviest by CPU time"[: width - 1]); row += 1
-        for item in proc.processes(limit=height - row - 2, key="cpu_time"):
-            if row >= height - 1:
+    if row < body.bottom:
+        shell.put(surface, row, body.left, "heaviest by CPU time",
+                  shell.tango.attr("title"))
+        row += 1
+        for item in proc.processes(
+                limit=max(0, body.bottom - row), key="cpu_time"):
+            if row >= body.bottom:
                 break
-            surface.addstr(row, 2, f"{item['pid']:>7}  "
-                                   f"{proc.human_duration(item['cpu_time']):>9}  "
-                                   f"{item['name']}"[: width - 3])
+            shell.put(
+                surface, row, body.left + 1,
+                f"{item['pid']:>7}  "
+                f"{proc.human_duration(item['cpu_time']):>9}  "
+                f"{item['name']}",
+            )
             row += 1
-    surface.addstr(height - 1, 0, keymap.FOOTER[: width - 1])
 
 
 def main(argv: list[str] | None = None) -> int:

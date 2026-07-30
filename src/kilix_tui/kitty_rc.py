@@ -39,6 +39,7 @@ class Pane:
     id: int
     title: str = ""
     process: str = ""
+    argv: tuple[str, ...] = ()
     cwd: str = ""
     is_focused: bool = False
     page_id: int = 0
@@ -55,7 +56,10 @@ class Pane:
         needle = needle.casefold()
         return any(
             needle in field.casefold()
-            for field in (self.title, self.process, self.cwd, self.page_title)
+            for field in (
+                self.title, self.process, self.cwd, self.page_title,
+                " ".join(self.argv),
+            )
         )
 
 
@@ -111,6 +115,22 @@ class Tree:
                 return page
         return None
 
+    def pane_with_argument(self, argument: str) -> Pane | None:
+        """Find a pane whose foreground argv contains one exact argument.
+
+        UUID-like arguments are compared without surrounding braces and
+        case-insensitively. This is how a manager can find the tab hosting a
+        particular VM without relying on a mutable tab title.
+        """
+        wanted = argument.strip("{}").casefold()
+        for pane in self.panes:
+            if any(
+                value.strip("{}").casefold() == wanted
+                for value in pane.argv
+            ):
+                return pane
+        return None
+
     def home_page(self) -> Page | None:
         """The page the *caller* is running on.
 
@@ -139,7 +159,23 @@ def self_pane_id() -> int:
 
 
 def _kitten() -> str:
-    return os.environ.get("KILIX_KITTEN") or "kitten"
+    if configured := os.environ.get("KILIX_KITTEN"):
+        return configured
+    # The Kilix launcher keeps its engine private rather than publishing
+    # `kitten` on PATH. Tools opened from an ordinary pane inherit the storage
+    # roots, so resolve the sibling launcher the same way Kilix itself does.
+    build = os.environ.get("KILIX_BUILD_DIRECTORY", "")
+    prebuilt = os.environ.get("KILIX_PREBUILT_HOME", "")
+    home = os.environ.get("KILIX_HOME", "")
+    candidates = (
+        os.path.join(build, "current/src/kitty/launcher/kitten") if build else "",
+        os.path.join(prebuilt, "bin/kitten") if prebuilt else "",
+        os.path.join(home, "src/kitty/launcher/kitten") if home else "",
+    )
+    for candidate in candidates:
+        if candidate and os.access(candidate, os.X_OK):
+            return candidate
+    return "kitten"
 
 
 def available() -> bool:
@@ -186,6 +222,14 @@ def _process_name(window: dict[str, Any]) -> str:
     return ""
 
 
+def _process_argv(window: dict[str, Any]) -> tuple[str, ...]:
+    for process in reversed(window.get("foreground_processes") or []):
+        cmdline = process.get("cmdline") or []
+        if cmdline:
+            return tuple(str(value) for value in cmdline)
+    return ()
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -221,6 +265,7 @@ def parse(state: list[dict[str, Any]]) -> Tree:
                     id=int(window.get("id") or 0),
                     title=_text(window.get("title")),
                     process=_process_name(window),
+                    argv=_process_argv(window),
                     cwd=_text(window.get("cwd")),
                     is_focused=(
                         bool(window.get("is_focused") or window.get("is_active"))
@@ -246,6 +291,11 @@ def tree() -> Tree:
     if not isinstance(state, list):
         raise Unavailable("the terminal returned an unexpected payload")
     return parse(state)
+
+
+def pane_with_argument(argument: str) -> Pane | None:
+    """Return the live pane whose foreground command owns `argument`."""
+    return tree().pane_with_argument(argument)
 
 
 def focus_page(page_id: int) -> None:

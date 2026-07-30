@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 
 def _os_release() -> dict[str, str]:
@@ -60,14 +60,20 @@ def facts() -> list[tuple[str, str]]:
 
 
 def render(surface, state) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, "Kilix System"[: width - 1])
+    host = next((value for label, value in state if label == "host"), "")
+    body = shell.draw(
+        surface,
+        title="System",
+        sections=("Facts",),
+        summary=host,
+        footer="r refresh · q quit",
+    )
     for index, (label, value) in enumerate(state):
-        row = 2 + index
-        if row >= height - 1:
+        row = body.top + index
+        if row >= body.bottom:
             break
-        surface.addstr(row, 0, f"{label:<16}{value}"[: width - 1])
-    surface.addstr(height - 1, 0, "r refresh · q quit"[: width - 1])
+        shell.put(surface, row, body.left, f"{label:<16}{value}",
+                  shell.tango.attr("muted") if index % 2 else 0)
 
 
 def main(argv: list[str] | None = None) -> int:

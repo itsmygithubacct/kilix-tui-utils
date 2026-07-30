@@ -7,20 +7,17 @@ root access or a background service. A low-frequency `/proc` sampler also
 groups the hottest CPU consumers, so an alert identifies likely heat sources
 such as several concurrent compiler, emulator, game, or agent processes.
 
-The default interface is a dense, Glances-inspired pixel dashboard rendered
-through the Kitty graphics protocol. It has adaptive wide and split-pane
-layouts, real line graphs, risk/headroom cards, a sensor table, system gauges,
-fan telemetry, and a heat-source view. It gives firmware-facing ACPI thermal
-zones the same visibility as CPU, GPU, NVMe, PCH, and Wi-Fi sensors. It is a
-monitor only: it never kills jobs, changes fan policy, throttles the CPU, or
-powers off the computer.
+The default interface is the canonical Kilix text TUI, with the same header,
+numbered navigation, status row, content well, and footer as the desktop and
+VirtualBox manager. It gives firmware-facing ACPI thermal zones the same
+visibility as CPU, GPU, NVMe, PCH, and Wi-Fi sensors. It is a monitor only: it
+never kills jobs, changes fan policy, throttles the CPU, or powers off the
+computer.
 
-Kilix Temps draws its dashboard with `soft-raster-py`, the Python binding for
-Kilix's native `soft-raster` graphics library, and hands the resulting RGB
-frames to `kitty-frame-presenter`. Unchanged frames are skipped and changing
-frames use bounded rectangular updates. In terminals without Kitty graphics,
-or when graphical dependencies are unavailable, it automatically retains the
-original adaptive ANSI dashboard.
+The optional pixel view uses `soft-raster-py`, the Python binding for Kilix's
+native `soft-raster` graphics library, and hands RGB frames to
+`kitty-frame-presenter`. Unchanged frames are skipped and changing frames use
+bounded rectangular updates. The default text TUI has no graphical dependency.
 
 ## Run it
 
@@ -51,12 +48,11 @@ checkouts at `../kitty-frame-presenter`, `../soft-raster-py`, and
 Run the complete repository test suite with `python3 tests/run.py`, or only
 this tool's suite with `python3 tests/run.py temps`.
 
-Graphical mode is selected automatically in Kilix, Kitty, Ghostty, and WezTerm.
-The choice can also be made explicitly:
+Graphical mode is optional and selected explicitly:
 
 ```bash
 kilix-temps --graphics       # require the Kitty pixel dashboard
-kilix-temps --text           # force the ANSI dashboard
+kilix-temps --text           # explicitly select the default text TUI
 ```
 
 `--graphics` exits with a useful dependency error instead of silently falling

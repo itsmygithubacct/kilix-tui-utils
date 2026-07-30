@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 
 def transcript_dir() -> str:
@@ -80,39 +80,56 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
     if state.viewing is not None:
         item = state.items[state.selected]
-        surface.addstr(0, 0, f"{item['id']} ({item['tier']})"[: width - 1])
+        body = shell.draw(
+            surface,
+            title="Session Logs",
+            sections=("Sessions", "Transcript"),
+            active=1,
+            summary=f"{item['id']} · {item['tier']}",
+            footer="↑/↓ scroll · Esc back · q quit",
+        )
         for index, line in enumerate(
-                state.viewing[state.offset:state.offset + height - 2]):
-            surface.addstr(1 + index, 0, line.replace("\t", "    ")[: width - 1])
-        surface.addstr(height - 1, 0,
-                       "↑/↓ scroll · Esc back · q quit"[: width - 1])
+                state.viewing[state.offset:state.offset + body.height]):
+            shell.put(surface, body.top + index, body.left,
+                      line.replace("\t", "    "))
         return
     live = sum(int(i["size"]) for i in state.items if i["tier"] == "live")
     archived = sum(int(i["size"]) for i in state.items if i["tier"] == "archived")
-    surface.addstr(0, 0, "Kilix Session Logs"[: width - 1])
-    surface.addstr(1, 0, f"live {proc.human_bytes(live)} · "
-                         f"archived {proc.human_bytes(archived)} · "
-                         f"{len(state.items)} panes"[: width - 1])
+    body = shell.draw(
+        surface,
+        title="Session Logs",
+        sections=("Sessions", "Transcript"),
+        active=0,
+        summary=(
+            f"live {proc.human_bytes(live)} · "
+            f"archived {proc.human_bytes(archived)} · "
+            f"{len(state.items)} panes"
+        ),
+        footer="Enter open · r refresh · q quit",
+    )
     if not state.items:
-        surface.addstr(3, 0, f"no transcripts in {state.directory}"[: width - 1])
-    visible = max(1, height - 5)
+        shell.put(surface, body.top, body.left,
+                  f"no transcripts in {state.directory}",
+                  shell.tango.attr("muted"))
+    visible = max(1, body.height)
     start = max(0, min(state.selected - visible // 2,
                        max(0, len(state.items) - visible)))
     import time as _time
     for index, item in enumerate(state.items[start:start + visible]):
-        row = 3 + index
-        marker = ">" if start + index == state.selected else " "
+        row = body.top + index
+        selected = start + index == state.selected
+        marker = "▶" if selected else " "
         stamp = _time.strftime("%Y-%m-%d %H:%M",
                                _time.localtime(float(item["mtime"])))
         tag = "[archived]" if item["tier"] == "archived" else ""
-        surface.addstr(row, 0,
-                       f"{marker} {stamp}  {proc.human_bytes(int(item['size'])):>8}  "
-                       f"{item['id']} {tag}"[: width - 1])
-    surface.addstr(height - 1, 0,
-                   "Enter open · r refresh · q quit"[: width - 1])
+        shell.put(
+            surface, row, body.left,
+            f"{marker} {stamp}  {proc.human_bytes(int(item['size'])):>8}  "
+            f"{item['id']} {tag}",
+            shell.tango.attr("selected") if selected else 0,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -27,6 +27,7 @@ class Item:
     label: str
     command: str | None = None       # installed name on PATH — always wins
     sibling: str | None = None       # tools/<dir> in this checkout
+    source: str | None = None        # <dir>/main.py in this checkout
     kilix: tuple[str, ...] = ()      # `kilix <subcommand>` fallback
     verb: str = "inplace"
     kilix_only: bool = False         # hidden outside a Kilix session
@@ -59,6 +60,8 @@ MACHINE = (
     Item("Memory", command="kilix-memory", sibling="memory"),
     Item("Temperatures", command="kilix-temps", sibling="temps",
          kilix=("temps",), verb="tab"),
+    Item("VirtualBox VPN", command="kilix-virtualbox-manager",
+         source="kilix-virtualbox-manager"),
     Item("Disk", command="kilix-disk", sibling="disk"),
     Item("System facts", command="kilix-system", sibling="system"),
     Item("Volume", command="kilix-volume", sibling="volume"),
@@ -172,6 +175,11 @@ def resolve(item: Item) -> Plan | None:
         path = os.path.join(ROOT, "tools", item.sibling, "main.py")
         if os.path.isfile(path):
             return Plan((sys.executable, path), item.verb)
+    if item.source:
+        path = os.path.realpath(os.path.join(ROOT, item.source, "main.py"))
+        root = os.path.realpath(ROOT) + os.sep
+        if path.startswith(root) and os.path.isfile(path):
+            return Plan((sys.executable, path), item.verb)
     if item.kilix:
         launcher = kilix_command()
         if launcher:
@@ -181,7 +189,7 @@ def resolve(item: Item) -> Plan | None:
 
 def disabled_reason(item: Item) -> str:
     """One line saying why, and what fixes it — shown in place of the item."""
-    if item.sibling:
+    if item.sibling or item.source:
         return "not installed — run kilix-tui-utils/install.sh"
     if item.kilix:
         return "needs a Kilix checkout"

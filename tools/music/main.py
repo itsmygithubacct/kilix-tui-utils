@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 PROTOCOL_VERSION = 1
 
@@ -88,39 +88,61 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, "Kilix Music"[: width - 1])
+    available = state.backend.available()
+    playing = str(state.status.get("state", "stopped"))
+    title = str(state.status.get("title", ""))
+    summary = (
+        f"{playing} · {title}".rstrip(" ·")
+        if available else "kilix-amp backend unavailable"
+    )
+    body = shell.draw(
+        surface,
+        title="Music",
+        sections=("Playlist",),
+        summary=summary,
+        footer=(
+            "space play/pause · n next · p prev · r refresh · q quit"
+            if available else "r retry · q quit"
+        ),
+        summary_role="alert" if not available or state.backend.error else "muted",
+    )
     if not state.backend.available():
-        surface.addstr(2, 0, "kilix-amp backend unavailable."[: width - 1])
-        surface.addstr(3, 0,
-                       "This front end drives kilix-amp over a control socket;"[: width - 1])
-        surface.addstr(4, 0,
-                       "kilix-amp does not ship the headless backend yet."[: width - 1])
-        surface.addstr(6, 0, f"expected socket: {state.backend.path}"[: width - 1])
-        surface.addstr(7, 0,
-                       "Use the Kilix 95 Media Player until then."[: width - 1])
-        surface.addstr(height - 1, 0, "r retry · q quit"[: width - 1])
+        shell.put(surface, body.top, body.left,
+                  "This front end drives kilix-amp over a control socket;")
+        shell.put(surface, body.top + 1, body.left,
+                  "kilix-amp does not ship the headless backend yet.")
+        shell.put(surface, body.top + 3, body.left,
+                  f"expected socket: {state.backend.path}",
+                  shell.tango.attr("muted"))
+        shell.put(surface, body.top + 4, body.left,
+                  "Use the Kilix 95 Media Player until then.")
         return
     if state.backend.error:
-        surface.addstr(2, 0, state.backend.error[: width - 1])
-    playing = state.status.get("state", "stopped")
-    title = state.status.get("title", "")
+        shell.put(surface, body.top, body.left, state.backend.error,
+                  shell.tango.attr("alert"))
     position = float(state.status.get("pos", 0) or 0)
     length = float(state.status.get("len", 0) or 0)
-    surface.addstr(2, 0, f"{playing}  {title}"[: width - 1])
+    row = body.top
     if length:
-        surface.addstr(3, 0,
-                       f"{proc.human_duration(position)} / "
-                       f"{proc.human_duration(length)}  "
-                       f"{proc.bar(position / length, max(0, width - 24))}"[: width - 1])
+        shell.put(
+            surface, row, body.left,
+            f"{proc.human_duration(position)} / "
+            f"{proc.human_duration(length)}  "
+            f"{proc.bar(position / length, max(0, body.width - 24))}",
+            shell.tango.attr("accent"),
+        )
+        row += 2
     for index, item in enumerate(state.playlist):
-        row = 5 + index
-        if row >= height - 1:
+        list_row = row + index
+        if list_row >= body.bottom:
             break
-        marker = ">" if index == state.selected else " "
-        surface.addstr(row, 0, f"{marker} {os.path.basename(item)}"[: width - 1])
-    surface.addstr(height - 1, 0,
-                   "space play/pause · n next · p prev · r refresh · q quit"[: width - 1])
+        selected = index == state.selected
+        marker = "▶" if selected else " "
+        shell.put(
+            surface, list_row, body.left,
+            f"{marker} {os.path.basename(item)}",
+            shell.tango.attr("selected") if selected else 0,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

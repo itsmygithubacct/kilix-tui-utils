@@ -178,6 +178,16 @@ class ResolutionTests(unittest.TestCase):
             plan = registry.resolve(item)
         self.assertEqual(plan.argv, ("/usr/bin/kilix-calculator",))
 
+    def test_virtualbox_manager_resolves_from_this_checkout(self):
+        item = next(
+            item for item in registry.MACHINE
+            if item.label == "VirtualBox VPN")
+        with mock.patch("shutil.which", return_value=None):
+            plan = registry.resolve(item)
+        self.assertIsNotNone(plan)
+        self.assertTrue(
+            plan.argv[1].endswith("kilix-virtualbox-manager/main.py"))
+
     def test_sibling_tool_backs_up_a_missing_install(self):
         item = registry.Item("x", command="kilix-calculator",
                              sibling="calculator")

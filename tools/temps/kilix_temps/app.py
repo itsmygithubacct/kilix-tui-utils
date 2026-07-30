@@ -308,6 +308,10 @@ class DashboardApp:
             self.options.paused = not self.options.paused
         elif key in {"h", "H", "?"}:
             self.options.help_visible = not self.options.help_visible
+        elif key == "1":
+            self.options.help_visible = False
+        elif key == "2":
+            self.options.help_visible = True
         elif key in {"r", "R"}:
             self.model.reset_peaks()
         elif key in {"j", "J", "down"}:

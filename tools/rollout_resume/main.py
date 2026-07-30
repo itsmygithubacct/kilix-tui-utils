@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap  # noqa: E402
+from kilix_tui import app, keys as keymap, shell  # noqa: E402
 from kilix_rollout import (  # noqa: E402
     claude, codex, config, installer, kimi, launch, liveness, manage, menu,
     model, pacing, providers,
@@ -210,8 +210,15 @@ class State:
 
 # ── rendering ────────────────────────────────────────────────────────────────
 
-def _row_text(item: Session, width: int, *, marked: bool = False) -> str:
-    prefix = (f"{'*' if marked else ' '} {item.state.upper():<8}"
+def _row_text(
+    item: Session,
+    width: int,
+    *,
+    marked: bool = False,
+    selected: bool = False,
+) -> str:
+    prefix = (f"{'▶' if selected else ' '}{'*' if marked else ' '} "
+              f"{item.state.upper():<8}"
               f"{item.provider:<7}{item.age():>4}  "
               f"{item.project[:16]:<16}  {item.short_id:<13}  ")
     return prefix + (item.title or "(no recorded prompt)")[:max(0, width - len(prefix))]
@@ -223,78 +230,116 @@ def render(surface, state: State) -> None:
     # getch(), so screenshots and tests never become interactive.
     if hasattr(surface, "getch"):
         state.screen = surface
-    height, width = surface.getmaxyx()
     pane = PANES[state.pane]
-    surface.addstr(0, 0, (
-        f" kilix-rollout-resume   pane:{pane}   view:{VIEWS[state.view]}"
-        f"   agent:{AGENTS[state.agent]}   range:{state.range_label}"
-        f"{f'   filter:{state.query}' if state.query else ''}"
-        f"{f'   marked:{len(state.marked)}' if state.marked else ''}"
-        f"{'   YOLO' if state.yolo else ''} "
-    )[:width - 1], curses.A_REVERSE)
+    context = (
+        f"view {VIEWS[state.view]} · agent {AGENTS[state.agent]} · "
+        f"range {state.range_label}"
+        f"{f' · filter {state.query}' if state.query else ''}"
+        f"{f' · {len(state.marked)} marked' if state.marked else ''}"
+        f"{' · YOLO' if state.yolo else ''}"
+    )
+    footer = (
+        "Enter resume · x tmux · A attach · Space mark · R restore · "
+        "/ filter · y yolo · q quit"
+        if pane == "sessions" else
+        "Enter install/update · Tab sessions · m sync menu · "
+        "r refresh · ? help · q quit"
+    )
+    body = shell.draw(
+        surface,
+        title="Rollout Resume",
+        sections=("Sessions", "Agents"),
+        active=state.pane,
+        summary=state.status or context,
+        footer=footer,
+        summary_role=(
+            "alert" if state.yolo else "accent" if state.status else "muted"
+        ),
+    )
 
     if pane == "agents":
-        _render_agents(surface, state, height, width)
+        _render_agents(surface, state, body)
     else:
-        _render_sessions(surface, state, height, width)
-
-    surface.addstr(height - 2, 0, state.status[:width - 1], curses.A_DIM)
-    footer = (" Enter resume · x tmux · A attach · Space mark · R restore · / filter · y yolo · q quit"
-              if pane == "sessions" else
-              " Enter install/update · Tab sessions · m sync menu · r refresh · ? help · q quit")
-    surface.addstr(height - 1, 0, footer[:width - 1], curses.A_BOLD)
+        _render_sessions(surface, state, body)
 
 
-def _render_sessions(surface, state: State, height: int, width: int) -> None:
-    surface.addstr(2, 0, ("  STATE   AGENT   AGE  PROJECT           "
-                          "SESSION        CONVERSATION")[:width - 1], curses.A_BOLD)
+def _render_sessions(surface, state: State, body: shell.Body) -> None:
+    shell.put(
+        surface, body.top, body.left,
+        "   STATE   AGENT   AGE  PROJECT           SESSION        CONVERSATION",
+        shell.tango.attr("title"),
+    )
     rows = state.rows
-    body = max(1, height - 6)
+    capacity = max(1, body.height - 2)
     if state.selected < state.offset:
         state.offset = state.selected
-    if state.selected >= state.offset + body:
-        state.offset = state.selected - body + 1
-    state.offset = max(0, min(state.offset, max(0, len(rows) - body)))
+    if state.selected >= state.offset + capacity:
+        state.offset = state.selected - capacity + 1
+    state.offset = max(
+        0, min(state.offset, max(0, len(rows) - capacity)))
 
     if not rows:
-        surface.addstr(4, 2, "(no sessions match this view)")
-    for line, index in enumerate(range(state.offset, min(len(rows), state.offset + body)), start=3):
+        shell.put(surface, body.top + 2, body.left + 1,
+                  "(no sessions match this view)",
+                  shell.tango.attr("muted"))
+    for line, index in enumerate(
+        range(state.offset, min(len(rows), state.offset + capacity)),
+        start=body.top + 1,
+    ):
         item = rows[index]
-        attribute = curses.A_REVERSE if index == state.selected else 0
-        surface.addstr(
-            line, 0,
+        selected = index == state.selected
+        shell.put(
+            surface, line, body.left,
             _row_text(
-                item, width - 1,
-                marked=item.session_id in state.marked),
-            attribute,
+                item, body.width,
+                marked=item.session_id in state.marked,
+                selected=selected,
+            ),
+            shell.tango.attr("selected") if selected else 0,
         )
 
     chosen = state.current
-    if chosen is not None:
-        surface.addstr(height - 3, 0,
-                       f" {chosen.cwd or '(no working directory)'}"[:width - 1],
-                       curses.A_DIM)
+    if chosen is not None and body.height:
+        shell.put(
+            surface, body.bottom - 1, body.left,
+            chosen.cwd or "(no working directory)",
+            shell.tango.attr("muted"),
+        )
 
 
-def _render_agents(surface, state: State, height: int, width: int) -> None:
-    surface.addstr(2, 0, "  AGENT         COMMAND   STATUS"[:width - 1], curses.A_BOLD)
-    for line, row in enumerate(state.agents, start=3):
-        attribute = curses.A_REVERSE if line - 3 == state.agent_row else 0
+def _render_agents(surface, state: State, body: shell.Body) -> None:
+    shell.put(surface, body.top, body.left,
+              "  AGENT         COMMAND   STATUS",
+              shell.tango.attr("title"))
+    for line, row in enumerate(state.agents, start=body.top + 1):
+        selected = line - body.top - 1 == state.agent_row
         mark = "installed" if row["installed"] else "NOT INSTALLED"
-        text = f"{row['label']:<14}{row['command']:<10}{mark}"
-        surface.addstr(line, 1, text[:width - 2], attribute)
+        text = (
+            f"{'▶' if selected else ' '} "
+            f"{row['label']:<14}{row['command']:<10}{mark}"
+        )
+        shell.put(
+            surface, line, body.left, text,
+            shell.tango.attr("selected") if selected else
+            (shell.tango.attr("alert") if not row["installed"] else 0),
+        )
 
     item = state.current_agent
     row = state.agents[state.agent_row]
     if row["installed"]:
-        surface.addstr(height - 4, 1, f"Update with: {' '.join(item.update_argv)}"[:width - 2],
-                       curses.A_DIM)
-        surface.addstr(height - 3, 1, f"Installed at: {row['path']}"[:width - 2], curses.A_DIM)
+        shell.put(surface, body.bottom - 2, body.left,
+                  f"Update with: {' '.join(item.update_argv)}",
+                  shell.tango.attr("muted"))
+        shell.put(surface, body.bottom - 1, body.left,
+                  f"Installed at: {row['path']}",
+                  shell.tango.attr("muted"))
     else:
-        surface.addstr(height - 4, 1, f"Install with: {item.install_shell}"[:width - 2],
-                       curses.A_DIM)
-        surface.addstr(height - 3, 1, f"Documented at: {item.install_source}"[:width - 2],
-                       curses.A_DIM)
+        shell.put(surface, body.bottom - 2, body.left,
+                  f"Install with: {item.install_shell}",
+                  shell.tango.attr("muted"))
+        shell.put(surface, body.bottom - 1, body.left,
+                  f"Documented at: {item.install_source}",
+                  shell.tango.attr("muted"))
 
 
 # ── interaction ──────────────────────────────────────────────────────────────

@@ -35,7 +35,9 @@ class RenderTests(unittest.TestCase):
         lines = frame.splitlines()
         self.assertLessEqual(len(lines), 28)
         self.assertTrue(all(len(strip_ansi(line)) == 100 for line in lines))
-        self.assertIn("KILIX // MEMORY", frame)
+        self.assertIn("KILIX TUI", frame)
+        self.assertIn("▶1 Monitor", frame.splitlines()[1])
+        self.assertNotIn("//", frame)
         self.assertIn("firefox", frame)
 
     def test_help(self):

@@ -15,7 +15,6 @@ from .collect import DemoMemoryBackend, LinuxMemoryBackend, MemorySnapshot
 from .graphics import (
     GraphicalRenderer,
     graphics_available,
-    kitty_graphics_likely,
 )
 from .model import MemoryModel
 from .render import FrameOptions, Renderer, strip_ansi
@@ -71,7 +70,7 @@ def _parser() -> argparse.ArgumentParser:
     display.add_argument(
         "--text",
         action="store_true",
-        help="use ANSI text even when Kitty graphics are available",
+        help="use the canonical text interface (the default)",
     )
     parser.add_argument(
         "--no-color",
@@ -243,9 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("interactive mode requires a terminal; use --once or --json")
 
-    use_graphics = args.graphics or (
-        not args.text and kitty_graphics_likely()
-    )
+    use_graphics = args.graphics
     if use_graphics:
         available, reason = graphics_available()
         if not available and args.graphics:

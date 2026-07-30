@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, __file__.rsplit("/tools/", 1)[0] + "/src")
 
-from kilix_tui import app, keys as keymap  # noqa: E402
+from kilix_tui import app, keys as keymap, shell  # noqa: E402
 
 _BINARY = {
     ast.Add: operator.add,
@@ -108,20 +108,28 @@ def submit(state: State) -> None:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, "Kilix Calculator"[: width - 1])
-    surface.addstr(2, 0, f"> {state.entry}"[: width - 1])
+    body = shell.draw(
+        surface,
+        title="Calculator",
+        sections=("Calculate",),
+        summary="Safe arithmetic · standard operators and powers",
+        footer="Enter evaluate · Backspace · q quit",
+    )
+    row = body.top
+    shell.put(surface, row, body.left, f"> {state.entry}",
+              shell.tango.attr("accent"))
     if state.error:
-        surface.addstr(3, 0, f"  {state.error}"[: width - 1])
+        shell.put(surface, row + 1, body.left, f"  {state.error}",
+                  shell.tango.attr("alert"))
     elif state.result:
-        surface.addstr(3, 0, f"= {state.result}"[: width - 1])
+        shell.put(surface, row + 1, body.left, f"= {state.result}",
+                  shell.tango.attr("title"))
     for index, item in enumerate(state.history):
-        row = 5 + index
-        if row >= height - 1:
+        history_row = row + 3 + index
+        if history_row >= body.bottom:
             break
-        surface.addstr(row, 2, item[: width - 3])
-    surface.addstr(height - 1, 0,
-                   "Enter evaluate · Backspace · q quit"[: width - 1])
+        shell.put(surface, history_row, body.left + 1, item,
+                  shell.tango.attr("muted"))
 
 
 def handle(key: int, state: State) -> bool:

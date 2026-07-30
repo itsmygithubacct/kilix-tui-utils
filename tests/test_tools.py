@@ -57,6 +57,20 @@ class ToolContractTests(unittest.TestCase):
                 frame = app.render_to_text(module.render, make_state(module))
                 self.assertIsInstance(frame, str)
 
+    def test_every_tool_uses_the_virtualbox_manager_shell(self):
+        for name in TOOLS:
+            with self.subTest(tool=name):
+                module = load(name)
+                frame = app.render_to_text(
+                    module.render, make_state(module),
+                    height=24, width=100,
+                )
+                lines = frame.splitlines()
+                self.assertIn("KILIX TUI", lines[0])
+                self.assertIn("▶1", lines[1])
+                self.assertTrue(lines[2].startswith("─"))
+                self.assertNotIn(" // ", frame)
+
     def test_rendering_clips_to_awkward_sizes(self):
         # A pane can be one column wide. Nothing may raise or overrun.
         for name in TOOLS:
@@ -207,6 +221,13 @@ class SharedCoreTests(unittest.TestCase):
         from kilix_tui import theme
         self.assertEqual(theme.setting("KILIX_DEFINITELY_NOT_SET", "fallback"),
                          "fallback")
+
+    def test_only_the_main_tango_renderer_remains(self):
+        self.assertFalse((ROOT / "src/kilix_tui/panel.py").exists())
+        self.assertFalse((ROOT / "src/kilix_tui/chrome.py").exists())
+        source = (ROOT / "src/kilix_tui/theme.py").read_text()
+        for removed in ("KILIX_PANEL", "PANEL_RGB", "panel_attr"):
+            self.assertNotIn(removed, source)
 
 
 class SessionLogTests(unittest.TestCase):

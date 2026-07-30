@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 FORMAT = r"${Package}\t${Version}\t${Installed-Size}\t${binary:Summary}\n"
 
@@ -60,26 +60,38 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
     rows = state.rows
     total = sum(int(r["size"]) for r in state.all)
-    surface.addstr(0, 0, f"Kilix Packages — {len(state.all)} installed, "
-                         f"{proc.human_bytes(total)} on disk"[: width - 1])
-    surface.addstr(1, 0, f"/{state.filter}"[: width - 1])
+    summary = (
+        f"{len(state.all)} installed · {proc.human_bytes(total)} on disk"
+        f"{f' · filter /{state.filter}' if state.filter else ''}"
+        f"{' · largest first' if state.sort_by_size else ''}"
+    )
+    body = shell.draw(
+        surface,
+        title="Packages",
+        sections=("Installed",),
+        summary=summary,
+        footer="type to filter · Tab sort by size · Esc quit",
+    )
     if not state.all:
-        surface.addstr(3, 0, "dpkg-query unavailable on this system"[: width - 1])
-    visible = max(1, height - 5)
+        shell.put(surface, body.top, body.left,
+                  "dpkg-query unavailable on this system",
+                  shell.tango.attr("alert"))
+    visible = max(1, body.height)
     start = max(0, min(state.selected - visible // 2, max(0, len(rows) - visible)))
     for index, item in enumerate(rows[start:start + visible]):
-        row = 3 + index
-        marker = ">" if start + index == state.selected else " "
-        surface.addstr(row, 0,
-                       f"{marker} {str(item['name']):<28.28} "
-                       f"{str(item['version']):<18.18} "
-                       f"{proc.human_bytes(int(item['size'])):>8}  "
-                       f"{item['summary']}"[: width - 1])
-    surface.addstr(height - 1, 0,
-                   "type to filter · s sort by size · q quit"[: width - 1])
+        row = body.top + index
+        selected = start + index == state.selected
+        marker = "▶" if selected else " "
+        shell.put(
+            surface, row, body.left,
+            f"{marker} {str(item['name']):<28.28} "
+            f"{str(item['version']):<18.18} "
+            f"{proc.human_bytes(int(item['size'])):>8}  "
+            f"{item['summary']}",
+            shell.tango.attr("selected") if selected else 0,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

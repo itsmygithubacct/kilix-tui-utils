@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, privileged, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, privileged, proc, shell  # noqa: E402
 
 SECTIONS = ("Status", "Update", "Session", "Power", "Health")
 
@@ -121,39 +121,72 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, "Plebian-OS Control"[: width - 1])
-    tabs = "  ".join(
-        f"{index + 1} {name}" + ("*" if index == state.section else "")
-        for index, name in enumerate(SECTIONS))
-    surface.addstr(1, 0, tabs[: width - 1])
-    row = 3
+    summary = (
+        f"Confirm: {state.confirm[0]}"
+        if state.confirm is not None
+        else state.message.splitlines()[0] if state.message
+        else (
+            f"{len(state.status)} system checks"
+            if SECTIONS[state.section] == "Status"
+            else f"{len(state.actions())} available actions"
+        )
+    )
+    roles = [
+        "danger" if index == state.section and name == "Power"
+        else "selected" if index == state.section
+        else "alert" if name == "Power"
+        else "muted"
+        for index, name in enumerate(SECTIONS)
+    ]
+    body = shell.draw(
+        surface,
+        title="Plebian-OS Control",
+        sections=SECTIONS,
+        active=state.section,
+        summary=summary,
+        footer=(
+            "y proceed · n/Esc cancel"
+            if state.confirm is not None
+            else "1-5 section · ↑/↓ · Enter run · q quit"
+        ),
+        tab_roles=roles,
+        summary_role="danger" if state.confirm is not None else
+        ("accent" if state.message else "muted"),
+    )
+    row = body.top
     if state.confirm is not None:
-        surface.addstr(row, 0, f"Confirm: {state.confirm[0]}"[: width - 1])
-        surface.addstr(row + 1, 0, "y to proceed · any other key to cancel"[: width - 1])
-        surface.addstr(height - 1, 0, "q quit"[: width - 1])
+        shell.put(surface, row, body.left,
+                  f"$ {' '.join(state.confirm[1])}",
+                  shell.tango.attr("muted"))
+        shell.put(surface, row + 2, body.left,
+                  "y to proceed · any other key to cancel",
+                  shell.tango.attr("danger"))
         return
     if SECTIONS[state.section] == "Status":
         for label, value in state.status:
-            if row >= height - 2:
+            if row >= body.bottom:
                 break
-            surface.addstr(row, 0, f"{label:<16}{value}"[: width - 1])
+            shell.put(surface, row, body.left, f"{label:<16}{value}")
             row += 1
     else:
         for index, (label, _argv, needs) in enumerate(state.actions()):
-            if row >= height - 4:
+            if row >= body.bottom - (2 if state.message else 0):
                 break
-            marker = ">" if index == state.selected else " "
+            selected = index == state.selected
+            marker = "▶" if selected else " "
             tag = "  (confirms)" if needs else ""
-            surface.addstr(row, 0, f"{marker} {label}{tag}"[: width - 1])
+            shell.put(
+                surface, row, body.left, f"{marker} {label}{tag}",
+                shell.tango.attr("selected") if selected else
+                (shell.tango.attr("alert") if needs else 0),
+            )
             row += 1
     if state.message:
-        row = min(row + 1, height - 3)
-        for line in state.message.splitlines()[: max(0, height - row - 1)]:
-            surface.addstr(row, 0, line[: width - 1])
+        row = min(row + 1, body.bottom - 1)
+        for line in state.message.splitlines()[:max(0, body.bottom - row)]:
+            shell.put(surface, row, body.left, line,
+                      shell.tango.attr("muted"))
             row += 1
-    surface.addstr(height - 1, 0,
-                   "1-5 section · ↑/↓ · Enter run · q quit"[: width - 1])
 
 
 def handle(key: int, state: State) -> bool:
@@ -198,8 +231,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{label:<16}{value}")
         return 0
     if path := app.screenshot_argv(argv):
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(app.render_to_text(render, state) + "\n")
+        with open(path, "w", encoding="utf-8") as target:
+            target.write(app.render_to_text(render, state) + "\n")
         return 0
     return app.run(render, state, handle=handle)
 

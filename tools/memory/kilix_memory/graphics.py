@@ -29,12 +29,7 @@ WHITE = "#ffffff"
 MUTED = "#8297ae"
 DIM = "#4d6680"
 BLUE = "#419ce0"
-CYAN = "#3aced3"
-GREEN = "#8ae234"
-YELLOW = "#fcd34d"
-ORANGE = "#f57900"
 RED = "#ef4141"
-PURPLE = "#b58cff"
 
 
 class GraphicsUnavailable(RuntimeError):
@@ -392,8 +387,8 @@ class GraphicalRenderer:
         if percent >= 90:
             return RED
         if percent >= 75:
-            return YELLOW
-        return GREEN
+            return RED
+        return BLUE
 
     def _header(
         self,
@@ -415,7 +410,7 @@ class GraphicalRenderer:
         self._text(
             canvas,
             (left + 18, top + 3, right // 2, bottom - 2),
-            "KILIX // MEMORY",
+            "KILIX TUI",
             WHITE,
             scale=scale,
             bold=True,
@@ -507,7 +502,7 @@ class GraphicalRenderer:
                 format_bytes(memory.available),
                 f"{memory.available_percent:.1f}% ready",
                 memory.available_percent / 100.0,
-                CYAN,
+                BLUE,
             ),
             (
                 "SWAP",
@@ -522,7 +517,7 @@ class GraphicalRenderer:
                     else "not configured"
                 ),
                 memory.swap_percent / 100.0,
-                PURPLE,
+                BLUE,
             ),
             (
                 "PRESSURE / AVG10",
@@ -533,7 +528,7 @@ class GraphicalRenderer:
                     else "PSI unavailable"
                 ),
                 min(1.0, pressure_value / 25.0),
-                ORANGE if pressure_value >= 5 else BLUE,
+                RED if pressure_value >= 5 else BLUE,
             ),
         )
         for index, card in enumerate(cards):
@@ -569,8 +564,8 @@ class GraphicalRenderer:
         )
         colors = {
             "apps": BLUE,
-            "cache": CYAN,
-            "buffers": YELLOW,
+            "cache": BLUE,
+            "buffers": WHITE,
             "free": "#24425d",
         }
         bar = (left + 14, top + 34, right - 14, top + 58)
@@ -636,11 +631,11 @@ class GraphicalRenderer:
             (
                 "MAJOR",
                 format_rate(rates.major_faults_per_second, unit="events"),
-                ORANGE if rates.major_faults_per_second else GREEN,
+                RED if rates.major_faults_per_second else BLUE,
             ),
-            ("SWAP IN", format_rate(rates.swap_in_bytes_per_second), CYAN),
-            ("SWAP OUT", format_rate(rates.swap_out_bytes_per_second), PURPLE),
-            ("SCAN", format_rate(rates.scan_pages_per_second, unit="pages"), YELLOW),
+            ("SWAP IN", format_rate(rates.swap_in_bytes_per_second), BLUE),
+            ("SWAP OUT", format_rate(rates.swap_out_bytes_per_second), BLUE),
+            ("SCAN", format_rate(rates.scan_pages_per_second, unit="pages"), WHITE),
         )
         available = max(1, bottom - top - 40)
         row_height = max(17, available // len(rows))
@@ -770,9 +765,9 @@ class GraphicalRenderer:
                 )
             row_bottom = y + row_height
             rss_color = (
-                ORANGE
+                RED
                 if process.rss >= 2 * 1024**3
-                else CYAN
+                else BLUE
                 if process.rss >= 1024**3
                 else TEXT
             )
@@ -847,7 +842,7 @@ class GraphicalRenderer:
         self._text(
             canvas,
             (left + 24, top + 16, box[2] - 24, top + 58),
-            "KILIX MEMORY // HELP",
+            "KILIX TUI · MEMORY HELP",
             WHITE,
             scale=2 if panel_width > 500 else scale,
             bold=True,
@@ -868,7 +863,7 @@ class GraphicalRenderer:
                 canvas,
                 (left + 28, y, left + 180, y + row_height),
                 key,
-                CYAN,
+                BLUE,
                 bold=True,
             )
             self._text(
@@ -882,7 +877,7 @@ class GraphicalRenderer:
             canvas,
             (left + 24, box[3] - 42, box[2] - 24, box[3] - 14),
             "Read-only monitoring: no kill, reclaim, renice, or tuning actions.",
-            YELLOW,
+            WHITE,
             align="center",
         )
 
@@ -948,7 +943,7 @@ class GraphicalRenderer:
                 canvas,
                 (panel[2] - 95, y, panel[2] - 12, y + 20),
                 format_bytes(process.rss, short=True),
-                CYAN,
+                BLUE,
                 align="right",
             )
             y += 21
@@ -982,7 +977,7 @@ class GraphicalRenderer:
                 self._text(
                     canvas,
                     (10, 0, width - 10, height),
-                    "KILIX MEMORY // WAITING FOR SAMPLE",
+                    "KILIX TUI · MEMORY · WAITING FOR SAMPLE",
                     MUTED,
                     align="center",
                     scale=scale,

@@ -26,15 +26,15 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, chrome, keys as keymap, kitty_rc, panel, theme  # noqa: E402
+from kilix_desk import tango  # noqa: E402
+from kilix_tui import app, keys as keymap, kitty_rc, shell  # noqa: E402
 
 # The spine doubles as the scope control: which slice of the terminal is on
 # screen. F12 opens on everything; the tmux-leader `q` opens on this page,
 # which is the pane picker it replaces.
 SCOPES = ("all", "page", "other")
-SCOPE_LABELS = ("ALL", "THIS PAGE", "ELSEWHERE")
+SCOPE_LABELS = ("All", "This page", "Elsewhere")
 PREVIEW_LINES = 14
-NODE = "KILIX SWITCH"
 
 
 @dataclass
@@ -140,6 +140,26 @@ class State:
 # ── drawing ──────────────────────────────────────────────────────────────────
 
 
+def _put(surface, row: int, col: int, text: str, attr: int = 0) -> None:
+    """The same clipped write primitive used by the main desktop renderer."""
+    try:
+        height, width = surface.getmaxyx()
+    except Exception:
+        height, width = 24, 80
+    if not (0 <= row < height) or col >= width:
+        return
+    if col < 0:
+        text = text[-col:]
+        col = 0
+    text = text[: max(0, width - col - (1 if row == height - 1 else 0))]
+    if not text:
+        return
+    try:
+        surface.addstr(row, col, text, attr)
+    except Exception:
+        pass
+
+
 def _row_text(row: Row, width: int, collapsed: bool = False) -> tuple[str, str]:
     """(left, right) text for a row, before any styling."""
     if row.kind == "page":
@@ -205,8 +225,7 @@ def draw_list(
     if not rows:
         note = state.message or (
             f"nothing matches “{state.filter}”" if state.filter else "no panes")
-        panel._put(surface, top, left, note[:width],
-                   theme.panel_attr("alert", on_void=True))
+        _put(surface, top, left, note[:width], tango.attr("alert"))
         return
 
     for line in range(height):
@@ -226,14 +245,15 @@ def draw_list(
         line_text = f"{body}{' ' * pad}{text_right} "[:width]
 
         if selected:
-            # A filled row, not a colour swap: on a terminal without the panel
-            # palette the ▶ is what says which row is current.
-            attr = theme.panel_attr("primary", bold=True)
-            panel._put(surface, top + line, left, line_text.ljust(width), attr)
+            _put(
+                surface, top + line, left, line_text.ljust(width),
+                tango.attr("selected"),
+            )
         else:
-            role = "secondary" if row.kind == "page" else "quaternary"
-            panel._put(surface, top + line, left, line_text,
-                       theme.panel_attr(role, on_void=True))
+            _put(
+                surface, top + line, left, line_text,
+                tango.attr("accent") if row.kind == "page" else 0,
+            )
 
 
 def draw_preview(
@@ -241,18 +261,17 @@ def draw_preview(
 ) -> None:
     if height <= 2 or width <= 6:
         return
-    used = panel.pill(surface, top, left, "SCREEN", "tertiary")
+    _put(surface, top, left, "SCREEN", tango.attr("title"))
     text = state.preview_text()
     if not text:
-        # Empty space in this layout is meant to carry texture rather than sit
-        # blank, which is also why the readout exists at all.
-        panel.readout(surface, top + 2, left, min(6, height - 2), width, seed=3)
+        _put(
+            surface, top + 2, left, "(no preview)"[:width],
+            tango.attr("muted"),
+        )
         return
-    del used
     body = text.splitlines()[-(height - 2):]
-    attr = theme.panel_attr("secondary", on_void=True)
     for line, content in enumerate(body):
-        panel._put(surface, top + 2 + line, left, content[:width], attr)
+        _put(surface, top + 2 + line, left, content[:width])
 
 
 def footer(state: State) -> str:
@@ -266,27 +285,45 @@ def footer(state: State) -> str:
 
 
 def render(surface, state: State) -> None:
-    page = chrome.Page("Kilix Switcher", SCOPE_LABELS, node=NODE)
+    try:
+        surface_height, surface_width = surface.getmaxyx()
+    except Exception:
+        surface_height, surface_width = 24, 80
+    if surface_height <= 0 or surface_width <= 0:
+        return
     counts = (
         f"{len(state.tree.pages)} page{'' if len(state.tree.pages) == 1 else 's'}"
         f" · {len(state.tree.panes)} pane{'' if len(state.tree.panes) == 1 else 's'}"
     )
     if state.filter:
         counts += f" · filter “{state.filter}”"
-    page.render(surface, state.scope, footer=footer(state), status=counts)
+    status = state.message or counts
+    body = shell.draw(
+        surface,
+        title="Switcher",
+        sections=SCOPE_LABELS,
+        active=state.scope,
+        summary=status,
+        footer=footer(state),
+        summary_role="alert" if state.message else "muted",
+    )
 
-    top, left, height, width = page.content_box()
+    top, left = body.top, body.left
+    height, width = body.height, body.width
     if height <= 0 or width <= 0:
         return
     list_width, gap = width, 0
     if state.preview_on and width >= 64:
         list_width = max(30, width * 55 // 100)
-        gap = 1
+        gap = 2
     draw_list(surface, state, top, left, height, list_width)
     preview_width = width - list_width - gap
     if gap and preview_width > 6:
-        draw_preview(surface, state, top, left + list_width + gap, height,
-                     preview_width)
+        separator = left + list_width
+        for row in range(top, top + height):
+            _put(surface, row, separator, "│", tango.attr("muted"))
+        draw_preview(
+            surface, state, top, separator + gap, height, preview_width)
 
 
 # ── input ────────────────────────────────────────────────────────────────────

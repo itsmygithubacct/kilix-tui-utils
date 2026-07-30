@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 CONTROLS = ("pactl", "wpctl")
 
@@ -97,28 +97,43 @@ class State:
 
 
 def render(surface, state: State) -> None:
-    height, width = surface.getmaxyx()
-    surface.addstr(0, 0, "Kilix Volume"[: width - 1])
+    body = shell.draw(
+        surface,
+        title="Volume",
+        sections=("Outputs",),
+        summary=(
+            f"{len(state.sinks)} outputs · {state.control}"
+            if state.control else "No audio control command found"
+        ),
+        footer=(
+            "←/→ volume · m mute · d default · r refresh · q quit"
+            if state.control else "q quit"
+        ),
+        summary_role="muted" if state.control else "alert",
+    )
     if state.control is None:
-        surface.addstr(2, 0,
-                       "No PulseAudio or PipeWire control command found."[: width - 1])
-        surface.addstr(3, 0, "Install pulseaudio-utils (pactl)."[: width - 1])
-        surface.addstr(height - 1, 0, "q quit"[: width - 1])
+        shell.put(surface, body.top, body.left,
+                  "No PulseAudio or PipeWire control command found.")
+        shell.put(surface, body.top + 1, body.left,
+                  "Install pulseaudio-utils (pactl).",
+                  shell.tango.attr("muted"))
         return
-    row = 2
+    row = body.top
     for index, sink in enumerate(state.sinks):
-        if row >= height - 2:
+        if row >= body.bottom:
             break
-        marker = ">" if index == state.selected else " "
+        selected = index == state.selected
+        marker = "▶" if selected else " "
         star = "*" if sink.get("default") else " "
         level = int(sink["volume"])
         label = "muted" if sink["muted"] else f"{level:3d}%"
-        surface.addstr(row, 0,
-                       f"{marker}{star} {str(sink['description']):<30.30} "
-                       f"{label} {proc.bar(level / 100, max(0, width - 46))}"[: width - 1])
+        shell.put(
+            surface, row, body.left,
+            f"{marker}{star} {str(sink['description']):<30.30} "
+            f"{label} {proc.bar(level / 100, max(0, body.width - 46))}",
+            shell.tango.attr("selected") if selected else 0,
+        )
         row += 1
-    surface.addstr(height - 1, 0,
-                   "←/→ volume · m mute · d default · r refresh · q quit"[: width - 1])
 
 
 def main(argv: list[str] | None = None) -> int:

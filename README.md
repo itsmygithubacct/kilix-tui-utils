@@ -26,23 +26,22 @@ collapses that into a single component the coordinated release pins once.
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
 | `kilix-music` | Player driving kilix-amp over its control socket |
 | `kilix-temps` | Live temperature, fan, and thermal-headroom [dashboard](tools/temps/README.md) |
+| `kilix-virtualbox-manager` | Discover, launch, focus, and control VirtualBox VPN machines in Kilix tabs |
 | `kilix-tui` | **The text-native desktop** — see below |
 
 ## The desktop: `kilix-tui`
 
 `kilix-tui/main.py` (deliberately not under `tools/` — those are what it
-launches) is a desktop provider in the same sense as Kilix 95 and Kilix Cap:
-it composes the commands above rather than containing any application of its
-own. It is **Tango-themed and renders twice**: inside a Kitty-graphics
-terminal it draws real pixels — a large-type sidebar, cards, and a scarlet
-Power section over the stack's blues, whites, and greys, presented through
-the same damage-aware `kitty-frame-presenter` the dashboards use — and
-everywhere else (`ssh`, `tmux`, a bare console, `--text`) the identical
-desktop renders as Tango-coloured text. Six sections: Home (status),
-Programs, Machine, System, Session, and Power — the last being the point: it
-closes the stack's no-desktop-provider power gap with confirmed
-`systemctl`/`loginctl` actions shared verbatim with `plebian-os`
-(`src/kilix_tui/privileged.py` is the one list of what "Shut down" runs).
+launches) is a desktop provider in the same sense as Kilix 95, Kilix Cap, and
+Kilix Land: it composes the commands above rather than containing any
+application of its own. Its default is the canonical Tango text shell shared
+by every utility: `KILIX TUI`, numbered navigation, one divider, one status
+row, the application body, and a footer. An optional pixel rendering remains
+available with `--graphics`. Six sections: Home (status), Programs, Machine,
+System, Session, and Power — the last being the point: it closes the stack's
+no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions
+shared verbatim with `plebian-os` (`src/kilix_tui/privileged.py` is the one list
+of what "Shut down" runs).
 
 Three verbs, one rule. An entry is drawn in the well, handed the terminal in
 place, or opened in a Kilix page (`kitty_rc.launch_tab`) — and in-place is the
@@ -91,27 +90,15 @@ next tool gets it free.
   control. It is a convenience, never a privilege: Kilix scopes the credential
   it hands each pane at the terminal, so a tool asking for anything outside
   that set is refused even though it holds the credential.
-- `panel.py` / `chrome.py` — an optional second look, described below.
+- `shell.py` — the one four-row frame used by the desktop, managers, and every
+  installed text utility.
+- `kilix_desk/desk.py` and `kilix_desk/tango.py` — the one canonical text
+  layout and palette used by `kilix-tui/main.py` and the interactive managers.
 
-**An optional second look.** `theme.py` carries a second palette — flat colour
-blocks on black, no white, no grey, no borders — and `panel.py` draws in it:
-blocks, elbows, segmented bars, pill buttons, and the numeric identifiers that
-give the layout its texture. `chrome.Page` composes them into a spine on the
-left, a title upper right, and a content well a tool draws into, so a tool that
-opts in gets the whole look for the price of naming its sections.
-
-Two rules keep it from costing anything. Colour is never the only carrier of
-information — the selected row has a `▶`, not just a different background — and
-the whole layer is an *attribute* over unchanged text, so a 16-colour terminal
-or an `ssh` session renders exactly the same characters without it. When the
-surface gets too small to afford a spine, the spine is dropped whole rather than
-squeezed. `KILIX_PANEL=0` turns it off; `KILIX_PANEL=1` forces it on, which is
-what makes the look testable at all, since its fills are spaces.
-
-**Two rendering idioms.** Text/curses for anything that is a list you act on, so
-it works over SSH and inside `tmux`. Framebuffer over the Kitty graphics
-protocol for anything whose value is a time series or a shape. `kilix-temps`
-and `kilix-memory` are the framebuffer cases.
+Text/curses is the default for every utility, including the time-series
+monitors, so the suite has one visual and navigation language over SSH, in
+`tmux`, and inside Kilix. Memory, Temperatures, and the desktop retain optional
+framebuffer renderings behind `--graphics`.
 
 ## Going to a page or a pane
 
