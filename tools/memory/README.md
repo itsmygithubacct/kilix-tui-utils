@@ -26,7 +26,7 @@ Python 3.10 or newer is required. For the pixel dashboard, keep the shared
 libraries as sibling checkouts and build the native rasterizer:
 
 ```bash
-cd ~/.local/gpu_terminal/sources/kilix-tui-utils
+cd ~/.local/gpu_terminal/sources/kilix-desktops/kilix-tui-utils
 python3 tools/memory/main.py --graphics
 ```
 
@@ -63,8 +63,10 @@ kilix-memory --graphics
 The generated command is a small launcher back into
 `kilix-tui-utils/tools/memory`, so this checkout remains the source of truth.
 The graphical dashboard discovers installed libraries first, then sibling
-checkouts at `../kitty-frame-presenter`, `../soft-raster-py`, and
-`../soft-raster`. Run the complete repository test suite with
+checkouts at `../../kilix-modules/kitty-frame-presenter`,
+`../../kilix-modules/soft-raster-py`, and
+`../../kilix-modules/soft-raster`. Run the
+complete repository test suite with
 `python3 tests/run.py`, or only this tool's suite with
 `python3 tests/run.py memory`.
 

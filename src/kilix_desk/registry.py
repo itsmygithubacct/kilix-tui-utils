@@ -44,7 +44,7 @@ PROGRAMS = (
     Item("Coding agents", command="kilix-rollout-resume",
          sibling="rollout_resume"),
     Item("Model store", command="kilix-bonsai", kilix=("bonsai",), verb="tab"),
-    Item("Web browser", kilix=("browse",), verb="tab", kilix_only=True),
+    Item("Web browser", kilix=("open-url",), verb="tab", kilix_only=True),
     Item("Games", submenu="games"),
     Item("Screensavers", submenu="screensavers", kilix_only=True),
     Item("Music", command="kilix-music", sibling="music"),

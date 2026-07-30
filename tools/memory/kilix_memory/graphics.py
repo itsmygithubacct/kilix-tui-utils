@@ -81,8 +81,10 @@ def _presenter_module() -> Any:
         return _import_from_siblings(
             "kitty_frame_presenter",
             (
-                repository_root.parent / "kitty-frame-presenter/src",
-                repository_root.parent / "kilix/third_party/kitty-frame-presenter/src",
+                repository_root.parents[1]
+                / "kilix-modules/kitty-frame-presenter/src",
+                repository_root.parents[1]
+                / "kilix/third_party/kitty-frame-presenter/src",
             ),
         )
     except ImportError as error:
@@ -97,8 +99,10 @@ def _soft_raster_backend() -> tuple[Any, Any]:
         module = _import_from_siblings(
             "soft_raster",
             (
-                repository_root.parent / "soft-raster-py/src",
-                repository_root.parent / "kilix/third_party/soft-raster-py/src",
+                repository_root.parents[1]
+                / "kilix-modules/soft-raster-py/src",
+                repository_root.parents[1]
+                / "kilix/third_party/soft-raster-py/src",
             ),
         )
     except ImportError as error:
@@ -121,8 +125,8 @@ def _soft_raster_backend() -> tuple[Any, Any]:
             else ("libsoft-raster.so",)
         )
         for directory in (
-            repository_root.parent / "soft-raster/build",
-            repository_root.parent / "kilix/third_party/soft-raster/build",
+            repository_root.parents[1] / "kilix-modules/soft-raster/build",
+            repository_root.parents[1] / "kilix/third_party/soft-raster/build",
         ):
             for name in names:
                 candidate = directory / name

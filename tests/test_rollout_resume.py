@@ -616,7 +616,7 @@ class PortedFeatureTests(unittest.TestCase):
             with redirect_stdout(output):
                 code = tool.main([
                     "resume", CODEX_ID[:8], "--detached", "--dry-run",
-                    "--name", "port.test", "--json"])
+                    "--name", "port.test", "--json", "--native-tmux"])
         finally:
             tool.providers.discover = original_discover
             manage.installed = original_installed

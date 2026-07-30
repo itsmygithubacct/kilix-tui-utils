@@ -11,7 +11,14 @@ import os
 from kilix_tui import proc
 
 BUILD_INFO = "/etc/plebian-os/build-info.env"
-COMPONENTS = ("plebian-os", "pleb", "kilix", "kilix-95", "kilix-tui-utils")
+COMPONENTS = (
+    ("plebian-os", "plebian-os"),
+    ("pleb", "pleb"),
+    ("kilix", "kilix"),
+    ("kilix-95", os.path.join("kilix-desktops", "kilix-95")),
+    ("kilix-tui-utils",
+     os.path.join("kilix-desktops", "kilix-tui-utils")),
+)
 
 
 def _read(path: str) -> str:
@@ -40,8 +47,9 @@ def status_rows() -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
     if release := build_info().get("PLEBIAN_OS_VERSION"):
         rows.append(("release", release))
-    for name in COMPONENTS:
-        version = _read(os.path.join(source_home(), name, "VERSION")).strip()
+    for name, relative_path in COMPONENTS:
+        version = _read(
+            os.path.join(source_home(), relative_path, "VERSION")).strip()
         rows.append((name, version or "not present"))
     rows.append(("provider", os.environ.get("KILIX_DESKTOP_PROVIDER", "auto")))
     rows.append(("uptime", proc.human_duration(proc.uptime_seconds())))

@@ -48,8 +48,10 @@ def _presenter_module() -> Any:
     except ImportError as original:
         package_root = Path(__file__).resolve().parents[2]
         candidates = (
-            package_root.parent / "kitty-frame-presenter/src",
-            package_root.parent / "kilix/third_party/kitty-frame-presenter/src",
+            package_root.parents[1]
+            / "kilix-modules/kitty-frame-presenter/src",
+            package_root.parents[1]
+            / "kilix/third_party/kitty-frame-presenter/src",
         )
         for candidate in candidates:
             if not (candidate / "kitty_frame_presenter/__init__.py").is_file():
@@ -72,8 +74,8 @@ def _soft_raster_backend() -> tuple[Any, Any]:
     except ImportError as original:
         package_root = Path(__file__).resolve().parents[2]
         candidates = (
-            package_root.parent / "soft-raster-py/src",
-            package_root.parent / "kilix/third_party/soft-raster-py/src",
+            package_root.parents[1] / "kilix-modules/soft-raster-py/src",
+            package_root.parents[1] / "kilix/third_party/soft-raster-py/src",
         )
         module = None
         for candidate in candidates:
@@ -102,8 +104,8 @@ def _soft_raster_backend() -> tuple[Any, Any]:
         names = (("libsoft-raster.so",) if sys.platform.startswith("linux")
                  else ("libsoft-raster.dylib", "libsoft-raster.so"))
         directories = (
-            package_root.parent / "soft-raster/build",
-            package_root.parent / "kilix/third_party/soft-raster/build",
+            package_root.parents[1] / "kilix-modules/soft-raster/build",
+            package_root.parents[1] / "kilix/third_party/soft-raster/build",
         )
         for directory in directories:
             for name in names:

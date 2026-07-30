@@ -22,7 +22,7 @@ bounded rectangular updates. The default text TUI has no graphical dependency.
 ## Run it
 
 ```bash
-cd ~/.local/gpu_terminal/sources/kilix-tui-utils
+cd ~/.local/gpu_terminal/sources/kilix-desktops/kilix-tui-utils
 python3 tools/temps/main.py
 ```
 
@@ -43,10 +43,12 @@ kilix-temps
 The generated command is a small launcher back into
 `kilix-tui-utils/tools/temps`, so this checkout remains the source of truth.
 The pixel dashboard discovers installed graphical libraries first, then sibling
-checkouts at `../kitty-frame-presenter`, `../soft-raster-py`, and
-`../soft-raster`. The installed command can be launched from any Kilix pane.
-Run the complete repository test suite with `python3 tests/run.py`, or only
-this tool's suite with `python3 tests/run.py temps`.
+checkouts at `../../kilix-modules/kitty-frame-presenter`,
+`../../kilix-modules/soft-raster-py`, and
+`../../kilix-modules/soft-raster`. The
+installed command can be launched from any Kilix pane. Run the complete
+repository test suite with `python3 tests/run.py`, or only this tool's suite
+with `python3 tests/run.py temps`.
 
 Graphical mode is optional and selected explicitly:
 

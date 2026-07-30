@@ -58,8 +58,16 @@ def component_versions() -> list[tuple[str, str]]:
     source = os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
         os.path.expanduser("~"), "gpu_terminal")
     rows = []
-    for name in ("plebian-os", "pleb", "kilix", "kilix-95", "kilix-tui-utils"):
-        version = _read(os.path.join(source, name, "VERSION")).strip()
+    components = (
+        ("plebian-os", "plebian-os"),
+        ("pleb", "pleb"),
+        ("kilix", "kilix"),
+        ("kilix-95", os.path.join("kilix-desktops", "kilix-95")),
+        ("kilix-tui-utils",
+         os.path.join("kilix-desktops", "kilix-tui-utils")),
+    )
+    for name, relative_path in components:
+        version = _read(os.path.join(source, relative_path, "VERSION")).strip()
         rows.append((name, version or "not present"))
     return rows
 

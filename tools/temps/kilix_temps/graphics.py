@@ -288,12 +288,14 @@ def _presenter_module() -> Any:
     try:
         return importlib.import_module("kitty_frame_presenter")
     except ImportError as original:
-        # Source checkouts in gpu_terminal keep shared libraries beside the
-        # kilix-tui-utils repository.
+        # Source checkouts keep shared libraries in the workspace module
+        # umbrella beside kilix-desktops.
         repository_root = Path(__file__).resolve().parents[3]
         candidates = (
-            repository_root.parent / "kitty-frame-presenter/src",
-            repository_root.parent / "kilix/third_party/kitty-frame-presenter/src",
+            repository_root.parents[1]
+            / "kilix-modules/kitty-frame-presenter/src",
+            repository_root.parents[1]
+            / "kilix/third_party/kitty-frame-presenter/src",
         )
         for candidate in candidates:
             if not (candidate / "kitty_frame_presenter/__init__.py").is_file():
@@ -318,8 +320,8 @@ def _soft_raster_module() -> Any:
         # packaged installations may provide it normally through site-packages.
         repository_root = Path(__file__).resolve().parents[3]
         candidates = (
-            repository_root.parent / "soft-raster-py/src",
-            repository_root.parent / "kilix/third_party/soft-raster-py/src",
+            repository_root.parents[1] / "kilix-modules/soft-raster-py/src",
+            repository_root.parents[1] / "kilix/third_party/soft-raster-py/src",
         )
         for candidate in candidates:
             if not (candidate / "soft_raster/__init__.py").is_file():
@@ -356,8 +358,8 @@ def _soft_raster_backend() -> tuple[Any, Any]:
             else ("libsoft-raster.so",)
         )
         directories = (
-            repository_root.parent / "soft-raster/build",
-            repository_root.parent / "kilix/third_party/soft-raster/build",
+            repository_root.parents[1] / "kilix-modules/soft-raster/build",
+            repository_root.parents[1] / "kilix/third_party/soft-raster/build",
         )
         for directory in directories:
             for name in names:

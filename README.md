@@ -5,7 +5,7 @@ installer, one shared core.
 
 Before this, each dashboard was its own repo pinned by SHA, and each pinned
 three further helper repos at their own SHAs — eight pins for two tools. This
-collapses that into a single component the coordinated release pins once.
+collapses that into one checkout pinned once by Kilix’s dependency closure.
 
 ## Commands
 
@@ -52,7 +52,7 @@ second, a `kilix` subcommand third, and a foreign source checkout never.
 
 Inside Kilix, select it like the other desktops: `kilix kilix-tui`,
 `kilix desktop kilix-tui`, or `KILIX_DESKTOP_PROVIDER=tui` in the runtime
-config or the shared settings file. When it is the whole session
+config. When it is the whole session
 (`KILIX_TUI_SESSION=1`), quitting asks first.
 
 ## Install
@@ -65,9 +65,10 @@ KILIX_TUI_UTILS_PREFIX=/usr/local ./install.sh
 Each command is a small launcher that runs the tool from this checkout, so
 updating is `git pull` rather than a reinstall.
 
-The pixel interfaces use sibling checkouts of `kitty-frame-presenter`,
-`soft-raster-py`, and `soft-raster`, or normally installed copies of those
-libraries. Their text fallbacks remain available when the graphical
+The pixel interfaces use workspace checkouts under
+`<source-root>/kilix-modules` (`../../kilix-modules` from this repository), or
+normally installed copies of `kitty-frame-presenter`, `soft-raster-py`, and
+`soft-raster` libraries. Their text fallbacks remain available when the graphical
 dependencies are absent.
 
 ## Design
@@ -243,6 +244,10 @@ python3 tests/run.py calculator   # one
 
 ## Versioning
 
-This repo follows the coordinated stack version alongside plebian-os, pleb,
-kilix, and kilix-95. Its `v<x.y.z>` tag is created only by the release
-procedure, never pushed on its own.
+This repository is a Kilix-pinned desktop and utility closure, not a
+coordinated Plebian-OS release-core member. Selecting Kilix TUI as the desktop
+is optional; managed Plebian-OS installs the same checkout eagerly because it
+also supplies the unified utility suite. Its `VERSION` may advance
+independently, and it does not receive the core’s coordinated `v<x.y.z>` tags.
+A Plebian-OS release inherits the exact reviewed commit through the Kilix
+commit that pins it.

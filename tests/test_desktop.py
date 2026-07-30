@@ -213,6 +213,17 @@ class ResolutionTests(unittest.TestCase):
             plan = registry.resolve(item)
         self.assertEqual(plan.argv, ("/opt/kilix/kilix", "bonsai"))
 
+    def test_web_browser_uses_the_real_browser_dispatch(self):
+        item = next(
+            item for item in registry.PROGRAMS if item.label == "Web browser"
+        )
+        with mock.patch.object(
+                registry, "kilix_command",
+                return_value=["/opt/kilix/kilix"]):
+            plan = registry.resolve(item)
+        self.assertEqual(plan.argv, ("/opt/kilix/kilix", "open-url"))
+        self.assertNotIn("browse", plan.argv)
+
     def test_unresolvable_items_carry_a_reason_not_a_crash(self):
         item = registry.Item("x", command="kilix-bonsai", kilix=("bonsai",))
         with mock.patch.object(registry.shutil, "which", return_value=None), \
