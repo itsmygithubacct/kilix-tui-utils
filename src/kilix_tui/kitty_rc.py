@@ -1,8 +1,10 @@
 """An authenticated client for the terminal's own remote control.
 
-Kilix runs kitty with `allow_remote_control password` and hands each pane a
-private credential through `KILIX_RC_PASSWORD_FILE`. That credential is scoped
-at the terminal, not here: the password line kilix writes names exactly the
+Kilix runs kitty with `allow_remote_control socket`: requests over the local
+instance socket (found via `KITTY_LISTEN_ON`) are accepted unconditionally,
+while TTY-borne requests still need the private credential each pane receives
+through `KILIX_RC_PASSWORD_FILE`. On the credentialed path the scope lives at
+the terminal, not here: the password line kilix writes names exactly the
 commands it will honour, so a tool asking for anything outside that set is
 refused by the terminal even though it holds the credential. This module is
 therefore a convenience, never a privilege — it cannot do more than the pane it
