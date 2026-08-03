@@ -199,10 +199,11 @@ per-user executable paths, and diagnostics. Claude resumes also accept
 `--fork`, `--permission-mode`, `--model`, and `--prompt`. Configure persistent
 overrides with, for example,
 `kilix-rollout-resume configure --tmux /usr/bin/tmux --gap 45`; the mode-0600
-file is shown by `configure`. Existing standalone Claude/Codex executable and
-launch-interval settings are read as migration fallbacks. The old `tb`
-configuration is intentionally not inherited because the unified tool uses
-tmux directly and does not need the provider-specific logging adapter.
+file is shown by `configure`. Existing standalone Claude/Codex executable,
+launch-interval, and `tb` settings are read as migration fallbacks. Native
+tmux is the default backend; a configured `tb` adapter keeps tmux-cli's pane
+logging for users who relied on it, and `--native-tmux` bypasses it for one
+invocation.
 
 ## Safety properties, enforced by tests
 

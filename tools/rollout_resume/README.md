@@ -73,6 +73,27 @@ before the pending agent starts.
 The TUI accepts the same source roots, archive/orphan controls, executable
 overrides, launch interval, and `tb` backend selection as the CLI.
 
+## Agents
+
+```sh
+kilix-rollout-resume status
+kilix-rollout-resume install kimi --yes
+kilix-rollout-resume update claude
+kilix-rollout-resume sync-menu
+```
+
+`status` reports every agent; `--json` emits the machine shape. `install` runs
+the vendor's own documented command, printed with its source URL, and never
+without confirmation or `--yes`. `update` delegates to the agent's own updater
+(`claude update`, `codex update`, `kimi upgrade`) rather than re-running an
+install script. In the picker, Tab switches between the session and agent
+panes, and Enter on an agent installs or updates it.
+
+`sync-menu` refreshes the Kilix-95 Start-menu entries: the picker entry is
+always present, and a per-agent "Update <agent>" entry exists only while that
+agent is installed. `install.sh` and installs done from inside the tool sync
+them too.
+
 ## Configuration and launcher
 
 ```sh
