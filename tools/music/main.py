@@ -211,18 +211,38 @@ class Backend:
 
 
 class State:
+    """Everything on screen, and the one place that talks to the backend.
+
+    `status` is whatever the last reply carried, so the renderer never has to
+    ask a second time: every mutating command answers with the state it
+    produced, which is why a keypress redraws correctly without a round trip
+    of its own.
+    """
+
     def __init__(self) -> None:
         self.backend = Backend()
         self.status: dict = {}
         self.playlist: list[str] = []
+        self.section = 0            # 0 Now playing, 1 Playlist
         self.selected = 0
-        self.phase = ""    # "", "installing", "starting"
-        self.note = ""     # why the last attempt did not get there
+        self.phase = ""             # "", "installing", "starting"
+        self.note = ""              # why the last attempt did not get there
+        self.message = ""           # one line of feedback about the last key
+        self.help_open = False
+        self.prompt: str | None = None   # the "add path" entry, when open
         self._worker: threading.Thread | None = None
         self.refresh()
 
     def busy(self) -> bool:
         return bool(self._worker and self._worker.is_alive())
+
+    def typing(self) -> bool:
+        return self.prompt is not None
+
+    def absorb(self, reply: dict) -> None:
+        """Take the status a mutating command already returned."""
+        if reply and "state" in reply:
+            self.status = reply
 
     def refresh(self) -> None:
         self.status = self.backend.command("state") or {}
@@ -235,11 +255,58 @@ class State:
         """Pull current state for a redraw.
 
         The loop wakes on its own timer without calling `handle`, so a playing
-        position only advances if the draw path asks for it.
+        position only advances if the draw path asks for it. While a path is
+        being typed the playlist is left alone: re-reading it under the cursor
+        would move the entry the user is looking at.
         """
         if self.busy() or not self.backend.available():
             return
+        if self.typing():
+            self.status = self.backend.command("state") or {}
+            return
         self.refresh()
+
+    # ── transport, as the backend defines it ────────────────────────────────
+
+    def send(self, name: str, **fields: object) -> None:
+        self.absorb(self.backend.command(name, **fields))
+
+    def position(self) -> float:
+        return float(self.status.get("pos", 0) or 0)
+
+    def length(self) -> float:
+        return float(self.status.get("len", 0) or 0)
+
+    def volume(self) -> int:
+        return number(self.status, "volume", 0)
+
+    def repeat_mode(self) -> int:
+        return number(self.status, "repeat", 0)
+
+    def seek_by(self, delta: float) -> None:
+        length = self.length()
+        if length <= 0:
+            self.message = "nothing playing to seek in"
+            return
+        target = min(max(0.0, self.position() + delta), max(0.0, length - 0.5))
+        self.send("seek", pos=round(target, 2))
+
+    def nudge_volume(self, delta: int) -> None:
+        level = max(0, min(100, self.volume() + delta))
+        self.send("volume", level=level)
+        self.message = f"volume {level}%"
+
+    def add_path(self, raw: str) -> None:
+        path = os.path.expanduser(raw.strip())
+        if not path:
+            return
+        reply = self.backend.command("add", path=path)
+        self.absorb(reply)
+        if reply.get("ok") is False:
+            self.message = str(reply.get("error") or "could not add that path")
+        else:
+            self.refresh()
+            self.message = f"added {os.path.basename(path.rstrip('/')) or path}"
 
     def begin_setup(self) -> None:
         """Install the player if needed, then start a backend, off this thread."""
@@ -269,96 +336,296 @@ WAITING = {
     "starting": "starting kilix-amp…",
 }
 
+def number(status: dict, key: str, default: int = 0) -> int:
+    """An integer field from a status reply, where 0 is a real value.
+
+    `status.get(key) or default` reads naturally and is wrong here: track index
+    0 is the first track, and `0 or -1` is -1, which hid the ♪ marker and the
+    "track 1 of N" line for whatever was playing first.
+    """
+    value = status.get(key, default)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+SECTIONS = ("Now playing", "Playlist")
+REPEAT_LABELS = {0: "repeat off", 1: "repeat all", 2: "repeat one"}
+STATE_GLYPH = {"playing": "▶", "paused": "❚❚", "stopped": "■"}
+SEEK_STEP = 5.0
+SEEK_JUMP = 30.0
+VOLUME_STEP = 5
+
+
+def footer(state: State) -> str:
+    if state.typing():
+        return "type a file or folder · Enter add · Esc cancel"
+    if state.phase:
+        return "q quit"
+    if not state.backend.available():
+        return "s start backend · r retry · q quit"
+    if state.section == 1:
+        return ("↑/↓ select · Enter play · a add · c clear · space play/pause "
+                "· Tab now playing · ? keys · q quit")
+    return ("space play/pause · ←/→ seek · +/- volume · z/b prev/next "
+            "· s shuffle · m repeat · Tab playlist · ? keys · q quit")
+
+
+def _draw_now_playing(surface, state: State, body) -> None:
+    status = state.status
+    playing = str(status.get("state", "stopped"))
+    glyph = STATE_GLYPH.get(playing, "·")
+    title = str(status.get("title") or "")
+    path = str(status.get("file") or "")
+    if not title:
+        title = os.path.basename(path) or "nothing loaded"
+    index = number(status, "index", -1)
+    count = number(status, "count", 0)
+
+    row = body.top
+    shell.put(surface, row, body.left, f"{glyph}  {title}"[:body.width],
+              shell.tango.attr("title"))
+    row += 1
+    if path:
+        shell.put(surface, row, body.left + 3,
+                  os.path.dirname(path)[:max(0, body.width - 3)],
+                  shell.tango.attr("muted"))
+    row += 2
+
+    length = state.length()
+    position = state.position()
+    if length > 0:
+        times = f"{clock(position)} / {clock(length)}"
+        width = max(4, body.width - len(times) - 4)
+        shell.put(surface, row, body.left, times, shell.tango.attr("accent"))
+        shell.put(surface, row, body.left + len(times) + 2,
+                  proc.bar(position / length, width),
+                  shell.tango.attr("accent"))
+    else:
+        shell.put(surface, row, body.left, "no track loaded",
+                  shell.tango.attr("muted"))
+    row += 2
+
+    # Volume, shuffle and repeat all arrive in the same status reply, so the
+    # front end shows them rather than making the user guess what is set.
+    level = state.volume()
+    meter = shell.meter(level / 100.0, max(4, min(20, body.width - 24)))
+    shell.put(surface, row, body.left, f"vol  {meter} {level:3d}%",
+              shell.tango.attr("accent" if level else "muted"))
+    row += 1
+    shuffle_on = bool(status.get("shuffle"))
+    repeat = state.repeat_mode()
+    shell.put(surface, row, body.left,
+              "shuffle on" if shuffle_on else "shuffle off",
+              shell.tango.attr("accent" if shuffle_on else "muted"))
+    shell.put(surface, row, body.left + 14, REPEAT_LABELS.get(repeat, "repeat"),
+              shell.tango.attr("accent" if repeat else "muted"))
+    if count:
+        shell.put(surface, row, body.left + 30,
+                  f"track {index + 1} of {count}" if index >= 0
+                  else f"{count} in playlist", shell.tango.attr("muted"))
+
+
+def _draw_playlist(surface, state: State, body) -> None:
+    if not state.playlist:
+        shell.put(surface, body.top, body.left,
+                  "the playlist is empty — press a to add a file or folder",
+                  shell.tango.attr("muted"))
+        return
+    current = number(state.status, "index", -1)
+    state.selected = max(0, min(state.selected, len(state.playlist) - 1))
+    height = max(1, body.height - (2 if state.typing() else 0))
+    first = visible_window(len(state.playlist), height, state.selected)
+    for line in range(min(height, len(state.playlist) - first)):
+        index = first + line
+        item = state.playlist[index]
+        selected = index == state.selected
+        # Two different meanings, two different marks: the cursor is where you
+        # are, the note is what the backend is actually playing.
+        cursor = "▶" if selected else " "
+        playing = "♪" if index == current else " "
+        label = f" {cursor}{playing} {os.path.basename(item)}"
+        if selected:
+            shell.put(surface, body.top + line, 0,
+                      label.ljust(body.width + 1)[:body.width + 1],
+                      shell.tango.attr("selected"))
+        else:
+            shell.put(surface, body.top + line, 0, label[:body.width + 1],
+                      shell.tango.attr("accent") if index == current else 0)
+
+
+def visible_window(count: int, height: int, selected: int) -> int:
+    """The first visible index, keeping the selection on screen."""
+    if height <= 0 or count <= height:
+        return 0
+    return max(0, min(selected - height + 1, count - height))
+
 
 def render(surface, state: State) -> None:
     state.tick()
     available = state.backend.available()
-    playing = str(state.status.get("state", "stopped"))
-    title = str(state.status.get("title", ""))
     waiting = WAITING.get(state.phase, "")
-    summary = (
-        waiting if waiting
-        else f"{playing} · {title}".rstrip(" ·") if available
-        else "kilix-amp backend not running"
-    )
+    if waiting:
+        summary = waiting
+    elif state.message:
+        summary = state.message
+    elif available:
+        summary = f"{state.status.get('state', 'stopped')}"
+        if state.backend.error:
+            summary = state.backend.error
+    else:
+        summary = "kilix-amp backend not running"
     body = shell.draw(
         surface,
         title="Music",
-        sections=("Playlist",),
+        sections=SECTIONS,
+        active=state.section,
         summary=summary,
-        footer=(
-            "q quit" if waiting
-            else "space play/pause · n next · p prev · r refresh · q quit"
-            if available else "s start backend · r retry · q quit"
-        ),
+        footer=footer(state),
+        help_key=False,          # this tool owns `?`, so a typed path may use it
         summary_role=(
-            "muted" if available and not state.backend.error and not waiting
-            else "alert"),
+            "alert" if (not available or state.backend.error) and not waiting
+            else "accent" if state.message else "muted"),
     )
     if waiting:
-        shell.put(surface, body.top, body.left, f"{waiting.capitalize()}")
+        shell.put(surface, body.top, body.left, waiting.capitalize())
         shell.put(surface, body.top + 2, body.left,
                   "The player is built once, from the commit Kilix pins.",
                   shell.tango.attr("muted"))
         return
     if not available:
-        shell.put(surface, body.top, body.left,
-                  "This front end drives kilix-amp over a control socket;")
-        shell.put(surface, body.top + 1, body.left,
-                  "no backend is listening yet.")
-        if state.backend.installed():
-            shell.put(surface, body.top + 3, body.left,
-                      "Press s to start one.")
-        elif kilix_launcher():
-            shell.put(surface, body.top + 3, body.left,
-                      "Press s to build the pinned Media Player and start it.")
-        else:
-            shell.put(surface, body.top + 3, body.left,
-                      "kilix-amp is not built, and no kilix command was found",
-                      shell.tango.attr("alert"))
-            shell.put(surface, body.top + 4, body.left,
-                      "to build it with. Run 'kilix amp' from a Kilix checkout.")
-        shell.put(surface, body.top + 6, body.left,
-                  f"expected socket: {state.backend.path}",
-                  shell.tango.attr("muted"))
-        for offset, message in enumerate((state.note, state.backend.error)):
-            if message:
-                shell.put(surface, body.top + 7 + offset, body.left, message,
-                          shell.tango.attr("alert"))
+        _draw_offline(surface, state, body)
         return
-    if state.backend.error:
-        shell.put(surface, body.top, body.left, state.backend.error,
+    if state.section == 0:
+        _draw_now_playing(surface, state, body)
+    else:
+        _draw_playlist(surface, state, body)
+    if state.typing():
+        shell.put(surface, body.bottom - 1, body.left,
+                  f"add: {state.prompt}_"[:body.width],
+                  shell.tango.attr("selected"))
+    if state.help_open:
+        app.help_overlay(surface)
+
+
+def _draw_offline(surface, state: State, body) -> None:
+    shell.put(surface, body.top, body.left,
+              "This front end drives kilix-amp over a control socket;")
+    shell.put(surface, body.top + 1, body.left,
+              "no backend is listening yet.")
+    if state.backend.installed():
+        shell.put(surface, body.top + 3, body.left, "Press s to start one.")
+    elif kilix_launcher():
+        shell.put(surface, body.top + 3, body.left,
+                  "Press s to build the pinned Media Player and start it.")
+    else:
+        shell.put(surface, body.top + 3, body.left,
+                  "kilix-amp is not built, and no kilix command was found",
                   shell.tango.attr("alert"))
-    position = float(state.status.get("pos", 0) or 0)
-    length = float(state.status.get("len", 0) or 0)
-    row = body.top
-    if length:
-        shell.put(
-            surface, row, body.left,
-            f"{clock(position)} / {clock(length)}  "
-            f"{proc.bar(position / length, max(0, body.width - 24))}",
-            shell.tango.attr("accent"),
-        )
-        row += 2
-    for index, item in enumerate(state.playlist):
-        list_row = row + index
-        if list_row >= body.bottom:
-            break
-        selected = index == state.selected
-        marker = "▶" if selected else " "
-        shell.put(
-            surface, list_row, body.left,
-            f"{marker} {os.path.basename(item)}",
-            shell.tango.attr("selected") if selected else 0,
-        )
+        shell.put(surface, body.top + 4, body.left,
+                  "to build it with. Run 'kilix amp' from a Kilix checkout.")
+    shell.put(surface, body.top + 6, body.left,
+              f"expected socket: {state.backend.path}",
+              shell.tango.attr("muted"))
+    for offset, message in enumerate((state.note, state.backend.error)):
+        if message:
+            shell.put(surface, body.top + 7 + offset, body.left, message,
+                      shell.tango.attr("alert"))
+
+
+def _typed(key: int, state: State) -> bool:
+    """Keys while a path is being entered. Everything printable is text."""
+    if key == 27:                                   # Esc
+        state.prompt = None
+    elif key in (ord("\n"), ord("\r")):
+        entry, state.prompt = state.prompt or "", None
+        state.add_path(entry)
+    elif key in keymap.BACKSPACE:
+        state.prompt = (state.prompt or "")[:-1]
+    elif keymap.is_text(key):
+        state.prompt = (state.prompt or "") + chr(key)
+    return True
+
+
+def handle(key: int, state: State) -> bool:
+    if state.help_open:
+        state.help_open = False
+        return True
+    if state.typing():
+        return _typed(key, state)
+    if keymap.is_quit(key):
+        return False
+    if state.busy():
+        return True              # an install is running; ignore transport keys
+    state.message = ""
+    if key == ord("?"):
+        state.help_open = True
+        return True
+    if not state.backend.available():
+        if key == ord("s"):
+            state.begin_setup()
+        elif keymap.is_refresh(key):
+            state.refresh()
+        return True
+    if key == ord("\t"):
+        state.section = (state.section + 1) % len(SECTIONS)
+    elif ord("1") <= key <= ord("0") + len(SECTIONS):
+        state.section = key - ord("1")
+    elif key == ord(" "):
+        state.send("toggle")
+    elif key in (ord("b"), ord("n")):
+        state.send("next")
+    elif key in (ord("z"), ord("p")):
+        state.send("previous")
+    elif key == ord("v"):
+        state.send("stop")
+    elif key in keymap.LEFT and state.section == 0:
+        state.seek_by(-SEEK_STEP)
+    elif key in keymap.RIGHT and state.section == 0:
+        state.seek_by(SEEK_STEP)
+    elif key == ord(","):
+        state.seek_by(-SEEK_JUMP)
+    elif key == ord("."):
+        state.seek_by(SEEK_JUMP)
+    elif key in (ord("+"), ord("=")):
+        state.nudge_volume(VOLUME_STEP)
+    elif key == ord("-"):
+        state.nudge_volume(-VOLUME_STEP)
+    elif key == ord("s"):
+        state.send("shuffle")
+        state.message = ("shuffle on" if state.status.get("shuffle")
+                         else "shuffle off")
+    elif key == ord("m"):
+        state.send("repeat")
+        state.message = REPEAT_LABELS.get(state.repeat_mode(), "repeat")
+    elif key == ord("a"):
+        state.prompt = ""
+    elif key == ord("c"):
+        state.send("clear")
+        state.refresh()
+        state.message = "playlist cleared"
+    elif (step := keymap.direction(key)) and state.section == 1:
+        state.selected = max(
+            0, min(len(state.playlist) - 1, state.selected + step))
+    elif key in (ord("\n"), ord("\r")) and state.section == 1:
+        if state.playlist:
+            state.send("play", index=state.selected)
+    elif keymap.is_refresh(key):
+        state.refresh()
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     state = State()
     if path := app.screenshot_argv(argv):
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(app.render_to_text(render, state) + "\n")
+        # Not named `handle`: that is this module's key handler, and binding it
+        # here would make the name local to `main` and unbound at `app.run`.
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(app.render_to_text(render, state) + "\n")
         return 0
 
     # Opening the player is the request for a player: bring the backend up —
@@ -367,28 +634,7 @@ def main(argv: list[str] | None = None) -> int:
     if not state.backend.available():
         state.begin_setup()
 
-    def handle(key: int, s: State) -> bool:
-        if keymap.is_quit(key):
-            return False
-        if s.busy():
-            return True          # an install is running; ignore transport keys
-        if key == ord("s") and not s.backend.available():
-            s.begin_setup()
-        elif key == ord(" "):
-            s.backend.command("toggle"); s.refresh()
-        elif key == ord("n"):
-            s.backend.command("next"); s.refresh()
-        elif key == ord("p"):
-            s.backend.command("previous"); s.refresh()
-        elif (step := keymap.direction(key)) and s.playlist:
-            s.selected = max(0, min(len(s.playlist) - 1, s.selected + step))
-        elif key in keymap.SELECT and s.playlist:
-            s.backend.command("play", index=s.selected); s.refresh()
-        elif keymap.is_refresh(key):
-            s.refresh()
-        return True
-
-    return app.run(render, state, handle=handle, tick_ms=1000)
+    return app.run(render, state, handle=handle, tick_ms=1000, help_key=False)
 
 
 if __name__ == "__main__":

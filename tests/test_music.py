@@ -319,5 +319,184 @@ class _server:
         return False
 
 
+
+class _FakeBackend:
+    """A backend that records commands and answers with a status."""
+
+    def __init__(self, status=None, ok=True, error=""):
+        self.path = "/run/fake/amp.sock"
+        self.error = ""
+        self.sent: list[tuple[str, dict]] = []
+        self.status = dict(status or {
+            "state": "playing", "title": "t", "file": "/m/t.flac",
+            "pos": 30.0, "len": 100.0, "index": 1, "count": 3,
+            "volume": 50, "shuffle": False, "repeat": 0})
+        self._ok = ok
+        self._error = error
+
+    def available(self):
+        return True
+
+    def installed(self):
+        return True
+
+    def command(self, name, **fields):
+        self.sent.append((name, dict(fields)))
+        if name == "playlist":
+            return {"items": ["/m/a.flac", "/m/t.flac", "/m/c.flac"],
+                    "index": 1, "count": 3}
+        reply = {"ok": self._ok, **self.status}
+        if not self._ok:
+            reply["error"] = self._error
+        return reply
+
+    def last(self, name):
+        return [fields for sent, fields in self.sent if sent == name]
+
+
+def player(**kwargs):
+    state = music.State.__new__(music.State)
+    state.backend = _FakeBackend(**kwargs)
+    state.status = dict(state.backend.status)
+    state.playlist = []
+    state.section = 0
+    state.selected = 0
+    state.phase = ""
+    state.note = ""
+    state.message = ""
+    state.help_open = False
+    state.prompt = None
+    state._worker = None
+    state.refresh()
+    return state
+
+
+class TransportTests(unittest.TestCase):
+    """Every control kilix-amp exposes should be reachable from the keyboard."""
+
+    def test_seek_moves_relative_to_the_current_position(self):
+        state = player()
+        music.handle(ord("."), state)                    # +30s from 30s
+        self.assertEqual(state.backend.last("seek")[-1]["pos"], 60.0)
+
+    def test_seek_never_runs_past_either_end(self):
+        state = player()
+        for _ in range(20):
+            music.handle(ord(","), state)                # -30s, repeatedly
+        self.assertGreaterEqual(state.backend.last("seek")[-1]["pos"], 0.0)
+        state = player()
+        for _ in range(20):
+            music.handle(ord("."), state)
+        self.assertLessEqual(state.backend.last("seek")[-1]["pos"], 100.0)
+
+    def test_seek_with_no_track_says_so_instead_of_sending(self):
+        state = player(status={"state": "stopped", "pos": 0, "len": 0})
+        music.handle(ord("."), state)
+        self.assertEqual(state.backend.last("seek"), [])
+        self.assertIn("nothing playing", state.message)
+
+    def test_volume_steps_and_clamps_to_the_backend_range(self):
+        state = player()
+        music.handle(ord("+"), state)
+        self.assertEqual(state.backend.last("volume")[-1]["level"], 55)
+        state = player(status={"volume": 98, "state": "playing"})
+        for _ in range(5):
+            music.handle(ord("+"), state)
+        self.assertEqual(state.backend.last("volume")[-1]["level"], 100)
+        state = player(status={"volume": 2, "state": "playing"})
+        for _ in range(5):
+            music.handle(ord("-"), state)
+        self.assertEqual(state.backend.last("volume")[-1]["level"], 0)
+
+    def test_shuffle_and_repeat_reach_the_backend(self):
+        state = player()
+        music.handle(ord("s"), state)
+        music.handle(ord("m"), state)
+        self.assertEqual(len(state.backend.last("shuffle")), 1)
+        self.assertEqual(len(state.backend.last("repeat")), 1)
+
+    def test_transport_keys_are_the_ones_the_footer_promises(self):
+        state = player()
+        for key, command in ((" ", "toggle"), ("b", "next"), ("z", "previous"),
+                             ("v", "stop")):
+            state.backend.sent.clear()
+            music.handle(ord(key), state)
+            self.assertTrue(state.backend.last(command), f"{key} -> {command}")
+
+
+class PlaylistTests(unittest.TestCase):
+    def test_enter_plays_the_row_under_the_cursor_not_the_playing_one(self):
+        state = player()
+        state.section = 1
+        state.selected = 2
+        music.handle(ord("\n"), state)
+        self.assertEqual(state.backend.last("play")[-1]["index"], 2)
+
+    def test_the_cursor_and_the_playing_track_are_marked_differently(self):
+        state = player()
+        state.section = 1
+        state.selected = 0                       # cursor on 0, playing is 1
+        text = app.render_to_text(music.render, state, height=20, width=70)
+        self.assertIn("▶", text)
+        self.assertIn("♪", text)
+
+    def test_adding_a_path_expands_the_home_shorthand(self):
+        state = player()
+        music.handle(ord("a"), state)
+        self.assertTrue(state.typing())
+        for letter in "~/Music":
+            music.handle(ord(letter), state)
+        music.handle(ord("\n"), state)
+        self.assertEqual(state.backend.last("add")[-1]["path"],
+                         os.path.expanduser("~/Music"))
+
+    def test_a_rejected_path_is_reported_rather_than_silently_dropped(self):
+        state = player(ok=False, error="nothing playable at that path")
+        state.prompt = "/nope"
+        music.handle(ord("\n"), state)
+        self.assertIn("nothing playable", state.message)
+
+    def test_typing_a_path_takes_every_character_as_text(self):
+        # '?' opens help everywhere else; inside the prompt it is a character,
+        # which is why this tool owns the key instead of the shared loop.
+        state = player()
+        music.handle(ord("a"), state)
+        music.handle(ord("?"), state)
+        self.assertFalse(state.help_open)
+        self.assertEqual(state.prompt, "?")
+
+    def test_escape_abandons_the_prompt_without_adding(self):
+        state = player()
+        music.handle(ord("a"), state)
+        music.handle(ord("x"), state)
+        music.handle(27, state)
+        self.assertFalse(state.typing())
+        self.assertEqual(state.backend.last("add"), [])
+
+
+class PresentationTests(unittest.TestCase):
+    def test_now_playing_shows_what_the_status_already_carries(self):
+        state = player(status={"state": "playing", "title": "Kilix Theme",
+                               "file": "/m/kilix.flac", "pos": 65.0,
+                               "len": 130.0, "index": 0, "count": 3,
+                               "volume": 70, "shuffle": True, "repeat": 2})
+        text = app.render_to_text(music.render, state, height=20, width=90)
+        self.assertIn("Kilix Theme", text)
+        self.assertIn("1:05 / 2:10", text)
+        self.assertIn("70%", text)
+        self.assertIn("shuffle on", text)
+        self.assertIn("repeat one", text)
+        self.assertIn("track 1 of 3", text)
+
+    def test_the_key_line_keeps_help_and_quit_when_it_cannot_fit(self):
+        state = player()
+        for width in (100, 80, 60, 40):
+            text = app.render_to_text(music.render, state, height=20,
+                                      width=width)
+            last = text.splitlines()[-1]
+            self.assertLessEqual(len(last), width)
+            self.assertTrue(last.rstrip().endswith("q quit"), f"{width}")
+            self.assertIn("?", last, f"{width}")
+
 if __name__ == "__main__":
     unittest.main()

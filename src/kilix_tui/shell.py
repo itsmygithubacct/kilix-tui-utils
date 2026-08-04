@@ -54,19 +54,39 @@ def last_frame() -> dict[str, str]:
 
 
 def fit(text: str, width: int, separator: str = " · ") -> str:
-    """Fit a `·`-separated key line to the width without losing the end.
+    """Fit a `·`-separated key line to the width without losing the way out.
 
     Truncating a key line silently removes the keys furthest right, and those
-    are the ones that get a stuck user out — `? keys`, `q quit`. So segments
-    drop from the middle outwards and the last one always survives.
+    are the ones that get a stuck user out. So segments drop from the middle
+    outwards, and two are protected until nothing else is left to drop: the
+    last one, and `?`. Quitting is the way out of the tool; `?` is the way to
+    everything that did not fit — dropping it takes the map away exactly when
+    the screen is too small to show the territory.
     """
     if width <= 0 or len(text) <= width:
         return text
     parts = text.split(separator)
+
+    def droppable() -> list[int]:
+        last = len(parts) - 1
+        return [i for i, part in enumerate(parts)
+                if i != last and "?" not in part]
+
     while len(parts) > 1 and len(separator.join(parts)) > width:
-        del parts[max(0, len(parts) - 2)]
+        candidates = droppable() or [i for i in range(len(parts) - 1)]
+        if not candidates:
+            break
+        del parts[candidates[-1]]        # nearest the end, from the middle out
     line = separator.join(parts)
     return line if len(line) <= width else line[:width]
+
+
+# Keys that are spelled as words. Without these, "space play/pause" reads as
+# prose to the parser below and loses its key column in the `?` overlay.
+NAMED_KEYS = frozenset({
+    "space", "tab", "enter", "esc", "escape", "backspace", "del", "delete",
+    "home", "end", "pgup", "pgdn", "mouse", "wheel", "shift", "ctrl", "alt",
+})
 
 
 def help_rows_for(footer: str) -> list[tuple[str, str]]:
@@ -81,8 +101,12 @@ def help_rows_for(footer: str) -> list[tuple[str, str]]:
         if not segment:
             continue
         head, _, rest = segment.partition(" ")
-        # "type to filter" is a sentence, not a binding: keep it whole.
-        if not rest or (head.isalpha() and head.islower() and len(head) > 2):
+        named = head.lower() in NAMED_KEYS
+        # "type to filter" is a sentence, not a binding: keep it whole. But
+        # "space play/pause" is a binding whose key happens to be a word, so
+        # the keys that are spelled out get their own column like the rest.
+        if not rest or (not named and head.isalpha() and head.islower()
+                        and len(head) > 2):
             rows.append(("", segment))
         else:
             rows.append((head, rest))
