@@ -6,9 +6,11 @@ contract between two repositories: this client declares the version it speaks
 and reports a mismatch rather than guessing.
 
 kilix-amp ships the headless backend, so this starts one when none is running
-and drives it. It still never fails at launch — it is installed unconditionally
-alongside the other tools, and kilix-amp may not be built on a given machine —
-so a missing backend is a state this renders and offers to fix, not an error.
+and drives it. Opening this tool is the activation that installs the player:
+where kilix-amp was never built, Kilix builds the pinned one first, the same
+way the Kilix 95 Media Player always has. Neither step blocks the loop — a
+first install compiles an SDL application, and a UI that stops redrawing for
+that reads as a hang.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ import json
 import shutil
 import socket
 import subprocess
+import threading
 import time
 
 import os
@@ -32,6 +35,9 @@ PROTOCOL_VERSION = 1
 # Long enough for the backend to open its audio device on a slow disk, short
 # enough that a wedged one does not look like a hung UI.
 START_TIMEOUT = 5.0
+# A first install clones and compiles kilix-amp. This is an upper bound on a
+# slow machine, not an expected wait; it runs off the UI thread either way.
+INSTALL_TIMEOUT = 900.0
 
 
 def socket_path() -> str:
@@ -89,6 +95,39 @@ def backend_executable() -> str:
         if os.access(candidate, os.X_OK):
             return candidate
     return ""
+
+
+def kilix_launcher() -> str:
+    """The `kilix` command, or "" when this is not running under Kilix."""
+    found = shutil.which("kilix")
+    if found:
+        return found
+    candidate = os.path.join(sources.component_dir("kilix"), "kilix")
+    return candidate if os.access(candidate, os.X_OK) else ""
+
+
+def install_backend(timeout: float = INSTALL_TIMEOUT) -> bool:
+    """Build the pinned Media Player, through Kilix rather than around it.
+
+    Kilix owns the content catalog that pins kilix-amp and the installer that
+    verifies and builds it. Cloning it from here would mean a second, unpinned
+    copy of that decision.
+    """
+    launcher = kilix_launcher()
+    if not launcher:
+        return False
+    try:
+        completed = subprocess.run(
+            [launcher, "amp", "--install-only"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and bool(backend_executable())
 
 
 class Backend:
@@ -177,8 +216,13 @@ class State:
         self.status: dict = {}
         self.playlist: list[str] = []
         self.selected = 0
-        self.starting = False
+        self.phase = ""    # "", "installing", "starting"
+        self.note = ""     # why the last attempt did not get there
+        self._worker: threading.Thread | None = None
         self.refresh()
+
+    def busy(self) -> bool:
+        return bool(self._worker and self._worker.is_alive())
 
     def refresh(self) -> None:
         self.status = self.backend.command("state") or {}
@@ -187,22 +231,55 @@ class State:
         if self.selected >= len(self.playlist):
             self.selected = max(0, len(self.playlist) - 1)
 
-    def start_backend(self) -> None:
-        self.starting = True
+    def tick(self) -> None:
+        """Pull current state for a redraw.
+
+        The loop wakes on its own timer without calling `handle`, so a playing
+        position only advances if the draw path asks for it.
+        """
+        if self.busy() or not self.backend.available():
+            return
+        self.refresh()
+
+    def begin_setup(self) -> None:
+        """Install the player if needed, then start a backend, off this thread."""
+        if self.busy():
+            return
+        self.note = ""
+        self._worker = threading.Thread(target=self._setup, daemon=True)
+        self._worker.start()
+
+    def _setup(self) -> None:
         try:
-            if self.backend.start():
-                self.refresh()
+            if not backend_executable():
+                self.phase = "installing"
+                if not install_backend():
+                    self.note = ("could not install the Media Player — "
+                                 "run 'kilix amp' to see why")
+                    return
+            self.phase = "starting"
+            if not self.backend.start():
+                self.note = self.backend.error
         finally:
-            self.starting = False
+            self.phase = ""
+
+
+WAITING = {
+    "installing": "building the Media Player — this takes a few minutes",
+    "starting": "starting kilix-amp…",
+}
 
 
 def render(surface, state: State) -> None:
+    state.tick()
     available = state.backend.available()
     playing = str(state.status.get("state", "stopped"))
     title = str(state.status.get("title", ""))
+    waiting = WAITING.get(state.phase, "")
     summary = (
-        f"{playing} · {title}".rstrip(" ·")
-        if available else "kilix-amp backend not running"
+        waiting if waiting
+        else f"{playing} · {title}".rstrip(" ·") if available
+        else "kilix-amp backend not running"
     )
     body = shell.draw(
         surface,
@@ -210,32 +287,44 @@ def render(surface, state: State) -> None:
         sections=("Playlist",),
         summary=summary,
         footer=(
-            "space play/pause · n next · p prev · r refresh · q quit"
+            "q quit" if waiting
+            else "space play/pause · n next · p prev · r refresh · q quit"
             if available else "s start backend · r retry · q quit"
         ),
-        summary_role="alert" if not available or state.backend.error else "muted",
+        summary_role=(
+            "muted" if available and not state.backend.error and not waiting
+            else "alert"),
     )
+    if waiting:
+        shell.put(surface, body.top, body.left, f"{waiting.capitalize()}")
+        shell.put(surface, body.top + 2, body.left,
+                  "The player is built once, from the commit Kilix pins.",
+                  shell.tango.attr("muted"))
+        return
     if not available:
-        installed = state.backend.installed()
         shell.put(surface, body.top, body.left,
                   "This front end drives kilix-amp over a control socket;")
         shell.put(surface, body.top + 1, body.left,
                   "no backend is listening yet.")
-        if installed:
+        if state.backend.installed():
             shell.put(surface, body.top + 3, body.left,
                       "Press s to start one.")
+        elif kilix_launcher():
+            shell.put(surface, body.top + 3, body.left,
+                      "Press s to build the pinned Media Player and start it.")
         else:
             shell.put(surface, body.top + 3, body.left,
-                      "kilix-amp is not built here — install the Media Player",
+                      "kilix-amp is not built, and no kilix command was found",
                       shell.tango.attr("alert"))
             shell.put(surface, body.top + 4, body.left,
-                      "from the Kilix 95 desktop, then press s.")
+                      "to build it with. Run 'kilix amp' from a Kilix checkout.")
         shell.put(surface, body.top + 6, body.left,
                   f"expected socket: {state.backend.path}",
                   shell.tango.attr("muted"))
-        if state.backend.error:
-            shell.put(surface, body.top + 7, body.left, state.backend.error,
-                      shell.tango.attr("alert"))
+        for offset, message in enumerate((state.note, state.backend.error)):
+            if message:
+                shell.put(surface, body.top + 7 + offset, body.left, message,
+                          shell.tango.attr("alert"))
         return
     if state.backend.error:
         shell.put(surface, body.top, body.left, state.backend.error,
@@ -272,16 +361,19 @@ def main(argv: list[str] | None = None) -> int:
             handle.write(app.render_to_text(render, state) + "\n")
         return 0
 
-    # Opening the player is the request for a player: bring the backend up
-    # rather than making the first thing on screen an instruction to.
+    # Opening the player is the request for a player: bring the backend up —
+    # building it first if this machine never has — rather than making the
+    # first thing on screen an instruction to.
     if not state.backend.available():
-        state.start_backend()
+        state.begin_setup()
 
     def handle(key: int, s: State) -> bool:
         if keymap.is_quit(key):
             return False
+        if s.busy():
+            return True          # an install is running; ignore transport keys
         if key == ord("s") and not s.backend.available():
-            s.start_backend()
+            s.begin_setup()
         elif key == ord(" "):
             s.backend.command("toggle"); s.refresh()
         elif key == ord("n"):

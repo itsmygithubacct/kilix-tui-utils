@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -138,11 +139,12 @@ class RestraintTests(unittest.TestCase):
             subprocess.Popen = original
         self.assertEqual(started, [])
 
-    def test_the_only_command_it_spawns_is_kilix_amp(self):
-        """Read out of the source: the front end runs one program, headless.
+    def test_it_spawns_only_the_backend_and_the_kilix_installer(self):
+        """Read out of the source: two spawn sites, and both are known.
 
-        A front end that grew a second spawn site, or one that launched the
-        player windowed, would stop being a client of the shared backend.
+        A front end that launched the player windowed, or that cloned kilix-amp
+        itself instead of asking Kilix to, would stop being a client of one
+        pinned backend.
         """
         import ast
         tree = ast.parse((ROOT / "tools" / "music" / "main.py").read_text())
@@ -160,16 +162,84 @@ class RestraintTests(unittest.TestCase):
                 ("os", "popen"), ("os", "execv"), ("os", "spawnv"),
             )
         ]
-        self.assertEqual(len(spawns), 1, "exactly one spawn site")
-        headless = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.List)
-            and any(isinstance(element, ast.Constant)
-                    and element.value == "--headless"
-                    for element in node.elts)
+        self.assertEqual(len(spawns), 2, "exactly two spawn sites")
+        literals = [
+            [element.value for element in node.elts
+             if isinstance(element, ast.Constant)]
+            for node in ast.walk(tree) if isinstance(node, ast.List)
         ]
-        self.assertEqual(len(headless), 1,
-                         "one command literal, and it is the headless one")
+        self.assertIn(["--headless", "--socket"], literals)
+        self.assertIn(["amp", "--install-only"], literals)
+        self.assertNotIn("git", [word for row in literals for word in row])
+
+    def test_setup_runs_off_the_ui_thread(self):
+        """A first install compiles kilix-amp; the loop must keep redrawing."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_install(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with _environment(KILIX_AMP_SOCKET=os.path.join(tmp, "absent"),
+                              KILIX_AMP=os.path.join(tmp, "nothing-here"),
+                              PATH=tmp):
+                state = music.State()
+                original = music.install_backend
+                music.install_backend = fake_install
+                try:
+                    state.begin_setup()
+                    # Wait for the worker rather than assuming it has been
+                    # scheduled: the point of the test is that begin_setup
+                    # returned without waiting for the install itself.
+                    self.assertTrue(entered.wait(5), "install never started")
+                    self.assertTrue(state.busy())
+                    self.assertEqual(state.phase, "installing")
+                    frame = app.render_to_text(music.render, state,
+                                               height=24, width=100)
+                    self.assertIn("building the Media Player", frame)
+                finally:
+                    release.set()
+                    for _ in range(100):
+                        if not state.busy():
+                            break
+                        time.sleep(0.05)
+                    music.install_backend = original
+        self.assertFalse(state.busy())
+        self.assertEqual(state.phase, "")
+        self.assertIn("could not install", state.note)
+
+    def test_install_asks_kilix_rather_than_cloning(self):
+        seen = []
+
+        class _Result:
+            returncode = 0
+
+        original = subprocess.run
+        subprocess.run = lambda argv, **k: (seen.append(argv), _Result())[1]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                launcher = os.path.join(tmp, "kilix")
+                with open(launcher, "w") as handle:
+                    handle.write("#!/bin/sh\n")
+                os.chmod(launcher, 0o755)
+                with _environment(PATH=tmp, KILIX_AMP=""):
+                    music.install_backend()
+        finally:
+            subprocess.run = original
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1:], ["amp", "--install-only"])
+
+    def test_install_without_a_kilix_command_fails_quietly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with _environment(PATH=tmp,
+                              GPU_TERMINAL_SOURCE_HOME=tmp,
+                              KILIX_AMP=os.path.join(tmp, "nothing-here")):
+                if music.kilix_launcher():
+                    self.skipTest("a kilix checkout is reachable from here")
+                self.assertFalse(music.install_backend())
 
     def test_start_reports_a_missing_binary_instead_of_raising(self):
         with tempfile.TemporaryDirectory() as tmp:
