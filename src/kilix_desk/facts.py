@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 
+from kilix_desk import sources
 from kilix_tui import proc
 
 BUILD_INFO = "/etc/plebian-os/build-info.env"
@@ -39,8 +40,7 @@ def build_info() -> dict[str, str]:
 
 
 def source_home() -> str:
-    return os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
-        os.path.expanduser("~"), "gpu_terminal")
+    return sources.source_home()
 
 
 def status_rows() -> list[tuple[str, str]]:
@@ -49,7 +49,8 @@ def status_rows() -> list[tuple[str, str]]:
         rows.append(("release", release))
     for name, relative_path in COMPONENTS:
         version = _read(
-            os.path.join(source_home(), relative_path, "VERSION")).strip()
+            os.path.join(sources.component_dir(relative_path),
+                         "VERSION")).strip()
         rows.append((name, version or "not present"))
     rows.append(("provider", os.environ.get("KILIX_DESKTOP_PROVIDER", "auto")))
     rows.append(("uptime", proc.human_duration(proc.uptime_seconds())))

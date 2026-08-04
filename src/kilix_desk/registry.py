@@ -19,6 +19,8 @@ import shutil
 import sys
 from dataclasses import dataclass
 
+from kilix_desk import sources
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -106,10 +108,8 @@ SECTIONS: dict[str, tuple[Item, ...]] = {
 def _sdk_settings():
     """`kilix_sdk.settings`, or None — resolved the way `theme.py` does."""
     import importlib
-    source = os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
-        os.path.expanduser("~"), "gpu_terminal")
     for home in (os.environ.get("KILIX_HOME", ""),
-                 os.path.join(source, "kilix")):
+                 sources.component_dir("kilix")):
         config = os.path.join(home, "config") if home else ""
         if config and os.path.isdir(os.path.join(config, "kilix_sdk")):
             if config not in sys.path:
@@ -140,9 +140,7 @@ def games() -> list[tuple[str, str, bool]] | None:
 
 def screensavers() -> list[str]:
     """The screensaver names a Kilix checkout ships, `kilix screensaver X`."""
-    source = os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
-        os.path.expanduser("~"), "gpu_terminal")
-    home = os.environ.get("KILIX_HOME") or os.path.join(source, "kilix")
+    home = os.environ.get("KILIX_HOME") or sources.component_dir("kilix")
     directory = os.path.join(home, "config", "screensavers")
     try:
         names = sorted(name[:-2] for name in os.listdir(directory)
@@ -154,10 +152,8 @@ def screensavers() -> list[str]:
 
 def kilix_command() -> list[str] | None:
     """The `kilix` launcher, resolved the way `theme.py` finds the SDK."""
-    source = os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
-        os.path.expanduser("~"), "gpu_terminal")
     for base in (os.environ.get("KILIX_HOME", ""),
-                 os.path.join(source, "kilix")):
+                 sources.component_dir("kilix")):
         path = os.path.join(base, "kilix") if base else ""
         if path and os.access(path, os.X_OK):
             return [path]
