@@ -41,6 +41,24 @@ def socket_path() -> str:
                           os.path.join(runtime, "kilix-amp.sock"))
 
 
+def clock(seconds: float) -> str:
+    """M:SS, or H:MM:SS past an hour.
+
+    `proc.human_duration` is minute-granular, which is right for an uptime and
+    useless for a track: it renders every song shorter than a minute, and its
+    whole first minute, as "0m".
+    """
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        total = 0
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 def _storage_home() -> str:
     """Kilix's writable root, resolved the way Kilix itself resolves it."""
     base = os.environ.get("GPU_TERMINAL_HOME") or os.path.expanduser(
@@ -228,8 +246,7 @@ def render(surface, state: State) -> None:
     if length:
         shell.put(
             surface, row, body.left,
-            f"{proc.human_duration(position)} / "
-            f"{proc.human_duration(length)}  "
+            f"{clock(position)} / {clock(length)}  "
             f"{proc.bar(position / length, max(0, body.width - 24))}",
             shell.tango.attr("accent"),
         )

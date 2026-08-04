@@ -94,6 +94,25 @@ class ContractTests(unittest.TestCase):
             self.assertIn("malformed", backend.error)
 
 
+class ClockTests(unittest.TestCase):
+    """A track position is not an uptime; minutes alone say nothing here."""
+
+    def test_seconds_are_visible_below_a_minute(self):
+        self.assertEqual(music.clock(0), "0:00")
+        self.assertEqual(music.clock(7), "0:07")
+        self.assertEqual(music.clock(17.777), "0:17")
+
+    def test_minutes_and_hours(self):
+        self.assertEqual(music.clock(65), "1:05")
+        self.assertEqual(music.clock(600), "10:00")
+        self.assertEqual(music.clock(3661), "1:01:01")
+
+    def test_nonsense_is_zero_rather_than_an_exception(self):
+        self.assertEqual(music.clock(-5), "0:00")
+        self.assertEqual(music.clock(None), "0:00")
+        self.assertEqual(music.clock("what"), "0:00")
+
+
 class RestraintTests(unittest.TestCase):
     """A tool one keystroke from a menu must be inert until asked."""
 
