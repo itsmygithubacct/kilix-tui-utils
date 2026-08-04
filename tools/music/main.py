@@ -5,14 +5,18 @@ playback implementation rather than two that drift. The protocol is a versioned
 contract between two repositories: this client declares the version it speaks
 and reports a mismatch rather than guessing.
 
-kilix-amp does not ship the headless backend yet. Until it does, this renders a
-clear unavailable state and explains what is missing — it never fails at launch,
-because it is installed unconditionally alongside the other tools.
+kilix-amp ships the headless backend, so this starts one when none is running
+and drives it. It still never fails at launch — it is installed unconditionally
+alongside the other tools, and kilix-amp may not be built on a given machine —
+so a missing backend is a state this renders and offers to fix, not an error.
 """
 from __future__ import annotations
 
 import json
+import shutil
 import socket
+import subprocess
+import time
 
 import os
 import sys
@@ -21,9 +25,13 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
+from kilix_desk import sources  # noqa: E402
 from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 PROTOCOL_VERSION = 1
+# Long enough for the backend to open its audio device on a slow disk, short
+# enough that a wedged one does not look like a hung UI.
+START_TIMEOUT = 5.0
 
 
 def socket_path() -> str:
@@ -31,6 +39,38 @@ def socket_path() -> str:
         os.path.expanduser("~"), ".local/gpu_terminal/kilix/session")
     return os.environ.get("KILIX_AMP_SOCKET",
                           os.path.join(runtime, "kilix-amp.sock"))
+
+
+def _storage_home() -> str:
+    """Kilix's writable root, resolved the way Kilix itself resolves it."""
+    base = os.environ.get("GPU_TERMINAL_HOME") or os.path.expanduser(
+        "~/.local/gpu_terminal")
+    return os.environ.get("KILIX_STORAGE_HOME") or os.path.join(base, "kilix")
+
+
+def backend_executable() -> str:
+    """The kilix-amp binary, or "" when it is not built on this machine.
+
+    Kilix 95 installs catalog apps under its own data directory, and a
+    development checkout has it built in place; neither is on PATH.
+    """
+    override = os.environ.get("KILIX_AMP", "")
+    if override:
+        return override if os.access(override, os.X_OK) else ""
+    found = shutil.which("kilix-amp")
+    if found:
+        return found
+    data = os.environ.get("KILIX_DATA_HOME") or os.path.join(
+        _storage_home(), "data")
+    candidates = (
+        os.path.join(data, "desktop-apps", "kilix-amp", "kilix-amp"),
+        os.path.join(sources.component_dir("kilix-apps/kilix-amp"),
+                     "kilix-amp"),
+    )
+    for candidate in candidates:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return ""
 
 
 class Backend:
@@ -43,6 +83,46 @@ class Backend:
 
     def available(self) -> bool:
         return os.path.exists(self.path)
+
+    def installed(self) -> bool:
+        return bool(backend_executable())
+
+    def start(self, timeout: float = START_TIMEOUT) -> bool:
+        """Launch a headless backend and wait for its socket to appear."""
+        if self.available():
+            return True
+        executable = backend_executable()
+        if not executable:
+            self.error = "kilix-amp is not built on this machine"
+            return False
+        # The socket is passed explicitly rather than left to the default, so
+        # the backend cannot resolve a different path from a different
+        # environment than the one this client just computed.
+        command = [executable, "--headless", "--socket", self.path]
+        music = os.path.expanduser("~/Music")
+        if os.path.isdir(music):
+            command.append(music)
+        try:
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                # Its own session: the backend outlives this front end, which
+                # is the point of putting playback behind a socket.
+                start_new_session=True,
+            )
+        except OSError as failure:
+            self.error = f"could not start kilix-amp: {failure}"
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.available():
+                self.error = ""
+                return True
+            time.sleep(0.05)
+        self.error = "kilix-amp did not open its control socket"
+        return False
 
     def command(self, name: str, **fields: object) -> dict:
         if not self.available():
@@ -79,12 +159,23 @@ class State:
         self.status: dict = {}
         self.playlist: list[str] = []
         self.selected = 0
+        self.starting = False
         self.refresh()
 
     def refresh(self) -> None:
         self.status = self.backend.command("state") or {}
         listing = self.backend.command("playlist") or {}
         self.playlist = [str(i) for i in listing.get("items", [])]
+        if self.selected >= len(self.playlist):
+            self.selected = max(0, len(self.playlist) - 1)
+
+    def start_backend(self) -> None:
+        self.starting = True
+        try:
+            if self.backend.start():
+                self.refresh()
+        finally:
+            self.starting = False
 
 
 def render(surface, state: State) -> None:
@@ -93,7 +184,7 @@ def render(surface, state: State) -> None:
     title = str(state.status.get("title", ""))
     summary = (
         f"{playing} · {title}".rstrip(" ·")
-        if available else "kilix-amp backend unavailable"
+        if available else "kilix-amp backend not running"
     )
     body = shell.draw(
         surface,
@@ -102,20 +193,31 @@ def render(surface, state: State) -> None:
         summary=summary,
         footer=(
             "space play/pause · n next · p prev · r refresh · q quit"
-            if available else "r retry · q quit"
+            if available else "s start backend · r retry · q quit"
         ),
         summary_role="alert" if not available or state.backend.error else "muted",
     )
-    if not state.backend.available():
+    if not available:
+        installed = state.backend.installed()
         shell.put(surface, body.top, body.left,
                   "This front end drives kilix-amp over a control socket;")
         shell.put(surface, body.top + 1, body.left,
-                  "kilix-amp does not ship the headless backend yet.")
-        shell.put(surface, body.top + 3, body.left,
+                  "no backend is listening yet.")
+        if installed:
+            shell.put(surface, body.top + 3, body.left,
+                      "Press s to start one.")
+        else:
+            shell.put(surface, body.top + 3, body.left,
+                      "kilix-amp is not built here — install the Media Player",
+                      shell.tango.attr("alert"))
+            shell.put(surface, body.top + 4, body.left,
+                      "from the Kilix 95 desktop, then press s.")
+        shell.put(surface, body.top + 6, body.left,
                   f"expected socket: {state.backend.path}",
                   shell.tango.attr("muted"))
-        shell.put(surface, body.top + 4, body.left,
-                  "Use the Kilix 95 Media Player until then.")
+        if state.backend.error:
+            shell.put(surface, body.top + 7, body.left, state.backend.error,
+                      shell.tango.attr("alert"))
         return
     if state.backend.error:
         shell.put(surface, body.top, body.left, state.backend.error,
@@ -153,10 +255,17 @@ def main(argv: list[str] | None = None) -> int:
             handle.write(app.render_to_text(render, state) + "\n")
         return 0
 
+    # Opening the player is the request for a player: bring the backend up
+    # rather than making the first thing on screen an instruction to.
+    if not state.backend.available():
+        state.start_backend()
+
     def handle(key: int, s: State) -> bool:
         if keymap.is_quit(key):
             return False
-        if key == ord(" "):
+        if key == ord("s") and not s.backend.available():
+            s.start_backend()
+        elif key == ord(" "):
             s.backend.command("toggle"); s.refresh()
         elif key == ord("n"):
             s.backend.command("next"); s.refresh()
