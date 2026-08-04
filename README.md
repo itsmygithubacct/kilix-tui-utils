@@ -29,6 +29,17 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-virtualbox-manager` | Discover, launch, focus, and control VirtualBox VPN machines in Kilix tabs |
 | `kilix-tui` | **The text-native desktop** — see below |
 
+## Watch the episode
+
+https://github.com/user-attachments/assets/be594a53-03b3-466f-8d8e-f1687c92ca0e
+
+**[Desktop Three: Kilix TUI](https://github.com/itsmygithubacct/kilix-tui-utils/releases/download/media-v1/07-kilix-tui.mp4)**
+— part seven of *Kilix, Pleb, and Plebian-OS: A Desktop Built Inside a Terminal*, the ten-part
+stack series (1920×1080, 3m14s, 9.2 MB; published as a
+[media release](https://github.com/itsmygithubacct/kilix-tui-utils/releases/tag/media-v1) so a
+clone stays small). The [full series](https://github.com/itsmygithubacct/plebian-os#watch-the-series) (31m22s)
+lives on `plebian-os` and plays at [plebian-os.com](https://plebian-os.com/#watch).
+
 ## The desktop: `kilix-tui`
 
 `kilix-tui/main.py` (deliberately not under `tools/` — those are what it
