@@ -113,6 +113,71 @@ def help_rows_for(footer: str) -> list[tuple[str, str]]:
     return rows
 
 
+class Filter:
+    """Incremental `/` filtering, defined once for every browsable list.
+
+    A list long enough to scroll is a list worth searching, and a tool that
+    invents its own search box is a tool with its own keys to learn. This owns
+    the whole interaction — open on `/`, type to narrow, Enter to keep the
+    needle and resume navigating, Esc to drop it — so a tool spends three
+    lines: consume keys, filter its rows, hand the summary to `draw`.
+
+    Live dashboards are the deliberate exception. A process list ranked by
+    usage rearranges under the cursor every second, so a needle typed into it
+    is aiming at something that has already moved.
+    """
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.typing = False
+
+    def active(self) -> bool:
+        return bool(self.text) or self.typing
+
+    def open(self) -> None:
+        self.typing = True
+
+    def clear(self) -> None:
+        self.text = ""
+        self.typing = False
+
+    def handle(self, key: int) -> bool:
+        """Consume a key while filtering. True means the tool must not act."""
+        from . import keys as keymap
+        if not self.typing:
+            if keymap.is_filter(key):
+                self.open()
+                return True
+            return False
+        if key == keymap.ESCAPE:
+            self.clear()
+        elif key in keymap.ENTER:
+            self.typing = False          # keep the needle, resume navigating
+        elif key in keymap.BACKSPACE:
+            self.text = self.text[:-1]
+        elif keymap.is_text(key):
+            self.text += chr(key)
+        return True
+
+    def matches(self, label: object) -> bool:
+        return self.text.lower() in str(label).lower()
+
+    def apply(self, items, key=None) -> list:
+        if not self.text:
+            return list(items)
+        pick = key or (lambda item: item)
+        return [item for item in items if self.matches(pick(item))]
+
+    def summary(self, shown: int) -> str:
+        if not self.active():
+            return ""
+        tail = "1 match" if shown == 1 else f"{shown} matches"
+        return f"filter: {self.text}{'_' if self.typing else ''}  ({tail})"
+
+    def footer(self) -> str:
+        return "type to filter · Enter keep · Esc clear · ↑↓ move"
+
+
 @dataclass(frozen=True)
 class Body:
     """The content rectangle left after the shared shell is drawn."""

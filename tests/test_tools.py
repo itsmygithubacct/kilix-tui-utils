@@ -248,6 +248,64 @@ class SessionLogTests(unittest.TestCase):
             self.assertEqual({i["id"] for i in items}, {"live1", "old1"})
 
 
+class FilterTests(unittest.TestCase):
+    """`/` behaves the same in every list that has it."""
+
+    def test_typing_narrows_and_escape_restores(self):
+        f = shell.Filter()
+        rows = ["alpha", "beta", "gamma"]
+        self.assertEqual(f.apply(rows), rows)
+        f.open()
+        for letter in "am":
+            f.handle(ord(letter))
+        self.assertEqual(f.apply(rows), ["gamma"])
+        f.handle(27)
+        self.assertEqual(f.apply(rows), rows)
+        self.assertFalse(f.active())
+
+    def test_enter_keeps_the_needle_and_returns_to_navigating(self):
+        f = shell.Filter()
+        f.open()
+        f.handle(ord("a"))
+        f.handle(ord("\n"))
+        self.assertFalse(f.typing)        # keys drive the list again
+        self.assertTrue(f.active())       # but the needle still applies
+        self.assertEqual(f.text, "a")
+
+    def test_the_filter_consumes_keys_only_while_open(self):
+        f = shell.Filter()
+        self.assertFalse(f.handle(ord("q")))   # q must still quit
+        self.assertTrue(f.handle(ord("/")))    # `/` opens it
+        self.assertTrue(f.handle(ord("q")))    # now q is text
+        self.assertEqual(f.text, "q")
+
+    def test_a_filtered_playlist_plays_the_right_track(self):
+        # The backend addresses tracks by playlist position, so a filtered
+        # view has to carry the original index or Enter plays the wrong song.
+        music = load_tool("music")
+        state = music.State.__new__(music.State)
+        state.playlist = ["/m/aaa.flac", "/m/target.flac", "/m/ccc.flac"]
+        state.filter = shell.Filter()
+        state.filter.open()
+        for letter in "target":
+            state.filter.handle(ord(letter))
+        view = state.view()
+        self.assertEqual(len(view), 1)
+        self.assertEqual(view[0][0], 1)        # original index, not 0
+        self.assertTrue(view[0][1].endswith("target.flac"))
+
+    def test_every_list_tool_offers_the_filter(self):
+        for name in ("file", "session_log", "music"):
+            with self.subTest(tool=name):
+                source = (ROOT / "tools" / name / "main.py").read_text()
+                self.assertIn("shell.Filter()", source)
+                self.assertIn("/ filter", source)
+
+
+def load_tool(name):
+    return load(name)
+
+
 class SharedShellTests(unittest.TestCase):
     """What every tool gets from the frame and the loop, not one at a time."""
 

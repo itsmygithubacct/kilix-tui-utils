@@ -27,7 +27,13 @@ class State:
         self.selected = 0
         self.message = ""
         self.entries: list[dict[str, object]] = []
+        self.filter = shell.Filter()
         self.refresh()
+
+    def view(self) -> list[dict[str, object]]:
+        """The rows on screen. Everything that reads a row goes through this,
+        so the cursor can never index the unfiltered list."""
+        return self.filter.apply(self.entries, key=lambda row: row["name"])
 
     def refresh(self) -> None:
         rows: list[dict[str, object]] = []
@@ -53,9 +59,10 @@ class State:
         self.selected = min(self.selected, max(0, len(rows) - 1))
 
     def enter(self) -> None:
-        if not self.entries:
+        rows = self.view()
+        if not rows:
             return
-        item = self.entries[self.selected]
+        item = rows[min(self.selected, len(rows) - 1)]
         target = os.path.normpath(os.path.join(self.cwd, str(item["name"])))
         if item["dir"]:
             self.cwd, self.selected, self.message = target, 0, ""
@@ -76,17 +83,21 @@ class State:
 
 
 def render(surface, state: State) -> None:
+    rows = state.view()
+    state.selected = max(0, min(state.selected, max(0, len(rows) - 1)))
     body = shell.draw(
         surface,
         title="Files",
         sections=("Browse",),
-        summary=state.cwd,
-        footer="Enter open · Backspace up · r refresh · q quit",
+        summary=state.filter.summary(len(rows)) or state.cwd,
+        footer=(state.filter.footer() if state.filter.typing
+                else "Enter open · Backspace up · / filter · r refresh · q quit"),
+        summary_role="accent" if state.filter.active() else "muted",
     )
     visible = max(1, body.height - int(bool(state.message)))
     start = max(0, min(state.selected - visible // 2,
-                       max(0, len(state.entries) - visible)))
-    for index, item in enumerate(state.entries[start:start + visible]):
+                       max(0, len(rows) - visible)))
+    for index, item in enumerate(rows[start:start + visible]):
         row = body.top + index
         selected = start + index == state.selected
         marker = "▶" if selected else " "
@@ -116,11 +127,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     def handle(key: int, s: State) -> bool:
+        if s.filter.typing:
+            s.filter.handle(key)
+            return True
         if keymap.is_quit(key):
             return False
+        if s.filter.handle(key):          # `/` opens it
+            return True
         if step := keymap.direction(key):
-            if s.entries:
-                s.selected = max(0, min(len(s.entries) - 1, s.selected + step))
+            rows = s.view()
+            if rows:
+                s.selected = max(0, min(len(rows) - 1, s.selected + step))
         elif key in keymap.SELECT:
             s.enter()
         elif key in (263, 127, 8):

@@ -77,11 +77,17 @@ class State:
         self.selected = 0
         self.viewing: list[str] | None = None
         self.offset = 0
+        self.filter = shell.Filter()
+
+    def view(self) -> list:
+        """The transcripts on screen; every reader goes through this so the
+        cursor cannot index past a filtered list."""
+        return self.filter.apply(self.items, key=lambda row: row["id"])
 
 
 def render(surface, state: State) -> None:
     if state.viewing is not None:
-        item = state.items[state.selected]
+        item = state.view()[state.selected]
         body = shell.draw(
             surface,
             title="Session Logs",
@@ -95,6 +101,8 @@ def render(surface, state: State) -> None:
             shell.put(surface, body.top + index, body.left,
                       line.replace("\t", "    "))
         return
+    rows = state.view()
+    state.selected = max(0, min(state.selected, max(0, len(rows) - 1)))
     live = sum(int(i["size"]) for i in state.items if i["tier"] == "live")
     archived = sum(int(i["size"]) for i in state.items if i["tier"] == "archived")
     body = shell.draw(
@@ -102,22 +110,24 @@ def render(surface, state: State) -> None:
         title="Session Logs",
         sections=("Sessions", "Transcript"),
         active=0,
-        summary=(
+        summary=state.filter.summary(len(rows)) or (
             f"live {proc.human_bytes(live)} · "
             f"archived {proc.human_bytes(archived)} · "
             f"{len(state.items)} panes"
         ),
-        footer="Enter open · r refresh · q quit",
+        summary_role="accent" if state.filter.active() else "muted",
+        footer=(state.filter.footer() if state.filter.typing
+                else "Enter open · / filter · r refresh · q quit"),
     )
-    if not state.items:
+    if not rows:
         shell.put(surface, body.top, body.left,
                   f"no transcripts in {state.directory}",
                   shell.tango.attr("muted"))
     visible = max(1, body.height)
     start = max(0, min(state.selected - visible // 2,
-                       max(0, len(state.items) - visible)))
+                       max(0, len(rows) - visible)))
     import time as _time
-    for index, item in enumerate(state.items[start:start + visible]):
+    for index, item in enumerate(rows[start:start + visible]):
         row = body.top + index
         selected = start + index == state.selected
         marker = "▶" if selected else " "
@@ -149,13 +159,19 @@ def main(argv: list[str] | None = None) -> int:
             elif step := keymap.direction(key):
                 s.offset = max(0, s.offset + step)
             return True
+        if s.filter.typing:
+            s.filter.handle(key)
+            return True
         if keymap.is_quit(key):
             return False
+        if s.filter.handle(key):          # `/` opens it
+            return True
+        rows = s.view()
         if step := keymap.direction(key):
-            if s.items:
-                s.selected = max(0, min(len(s.items) - 1, s.selected + step))
-        elif key in keymap.SELECT and s.items:
-            s.viewing = read_transcript(s.items[s.selected]).splitlines()
+            if rows:
+                s.selected = max(0, min(len(rows) - 1, s.selected + step))
+        elif key in keymap.SELECT and rows:
+            s.viewing = read_transcript(rows[s.selected]).splitlines()
             s.offset = 0
         elif keymap.is_refresh(key):
             s.items = entries(s.directory)

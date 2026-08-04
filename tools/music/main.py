@@ -230,6 +230,7 @@ class State:
         self.message = ""           # one line of feedback about the last key
         self.help_open = False
         self.prompt: str | None = None   # the "add path" entry, when open
+        self.filter = shell.Filter()
         self._worker: threading.Thread | None = None
         self.refresh()
 
@@ -237,7 +238,20 @@ class State:
         return bool(self._worker and self._worker.is_alive())
 
     def typing(self) -> bool:
-        return self.prompt is not None
+        return self.prompt is not None or self.filter.typing
+
+    def view(self) -> list[tuple[int, str]]:
+        """The playlist rows on screen, as (playlist index, path).
+
+        The index travels with the row because the backend addresses tracks by
+        their position in the *whole* playlist: filtering renumbers what is on
+        screen, and playing row 0 of a filtered list must not play track 0.
+        """
+        pairs = list(enumerate(self.playlist))
+        if not self.filter.text:
+            return pairs
+        return [pair for pair in pairs
+                if self.filter.matches(os.path.basename(pair[1]))]
 
     def absorb(self, reply: dict) -> None:
         """Take the status a mutating command already returned."""
@@ -361,15 +375,17 @@ VOLUME_STEP = 5
 
 
 def footer(state: State) -> str:
-    if state.typing():
+    if state.filter.typing:
+        return state.filter.footer()
+    if state.prompt is not None:
         return "type a file or folder · Enter add · Esc cancel"
     if state.phase:
         return "q quit"
     if not state.backend.available():
         return "s start backend · r retry · q quit"
     if state.section == 1:
-        return ("↑/↓ select · Enter play · a add · c clear · space play/pause "
-                "· Tab now playing · ? keys · q quit")
+        return ("↑/↓ select · Enter play · / filter · a add · c clear "
+                "· space play/pause · Tab now playing · ? keys · q quit")
     return ("space play/pause · ←/→ seek · +/- volume · z/b prev/next "
             "· s shuffle · m repeat · Tab playlist · ? keys · q quit")
 
@@ -430,19 +446,21 @@ def _draw_now_playing(surface, state: State, body) -> None:
 
 
 def _draw_playlist(surface, state: State, body) -> None:
-    if not state.playlist:
-        shell.put(surface, body.top, body.left,
-                  "the playlist is empty — press a to add a file or folder",
+    rows = state.view()
+    if not rows:
+        message = ("nothing matches that filter" if state.filter.text
+                   else "the playlist is empty — press a to add a file or folder")
+        shell.put(surface, body.top, body.left, message,
                   shell.tango.attr("muted"))
         return
     current = number(state.status, "index", -1)
-    state.selected = max(0, min(state.selected, len(state.playlist) - 1))
+    state.selected = max(0, min(state.selected, len(rows) - 1))
     height = max(1, body.height - (2 if state.typing() else 0))
-    first = visible_window(len(state.playlist), height, state.selected)
-    for line in range(min(height, len(state.playlist) - first)):
-        index = first + line
-        item = state.playlist[index]
-        selected = index == state.selected
+    first = visible_window(len(rows), height, state.selected)
+    for line in range(min(height, len(rows) - first)):
+        position = first + line
+        index, item = rows[position]
+        selected = position == state.selected
         # Two different meanings, two different marks: the cursor is where you
         # are, the note is what the backend is actually playing.
         cursor = "▶" if selected else " "
@@ -470,6 +488,8 @@ def render(surface, state: State) -> None:
     waiting = WAITING.get(state.phase, "")
     if waiting:
         summary = waiting
+    elif state.section == 1 and state.filter.active():
+        summary = state.filter.summary(len(state.view()))
     elif state.message:
         summary = state.message
     elif available:
@@ -554,7 +574,10 @@ def handle(key: int, state: State) -> bool:
     if state.help_open:
         state.help_open = False
         return True
-    if state.typing():
+    if state.filter.typing:
+        state.filter.handle(key)
+        return True
+    if state.prompt is not None:
         return _typed(key, state)
     if keymap.is_quit(key):
         return False
@@ -563,6 +586,9 @@ def handle(key: int, state: State) -> bool:
     state.message = ""
     if key == ord("?"):
         state.help_open = True
+        return True
+    if state.section == 1 and state.filter.handle(key):     # `/` filters
+        state.selected = 0
         return True
     if not state.backend.available():
         if key == ord("s"):
@@ -608,11 +634,13 @@ def handle(key: int, state: State) -> bool:
         state.refresh()
         state.message = "playlist cleared"
     elif (step := keymap.direction(key)) and state.section == 1:
-        state.selected = max(
-            0, min(len(state.playlist) - 1, state.selected + step))
+        rows = state.view()
+        state.selected = max(0, min(len(rows) - 1, state.selected + step))
     elif key in (ord("\n"), ord("\r")) and state.section == 1:
-        if state.playlist:
-            state.send("play", index=state.selected)
+        rows = state.view()
+        if rows:
+            # The playlist index, not the row number on screen.
+            state.send("play", index=rows[state.selected][0])
     elif keymap.is_refresh(key):
         state.refresh()
     return True

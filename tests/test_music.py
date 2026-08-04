@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_tui import app  # noqa: E402
+from kilix_tui import app, shell  # noqa: E402
 
 
 def load():
@@ -366,6 +366,7 @@ def player(**kwargs):
     state.message = ""
     state.help_open = False
     state.prompt = None
+    state.filter = shell.Filter()
     state._worker = None
     state.refresh()
     return state
