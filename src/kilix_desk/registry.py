@@ -48,6 +48,11 @@ PROGRAMS = (
          sibling="rollout_resume"),
     Item("Model store", command="kilix-bonsai", kilix=("bonsai",), verb="tab"),
     Item("Web browser", kilix=("open-url",), verb="tab", kilix_only=True),
+    # Listed separately from "Web browser" because it is a different promise:
+    # that one reaches for a desktop browser first, this one is always the
+    # text browser in a pane. On a machine with no X server they end up at
+    # the same program, and naming it is how you can ask for it directly.
+    Item("Text browser", kilix=("chawan",), verb="tab", kilix_only=True),
     Item("Games", submenu="games"),
     Item("Screensavers", submenu="screensavers", kilix_only=True),
     Item("Music", command="kilix-music", sibling="music"),
