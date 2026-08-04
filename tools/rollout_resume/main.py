@@ -1609,7 +1609,9 @@ def main(argv: list[str]) -> int:
             output_file.write(
                 app.render_to_text(render, State(**state_options)))
         return 0
-    return app.run(render, State(**state_options), handle=handle)
+    # This tool draws its own '?' help.
+    return app.run(render, State(**state_options), handle=handle,
+                   help_key=False)
 
 
 def _runtime_error(error: RuntimeError) -> ResumeError:

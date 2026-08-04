@@ -7,8 +7,10 @@ a desktop menu, and it is the check most likely to catch a regression in the
 shared core. The framebuffer memory and temperature dashboards have dedicated
 suites because their renderer and event-loop contracts are deliberately richer.
 """
+import glob
 import importlib.util
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -16,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_tui import app, keys as keymap, proc  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 
 TOOLS = [
     "calculator", "cpu", "disk", "system", "volume",
@@ -244,6 +246,63 @@ class SessionLogTests(unittest.TestCase):
             tiers = {item["tier"] for item in items}
             self.assertEqual(tiers, {"live", "archived"})
             self.assertEqual({i["id"] for i in items}, {"live1", "old1"})
+
+
+class SharedShellTests(unittest.TestCase):
+    """What every tool gets from the frame and the loop, not one at a time."""
+
+    def test_the_key_line_drops_the_middle_and_keeps_the_way_out(self):
+        line = "↑/↓ select · Enter scan · r refresh · q quit"
+        for width in range(12, len(line) + 5):
+            fitted = shell.fit(line, width)
+            self.assertLessEqual(len(fitted), width, f"width {width}")
+            self.assertTrue(fitted.endswith("q quit"), f"width {width}")
+
+    def test_help_is_advertised_only_where_it_works(self):
+        surface = app.TextSurface(height=12, width=70)
+        shell.draw(surface, title="Disk", footer="r refresh · q quit")
+        self.assertIn("? keys", str(surface))
+        surface = app.TextSurface(height=12, width=70)
+        shell.draw(surface, title="Calculator", footer="q quit",
+                   help_key=False)
+        self.assertNotIn("? keys", str(surface))
+
+    def test_the_overlay_is_built_from_the_tool_own_key_line(self):
+        surface = app.TextSurface(height=20, width=76)
+        shell.draw(surface, title="Disk",
+                   footer="↑/↓ select · Enter scan · r refresh · q quit")
+        app.help_overlay(surface)
+        text = str(surface)
+        self.assertIn("Disk — keys", text)
+        self.assertIn("scan", text)
+        # Only what is true here: no section keys in a tool without sections.
+        self.assertNotIn("jump straight to a section", text)
+        self.assertNotIn("next section", text)
+
+    def test_the_overlay_mentions_the_mouse_only_when_enabled(self):
+        surface = app.TextSurface(height=20, width=76)
+        shell.draw(surface, title="Disk", footer="q quit")
+        app.help_overlay(surface, mouse=False)
+        self.assertNotIn("wheel to scroll", str(surface))
+        surface = app.TextSurface(height=20, width=76)
+        shell.draw(surface, title="Disk", footer="q quit")
+        app.help_overlay(surface, mouse=True)
+        self.assertIn("wheel to scroll", str(surface))
+
+    def test_ctrl_h_is_not_swallowed_as_help(self):
+        # Ctrl-H arrives as 8, the same code as Backspace, which the file
+        # manager uses for "go up". The shared loop must only take "?".
+        self.assertTrue(keymap.is_help_char(ord("?")))
+        self.assertFalse(keymap.is_help_char(8))
+
+    def test_every_tool_title_that_draws_a_frame_has_a_tip(self):
+        titles = set()
+        for path in sorted(glob.glob(os.path.join(ROOT, "tools", "*",
+                                                  "main.py"))):
+            with open(path, encoding="utf-8") as handle:
+                titles.update(re.findall(r'title="([^"]+)"', handle.read()))
+        missing = sorted(t for t in titles if t not in shell.TIPS)
+        self.assertEqual(missing, [], f"tools without a tip: {missing}")
 
 
 if __name__ == "__main__":

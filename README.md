@@ -35,9 +35,28 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 launches) is a desktop provider in the same sense as Kilix 95, Kilix Cap, and
 Kilix Land: it composes the commands above rather than containing any
 application of its own. Its default is the canonical Tango text shell shared
-by every utility: `KILIX TUI`, numbered navigation, one divider, one status
-row, the application body, and a footer. An optional pixel rendering remains
-available with `--graphics`. Six sections: Home (status), Programs, Machine,
+by every utility: `KILIX TUI`, one divider, one status row, the application
+body, a tip, and a key line. An optional pixel rendering remains
+available with `--graphics`.
+
+The desktop navigates by **place**, not by focus: one cursor, always in the
+list on screen, with a breadcrumb saying where that is, `..` as a real row so
+going back is somewhere the cursor can reach, and `/` to filter a long list.
+The utilities keep their numbered section strip, which is a tab bar rather
+than a second focus ring. Everything else is shared from one place, so the
+whole suite gains it at once:
+
+* the key line is **fitted, never clipped** — narrow terminals drop bindings
+  from the middle outwards so `q quit` always survives;
+* `?` opens a help overlay in any tool, built from that tool's *own* key line
+  so the two cannot disagree, and listing only keys that actually work there;
+* one tip per tool, in `kilix_tui/shell.TIPS`, which a test keeps complete.
+
+Tools where typing is text — the calculator, the package and pane filters —
+pass `help_key=False` and keep `?` as an ordinary character rather than
+advertising a key that would do nothing.
+
+Six sections: Home (status), Programs, Machine,
 System, Session, and Power — the last being the point: it closes the stack's
 no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions
 shared verbatim with `plebian-os` (`src/kilix_tui/privileged.py` is the one list

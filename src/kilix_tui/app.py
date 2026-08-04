@@ -104,6 +104,33 @@ def render_to_text(
     return str(surface)
 
 
+def help_overlay(surface: Any, *, mouse: bool = False, extra: str = "") -> None:
+    """Draw `?` help for whatever the last frame drew.
+
+    The rows come from that tool's own key line, so a tool cannot advertise a
+    key in its footer and omit it from its help — and no tool has to write its
+    help twice.
+
+    Only keys that are *actually true here* are added to that: `?` itself, and
+    the mouse when this run enabled it. Appending the whole shared table looked
+    generous and was dishonest — it promised "1 – 6 jump to a section" and "Tab
+    next section" in single-section tools that do nothing with either, which is
+    worse than saying nothing, because the user tries them.
+    """
+    from . import shell
+
+    frame = shell.last_frame()
+    rows = shell.help_rows_for(frame.get("footer", ""))
+    if not any(keys.startswith("?") for keys, _text in rows):
+        rows.append(("?", "show these keys"))
+    if mouse:
+        rows.append(("mouse", "click to select, click again to open, "
+                              "wheel to scroll"))
+    title = frame.get("title") or "Keys"
+    shell.overlay(surface, title=f"{title} — keys", rows=rows,
+                  note=extra or "any key closes this")
+
+
 def run(
     render: Callable[[Any, Any], None],
     state: Any,
@@ -111,15 +138,22 @@ def run(
     handle: Callable[[int, Any], bool] | None = None,
     tick_ms: int | None = None,
     mouse: bool = False,
+    help_key: bool = True,
 ) -> int:
     """Run a tool interactively until it quits.
 
     `handle` returns False to exit. `tick_ms` makes the loop wake up on its own
     so a monitoring tool can refresh without input. `mouse` reports clicks and
     the wheel as `curses.KEY_MOUSE` for `handle` to interpret via `getmouse`.
+
+    `help_key` puts `?` on every tool from here, so seventeen tools do not each
+    implement the same overlay. Tools that read typed text — a calculator, a
+    filter box — set it False and keep `?` as an ordinary character.
     """
+    showing_help = False
 
     def _loop(stdscr: Any) -> int:
+        nonlocal showing_help
         curses.curs_set(0)
         stdscr.keypad(True)
         if mouse:
@@ -132,11 +166,19 @@ def run(
         while True:
             stdscr.erase()
             render(stdscr, state)
+            if showing_help:
+                help_overlay(stdscr, mouse=mouse)
             stdscr.refresh()
             key = stdscr.getch()
             if key == -1:            # timeout tick: redraw only
                 continue
             if key == curses.KEY_RESIZE:
+                continue
+            if showing_help:
+                showing_help = False     # any key closes it, as the note says
+                continue
+            if help_key and keymap.is_help_char(key):
+                showing_help = True
                 continue
             if handle is not None:
                 if not handle(key, state):

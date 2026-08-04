@@ -110,6 +110,7 @@ def submit(state: State) -> None:
 def render(surface, state: State) -> None:
     body = shell.draw(
         surface,
+        help_key=False,   # '?' is text here, not help
         title="Calculator",
         sections=("Calculate",),
         summary="Safe arithmetic · standard operators and powers",
@@ -160,7 +161,8 @@ def main(argv: list[str] | None = None) -> int:
         with open(path, "w", encoding="utf-8") as handle_:
             handle_.write(app.render_to_text(render, state) + "\n")
         return 0
-    return app.run(render, state, handle=handle)
+    # '?' is a character an expression may contain.
+    return app.run(render, state, handle=handle, help_key=False)
 
 
 if __name__ == "__main__":

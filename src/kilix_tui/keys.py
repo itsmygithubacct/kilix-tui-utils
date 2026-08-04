@@ -88,6 +88,17 @@ def is_help(key: int) -> bool:
     return key in HELP
 
 
+def is_help_char(key: int) -> bool:
+    """Just `?`, for the shared loop.
+
+    `HELP` also carries Ctrl-H, which arrives as 8 — the same code many
+    terminals send for Backspace, and Backspace is "go up a directory" in the
+    file manager. The central interception must not swallow that, so it matches
+    the one key that means help and nothing else.
+    """
+    return key == ord("?")
+
+
 def is_refresh(key: int) -> bool:
     return key in REFRESH
 

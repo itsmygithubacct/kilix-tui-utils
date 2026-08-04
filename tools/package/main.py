@@ -69,6 +69,7 @@ def render(surface, state: State) -> None:
     )
     body = shell.draw(
         surface,
+        help_key=False,   # '?' is text here, not help
         title="Packages",
         sections=("Installed",),
         summary=summary,
@@ -117,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
             s.selected = 0
         return True
 
-    return app.run(render, state, handle=handle)
+    # Typing filters the package list, so '?' is text here.
+    return app.run(render, state, handle=handle, help_key=False)
 
 
 if __name__ == "__main__":

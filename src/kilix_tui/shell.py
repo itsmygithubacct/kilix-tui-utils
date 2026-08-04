@@ -20,6 +20,75 @@ from typing import Sequence
 from kilix_desk import tango
 
 
+# One tip per tool, keyed by the title the tool already passes to `draw`.
+# Keeping them here rather than in each tool means the whole suite gains tips
+# from one file, and a tip earns its row only by saying something the screen
+# does not already show.
+TIPS: dict[str, str] = {
+    "Calculator": "answers stay in the list — Up recalls what you typed",
+    "CPU": "the busiest processes are listed under the per-core bars",
+    "Disk": "Enter scans a filesystem; it stays interruptible while it runs",
+    "Files": "this manager only opens and navigates — it never deletes or moves",
+    "Music": "this drives kilix-amp over its control socket, so the player can be anywhere",
+    "Packages": "read-only: type to filter, Tab re-sorts by size",
+    "Plebian-OS Control": "every power and update action confirms before it runs",
+    "Rollout Resume": "resumes Claude, Codex and Kimi sessions — and installs them",
+    "Session Logs": "live and archived transcripts read the same; archives decompress on the fly",
+    "Switcher": "shows what each pane is running before you jump to it",
+    "System": "--print gives the same facts as plain text for scripts",
+    "Volume": "this sets the sink Kilix itself uses, not just this pane",
+    "Weather": "forecast comes from Open-Meteo; r refetches it",
+    "Temperatures": "green below 80°C, yellow to 89°C, red above",
+    "Memory": "pressure matters more than free bytes — watch the stall lines",
+    "VirtualBox": "machines launch into their own Kilix tab",
+}
+
+# What the last frame drew, so the `?` overlay can explain the keys the user is
+# actually looking at instead of a generic list. The curses loop is single
+# threaded and draws one frame at a time, so one slot is enough.
+_LAST: dict[str, str] = {"title": "", "footer": ""}
+
+
+def last_frame() -> dict[str, str]:
+    return dict(_LAST)
+
+
+def fit(text: str, width: int, separator: str = " · ") -> str:
+    """Fit a `·`-separated key line to the width without losing the end.
+
+    Truncating a key line silently removes the keys furthest right, and those
+    are the ones that get a stuck user out — `? keys`, `q quit`. So segments
+    drop from the middle outwards and the last one always survives.
+    """
+    if width <= 0 or len(text) <= width:
+        return text
+    parts = text.split(separator)
+    while len(parts) > 1 and len(separator.join(parts)) > width:
+        del parts[max(0, len(parts) - 2)]
+    line = separator.join(parts)
+    return line if len(line) <= width else line[:width]
+
+
+def help_rows_for(footer: str) -> list[tuple[str, str]]:
+    """Turn a tool's own key line into rows for the `?` overlay.
+
+    Deriving the overlay from the footer the tool already writes means the two
+    can never disagree, and no tool has to author its help twice.
+    """
+    rows: list[tuple[str, str]] = []
+    for segment in footer.split(" · "):
+        segment = segment.strip()
+        if not segment:
+            continue
+        head, _, rest = segment.partition(" ")
+        # "type to filter" is a sentence, not a binding: keep it whole.
+        if not rest or (head.isalpha() and head.islower() and len(head) > 2):
+            rows.append(("", segment))
+        else:
+            rows.append((head, rest))
+    return rows
+
+
 @dataclass(frozen=True)
 class Body:
     """The content rectangle left after the shared shell is drawn."""
@@ -69,6 +138,7 @@ def draw(
     summary_role: str = "muted",
     breadcrumb: str = "",
     tip: str = "",
+    help_key: bool = True,
 ) -> Body:
     """Draw the shared frame and return its content rectangle.
 
@@ -123,11 +193,22 @@ def draw(
 
     put(surface, 2, 0, "─" * max(0, width - 1), tango.attr("muted"))
     put(surface, 3, left, str(summary)[:inner_width], tango.attr(summary_role))
-    put(surface, height - 1, left, str(footer)[:inner_width],
-        tango.attr("muted"))
+
+    # Every screen that *has* `?` advertises it, and the line is fitted rather
+    # than clipped. A tool where typing is text (`help_key=False`) must not
+    # advertise a key that does nothing there.
+    line = str(footer)
+    if line and help_key and "?" not in line:
+        line = f"{line} · ? keys"
+    line = fit(line, inner_width)
+    put(surface, height - 1, left, line, tango.attr("muted"))
+
+    tip = tip or TIPS.get(str(title), "")
     if tip:
-        put(surface, height - 2, left, f"tip  {tip}"[:inner_width],
+        put(surface, height - 2, left, fit(f"tip  {tip}", inner_width),
             tango.attr("accent"))
+    _LAST["title"] = str(title)
+    _LAST["footer"] = str(footer)
 
     top = 4
     reserved = 2 if tip else 1          # footer, plus the tip row when present

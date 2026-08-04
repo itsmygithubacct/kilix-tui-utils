@@ -200,12 +200,16 @@ class RenderTests(unittest.TestCase):
         module = load()
         st = state(module)
         footer = module.footer(st)
+        last_segment = footer.split(" · ")[-1].strip()
         for width in range(60, 140):
             frame = app.render_to_text(module.render, st, height=20, width=width)
             last = frame.splitlines()[-1]
             self.assertLessEqual(len(last), width)
-            self.assertTrue(
-                last.lstrip().startswith(footer[: width - 2].rstrip()))
+            # The row is fitted, not clipped: narrow widths drop segments from
+            # the middle, so the key that gets you out always survives.
+            self.assertTrue(last.rstrip().endswith(last_segment),
+                            f"width {width}: {last!r}")
+            self.assertTrue(last.lstrip().startswith(footer.split(" · ")[0]))
             self.assertNotIn("KILIX SWITCH", last)
 
     def test_render_uses_the_main_kilix_tui_header_and_scope_bar(self):

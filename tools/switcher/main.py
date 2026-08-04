@@ -300,6 +300,7 @@ def render(surface, state: State) -> None:
     status = state.message or counts
     body = shell.draw(
         surface,
+        help_key=False,   # '?' is text here, not help
         title="Switcher",
         sections=SCOPE_LABELS,
         active=state.scope,
@@ -463,7 +464,8 @@ def main(argv: list[str] | None = None) -> int:
         with open(path, "w", encoding="utf-8") as handle_:
             handle_.write(app.render_to_text(render, state) + "\n")
         return 0
-    return app.run(render, state, handle=handle)
+    # Typing filters panes, so '?' is text here.
+    return app.run(render, state, handle=handle, help_key=False)
 
 
 if __name__ == "__main__":
