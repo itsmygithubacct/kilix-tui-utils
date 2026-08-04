@@ -31,9 +31,10 @@ class Item:
     sibling: str | None = None       # tools/<dir> in this checkout
     source: str | None = None        # <dir>/main.py in this checkout
     kilix: tuple[str, ...] = ()      # `kilix <subcommand>` fallback
-    verb: str = "inplace"
+    verb: str = "inplace"            # inplace | tab | report
     kilix_only: bool = False         # hidden outside a Kilix session
     submenu: str = ""                # opens a drill-down list instead
+    confirm: bool = False            # asks before running
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,11 @@ MACHINE = (
 SYSTEM = (
     Item("OS control", command="plebian-os", sibling="plebian_control"),
     Item("Chrome settings", command="kilix-settings", kilix=("settings",)),
+    Item("Screen size", kilix=("screen-size", "show"), verb="report"),
+    Item("Stack status", kilix=("status",), verb="report"),
+    Item("Voice status", kilix=("voice", "status"), verb="report"),
+    Item("Voice doctor", kilix=("voice", "doctor"), verb="report"),
+    Item("Update the stack", kilix=("update",), confirm=True),
     Item("Screen sharing", kilix=("share",), verb="tab", kilix_only=True),
     # `kilix desktop <name>` opens its own page and returns at once, so these
     # run in place: launching them in a page of ours would leave a dead tab
@@ -81,6 +87,8 @@ SYSTEM = (
     Item("Kilix 95 desktop", kilix=("desktop", "95"), kilix_only=True),
     Item("Kilix XP desktop", kilix=("desktop", "kilix-xp"), kilix_only=True),
     Item("Kilix Cap desktop", kilix=("desktop", "kilix-cap"), kilix_only=True),
+    Item("Kilix Land desktop", kilix=("desktop", "kilix-land"),
+         kilix_only=True),
 )
 
 SESSION = (
@@ -92,6 +100,15 @@ SESSION = (
     Item("PTY sessions", kilix=("pty",), kilix_only=True),
     Item("Mux terminal", kilix=("mux",), kilix_only=True),
     Item("Tmux manager", command="tmux-tui"),
+    # The streaming tiers: serve holds a session open, attach drives it,
+    # view watches without a keyboard.
+    Item("Serve this session", kilix=("serve",), kilix_only=True),
+    Item("Attach to a session", kilix=("attach",), kilix_only=True),
+    Item("Watch a session", kilix=("view",), kilix_only=True),
+    Item("Compress dead transcripts", kilix=("transcript", "archive"),
+         verb="report"),
+    Item("Apply transcript budgets", kilix=("transcript", "prune"),
+         verb="report", confirm=True),
 )
 
 # Six sections, not more: the spine gives each section three rows, so six is

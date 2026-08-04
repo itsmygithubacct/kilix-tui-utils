@@ -1,14 +1,18 @@
-"""The desktop itself: sections in one column, entries in the other.
+"""The desktop itself: one list, one cursor, and a trail saying where you are.
 
-Navigation is a focus model, because that is what the layout already looks
-like: the section list and the entry list are two columns, Up/Down drive
-whichever holds the focus, Right or Enter steps into the entries, Left steps
-back out — and pops a drill-down first — while Esc walks the whole way out:
-submenu, then Home, then (with a confirmation when the desktop is the whole
-session) quit. Browsing sections previews their content live, since the body
-always renders the current section. The mouse speaks the same vocabulary:
-click a section to show it, click an entry to select it, click the selection
-to open it, wheel to move.
+Navigation is a *place*, not a focus model. There is one cursor and it is
+always in the list you are looking at; Right or Enter walks into a place, Left
+or Esc walks back out, and the breadcrumb on row one says which place that is.
+The earlier design gave the section strip and the entry list their own focus,
+so Up and Down meant two different things depending on invisible state — the
+single fastest way to make a terminal UI feel unpredictable.
+
+Everything else follows ncdu, which is the most navigable list in the terminal
+and gets there with four habits worth copying: say where you are on every
+screen, put "go back" *in* the list where the cursor can reach it, keep the
+keys on screen instead of in a manual, and let `?` explain the rest in place.
+To that we add `/`, because a system this size has more entries than a screen
+has rows.
 
 Three verbs and one rule. An entry is drawn here, handed the terminal in
 place, or opened in a Kilix page — and in-place is the floor: every feature
@@ -16,13 +20,16 @@ must be reachable through it, because the page verb exists only inside Kilix.
 
 This module is the text rendering — Tango-coloured curses, the floor every
 terminal can carry. The pixel rendering over the same `State` lives in
-`graphics.py`, and `main.py` picks per session.
+`graphics.py`, and `main.py` picks per session. `section`, `submenu` and
+`focus` remain readable and settable there and in the tests: they are views
+over `path`, which is the one piece of navigation state.
 """
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from kilix_tui import keys as keymap, kitty_rc, privileged, shell
@@ -32,6 +39,21 @@ from . import facts, registry, tango
 SECTIONS = ("Home", "Programs", "Machine", "System", "Session", "Power")
 QUIT_SENTINEL: tuple[str, ...] = ()
 KEY_MOUSE = 409          # curses.KEY_MOUSE, named without importing curses
+BACK_LABEL = ".."
+
+# One line per place, shown above the footer. A tip earns its row by naming
+# something the screen does not already show.
+TIPS: dict[str, str] = {
+    "": "Enter walks in, ← walks back — the trail above always says where you are",
+    "Home": "r refreshes these numbers without leaving",
+    "Programs": "press / and type to filter — 'chess' finds Chess Bash",
+    "Machine": "these open live dashboards; q returns you here",
+    "System": "settings, desktops and updates for the whole stack",
+    "Session": "panes, pages and transcripts of what this terminal has shown",
+    "Power": "every action here asks before it runs",
+    "Games": "Enter toggles a game on or off for the whole stack",
+    "Screensavers": "Enter runs one; any key stops it",
+}
 
 
 @dataclass(frozen=True)
@@ -44,9 +66,12 @@ class Entry:
     submenu: str = ""                # Enter descends instead of launching
     toggle: bool = False             # Enter flips a setting, quietly
     hint: str = ""                   # overrides the derived right-hand text
+    back: bool = False               # the ".." row
 
 
 def entry_hint(entry: Entry) -> str:
+    if entry.back:
+        return "back"
     if entry.hint:
         return entry.hint
     if entry.submenu:
@@ -55,6 +80,8 @@ def entry_hint(entry: Entry) -> str:
         return entry.reason
     if entry.verb == "tab":
         return "opens a page"
+    if entry.verb == "report":
+        return "shows output"
     if entry.confirm:
         return "confirms"
     return ""
@@ -84,6 +111,19 @@ def _quiet_run(argv: Sequence[str]) -> int:
         return 126
 
 
+def report_argv(argv: Sequence[str]) -> tuple[str, ...]:
+    """Wrap a command that prints and exits so its output can be read.
+
+    `kilix status` is worth reaching from a menu, but running it directly
+    would paint the screen and repaint over it in the same instant. The wrapper
+    holds the output until Enter, which is the whole difference between a
+    command that appears broken and one that answers a question.
+    """
+    quoted = " ".join(shlex.quote(part) for part in argv)
+    return ("sh", "-c",
+            f"{quoted}; printf '\\n— press Enter to return —'; read -r _")
+
+
 def visible_window(count: int, height: int, selected: int) -> int:
     """The first visible index, keeping the selection on screen."""
     if height <= 0 or count <= height:
@@ -95,10 +135,11 @@ class State:
     def __init__(self, *, runner: Callable[[Sequence[str]], int] | None = None,
                  quiet: Callable[[Sequence[str]], int] | None = None,
                  live: Callable[[], bool] | None = None) -> None:
-        self.section = 0
+        self.path: list[str] = []        # [] | ["Programs"] | [..., "Games"]
         self.selected = 0
-        self.focus = "sections"          # "sections" | "entries"
-        self.submenu: str | None = None
+        self.filter = ""
+        self.filtering = False
+        self.help_open = False
         self.message = ""
         self.confirm: tuple[str, tuple[str, ...]] | None = None
         self.runner = runner or _attached_run
@@ -107,14 +148,73 @@ class State:
         self.status = facts.status_rows()
         self.text_hits: dict = {}
 
+    # ── views over `path`, kept for the pixel renderer and the tests ─────────
+
+    @property
+    def section(self) -> int:
+        if not self.path:
+            return 0
+        try:
+            return SECTIONS.index(self.path[0])
+        except ValueError:
+            return 0
+
+    @section.setter
+    def section(self, index: int) -> None:
+        self.path = [SECTIONS[index % len(SECTIONS)]]
+        self.selected = 0
+
+    @property
+    def submenu(self) -> str | None:
+        return self.path[1].lower() if len(self.path) > 1 else None
+
+    @submenu.setter
+    def submenu(self, name: str | None) -> None:
+        if name:
+            if not self.path:
+                self.path = ["Programs"]
+            self.path = [self.path[0], name.capitalize()]
+        elif len(self.path) > 1:
+            self.path = self.path[:1]
+
+    @property
+    def focus(self) -> str:
+        return "sections" if not self.path else "entries"
+
+    @focus.setter
+    def focus(self, value: str) -> None:
+        # Entering "entries" from the root means walking into the section the
+        # cursor is on; leaving them means walking back out.
+        if value == "entries" and not self.path:
+            self.path = [SECTIONS[min(self.selected, len(SECTIONS) - 1)]]
+            self.selected = 0
+        elif value == "sections" and self.path:
+            self.path = []
+            self.selected = 0
+
     # ── the data both renderers draw ─────────────────────────────────────────
 
+    def place(self) -> str:
+        """The name of the current place: "" at the root."""
+        return self.path[-1] if self.path else ""
+
     def entries(self) -> list[Entry]:
+        rows = self._place_entries()
+        if self.filter:
+            needle = self.filter.lower()
+            rows = [row for row in rows if needle in row.label.lower()]
+        if self.path:
+            rows.insert(0, Entry(BACK_LABEL, None, back=True))
+        return rows
+
+    def _place_entries(self) -> list[Entry]:
+        if not self.path:
+            return self._section_entries()
         if self.submenu == "games":
             return self._game_entries()
         if self.submenu == "screensavers":
             return self._screensaver_entries()
-        name = SECTIONS[self.section]
+        name = self.path[0]
         if name == "Home":
             return []
         if name == "Power":
@@ -122,7 +222,7 @@ class State:
                     for label, argv, _needs in privileged.power_actions()]
         live = bool(self.live())
         out: list[Entry] = []
-        for item in registry.SECTIONS[name]:
+        for item in registry.SECTIONS.get(name, ()):
             if item.kilix_only and not live:
                 continue
             if item.submenu:
@@ -134,7 +234,24 @@ class State:
                                  reason=registry.disabled_reason(item)))
                 continue
             verb = plan.verb if (plan.verb == "inplace" or live) else "inplace"
-            out.append(Entry(item.label, plan.argv, verb=verb))
+            argv = (report_argv(plan.argv) if verb == "report"
+                    else plan.argv)
+            out.append(Entry(item.label, argv, verb=verb,
+                             confirm=item.confirm))
+        return out
+
+    def _section_entries(self) -> list[Entry]:
+        """The root: the six sections, as things the one cursor can open."""
+        out: list[Entry] = []
+        for name in SECTIONS:
+            if name == "Home":
+                hint = "status of the stack"
+            elif name == "Power":
+                hint = "shut down, reboot, log out"
+            else:
+                count = len(registry.SECTIONS.get(name, ()))
+                hint = f"{count} entries" if count else ""
+            out.append(Entry(name, None, submenu=name, hint=hint))
         return out
 
     def _game_entries(self) -> list[Entry]:
@@ -159,10 +276,12 @@ class State:
         return [Entry(name, (*kilix, "screensaver", name)) for name in names]
 
     def breadcrumb(self) -> str:
-        name = SECTIONS[self.section]
-        if self.submenu:
-            return f"{name} ▸ {self.submenu.capitalize()}"
-        return name
+        return " › ".join(["Kilix", *self.path])
+
+    def tip(self) -> str:
+        if self.filtering:
+            return "type to narrow the list · Esc clears it · Enter keeps it"
+        return TIPS.get(self.place(), TIPS[""])
 
 
 # ── drawing ──────────────────────────────────────────────────────────────────
@@ -187,12 +306,29 @@ def _draw_home(surface, state: State, top: int,
         row += 1
 
 
+def _hint_attr(entry: Entry) -> int:
+    if entry.back:
+        return tango.attr("muted")
+    if entry.hint:
+        return tango.attr("accent" if entry.hint == "on" else "muted")
+    if entry.submenu:
+        return tango.attr("accent")
+    if entry.argv is None:
+        return tango.attr("muted")
+    if entry.verb in ("tab", "report"):
+        return tango.attr("accent")
+    if entry.confirm:
+        return tango.attr("alert")
+    return 0
+
+
 def _draw_entries(surface, state: State, top: int,
                   height: int, width: int) -> None:
     entries = state.entries()
     if not entries:
-        _put(surface, top, 2, "nothing here"[: width - 3],
-             tango.attr("alert"))
+        empty = ("nothing matches that filter" if state.filter
+                 else "nothing here")
+        _put(surface, top, 2, empty[: width - 3], tango.attr("alert"))
         return
     state.selected = max(0, min(state.selected, len(entries) - 1))
     offset = visible_window(len(entries), height, state.selected)
@@ -204,49 +340,35 @@ def _draw_entries(surface, state: State, top: int,
         entry = entries[index]
         selected = index == state.selected
         hint = entry_hint(entry)
-        if entry.hint:
-            hint_attr = tango.attr("accent" if entry.hint == "on"
-                                   else "muted")
-        elif entry.submenu:
-            hint_attr = tango.attr("accent")
-        elif entry.argv is None:
-            hint_attr = tango.attr("muted")
-        elif entry.verb == "tab":
-            hint_attr = tango.attr("accent")
-        elif entry.confirm:
-            hint_attr = tango.attr("alert")
-        else:
-            hint_attr = 0
         marker = "▶" if selected else " "
         body = f" {marker} {entry.label}"
         pad = width - len(body) - len(hint) - 2
         if pad < 1:
             body = body[: max(0, width - len(hint) - 3)]
             pad = 1
-        if selected and state.focus == "entries":
+        if selected:
             attr = tango.attr("danger" if entry.confirm else "selected")
             _put(surface, top + line, 0,
                  f"{body}{' ' * pad}{hint} ".ljust(width - 1)[: width - 1],
                  attr)
         else:
-            body_attr = tango.attr("muted") if entry.argv is None \
-                and not entry.submenu else 0
-            if selected:
-                body_attr = tango.attr("accent")
+            body_attr = 0
+            if entry.back:
+                body_attr = tango.attr("muted")
+            elif entry.argv is None and not entry.submenu:
+                body_attr = tango.attr("muted")
             _put(surface, top + line, 0, body[: width - 1], body_attr)
             if hint:
                 _put(surface, top + line, max(0, width - len(hint) - 2),
-                     hint, hint_attr)
+                     hint, _hint_attr(entry))
 
 
-def footer(state: State) -> str:
+def footer(state: State, width: int = 0) -> str:
     if state.confirm is not None:
         return "y confirm · any other key cancels"
-    if state.submenu:
-        return "↑/↓ · Enter open · ←/Esc back · q quit"
-    if state.focus == "sections":
-        return "↑/↓ section · →/Enter into the list · 1-6 jump · q quit"
-    return "↑/↓ · Enter open · ← sections · Tab next · r refresh · q quit"
+    if state.filtering:
+        return "type to filter · Enter keep · Esc clear · ↑↓ move"
+    return keymap.footer(width)
 
 
 def render(surface, state: State) -> None:
@@ -260,64 +382,70 @@ def render(surface, state: State) -> None:
     elif state.message:
         summary = state.message
         summary_role = "accent"
+    elif state.filter:
+        count = max(0, len(state.entries()) - (1 if state.path else 0))
+        summary = f"filter: {state.filter}_  ({count} match"
+        summary += ")" if count == 1 else "es)"
+        summary_role = "accent"
     else:
-        summary = state.breadcrumb()
+        summary = _place_summary(state)
         summary_role = "muted"
-    roles = []
-    for index, name in enumerate(SECTIONS):
-        active = index == state.section
-        if active and state.focus == "sections":
-            roles.append("danger" if name == "Power" else "selected")
-        elif active:
-            roles.append("accent")
-        elif name == "Power":
-            roles.append("alert")
-        else:
-            roles.append("muted")
     body = shell.draw(
         surface,
         title=strap,
-        sections=SECTIONS,
-        active=state.section,
         summary=summary,
-        footer=footer(state),
-        tab_roles=roles,
+        footer=footer(state, max(0, width - 2)),
         summary_role=summary_role,
+        breadcrumb=state.breadcrumb(),
+        tip=state.tip(),
     )
-
-    # Keep the mouse hit map tied to the same measured tab strings.
-    column = body.left
-    for index, name in enumerate(SECTIONS):
-        text = f"{'▶' if index == state.section else ' '}{index + 1} {name} "
-        if column + len(text) >= width:
-            break
-        state.text_hits["sections"].append(
-            (column, column + len(text), index))
-        column += len(text)
 
     if state.confirm is not None:
         label, argv = state.confirm
-        _put(surface, body.top, body.left + 1, f"Confirm: {label}"[: body.width - 1],
-             tango.attr("danger"))
+        _put(surface, body.top, body.left + 1,
+             f"Confirm: {label}"[: body.width - 1], tango.attr("danger"))
         if argv:
             _put(surface, body.top + 1, body.left + 1,
-                 f"$ {' '.join(argv)}"[: body.width - 1],
-                 tango.attr("muted"))
-    elif SECTIONS[state.section] == "Home" and not state.submenu:
+                 f"$ {' '.join(argv)}"[: body.width - 1], tango.attr("muted"))
+    elif state.place() == "Home":
         _draw_home(surface, state, body.top, body.height, width)
     else:
         _draw_entries(surface, state, body.top, body.height, width)
+
+    if state.help_open:
+        shell.overlay(surface, title="Kilix TUI keys",
+                      rows=list(keymap.help_rows()),
+                      note="any key closes this")
+
+
+def _place_summary(state: State) -> str:
+    if not state.path:
+        return "Everything Kilix can do, in six places"
+    entries = [entry for entry in state.entries() if not entry.back]
+    missing = sum(1 for entry in entries
+                  if entry.argv is None and not entry.submenu)
+    if not entries:
+        return state.place()
+    if missing:
+        return f"{len(entries)} entries · {missing} not installed"
+    return f"{len(entries)} entries"
 
 
 # ── input ────────────────────────────────────────────────────────────────────
 
 
 def _open(state: State, entry: Entry) -> None:
+    if entry.back:
+        _back(state)
+        return
     if entry.submenu:
-        state.submenu = entry.submenu
+        # A section from the root, or a drill-down inside one.
+        name = entry.submenu
+        state.path = ([name] if name in SECTIONS
+                      else [*state.path, name.capitalize()])
         state.selected = 0
-        state.focus = "entries"
         state.message = ""
+        state.filter = ""
         return
     if entry.argv is None:
         state.message = entry.reason
@@ -341,12 +469,29 @@ def _open(state: State, entry: Entry) -> None:
     state.message = f"{entry.label} exited {code}" if code else ""
 
 
+def _back(state: State) -> None:
+    if state.filter:
+        state.filter = ""
+        state.filtering = False
+        state.selected = 0
+        return
+    if state.path:
+        leaving = state.path[-1]
+        state.path = state.path[:-1]
+        state.message = ""
+        # Land the cursor on the place just left, so walking out and back in
+        # returns to where you were rather than to the top of the list.
+        siblings = [entry.label for entry in state.entries()]
+        state.selected = (siblings.index(leaving)
+                          if leaving in siblings else 0)
+
+
 def _enter_section(state: State, section: int) -> None:
-    state.section = section % len(SECTIONS)
-    state.submenu = None
+    state.path = [SECTIONS[section % len(SECTIONS)]]
     state.selected = 0
     state.message = ""
-    state.focus = "entries" if state.entries() else "sections"
+    state.filter = ""
+    state.filtering = False
 
 
 def _quit(state: State) -> bool:
@@ -360,22 +505,11 @@ def _quit(state: State) -> bool:
 
 def _select(state: State) -> None:
     entries = state.entries()
-    if state.focus == "sections":
-        if entries:
-            state.focus = "entries"
-            state.selected = 0
-        return
     if entries and state.selected < len(entries):
         _open(state, entries[state.selected])
 
 
 def _move(state: State, step: int) -> None:
-    if state.focus == "sections":
-        state.section = max(0, min(len(SECTIONS) - 1, state.section + step))
-        state.submenu = None
-        state.selected = 0
-        state.message = ""
-        return
     count = len(state.entries())
     if count:
         state.selected = max(0, min(count - 1, state.selected + step))
@@ -394,31 +528,22 @@ def _text_mouse(state: State) -> bool:
     clicked = (getattr_int("BUTTON1_PRESSED") | getattr_int("BUTTON1_CLICKED")
                | getattr_int("BUTTON1_DOUBLE_CLICKED"))
     if bstate & wheel_up:
-        state.focus = "entries" if state.entries() else "sections"
         _move(state, -1)
         return True
     if bstate & wheel_down:
-        state.focus = "entries" if state.entries() else "sections"
         _move(state, 1)
         return True
     if not bstate & clicked:
-        return True
-    if y == hits.get("bar_row"):
-        for start, end, index in hits.get("sections", ()):
-            if start <= x < end:
-                _enter_section(state, index)
-                break
         return True
     top = hits.get("top")
     if top is None or not (top <= y < top + hits.get("visible", 0)):
         return True
     index = hits.get("offset", 0) + (y - top)
-    if state.focus == "entries" and index == state.selected:
+    if index == state.selected:
         entries = state.entries()
         if index < len(entries):
             _open(state, entries[index])
     else:
-        state.focus = "entries"
         state.selected = index
     return True
 
@@ -431,7 +556,34 @@ def getattr_int(name: str) -> int:
         return 0
 
 
+def _filter_key(key: int, state: State) -> bool:
+    """Keys while `/` is open: text builds the needle, arrows still move."""
+    if key == keymap.ESCAPE:
+        state.filter = ""
+        state.filtering = False
+        state.selected = 0
+        return True
+    if key in keymap.ENTER:
+        state.filtering = False          # keep the needle, resume navigating
+        return True
+    if key in keymap.BACKSPACE:
+        state.filter = state.filter[:-1]
+        state.selected = 0
+        return True
+    if (step := keymap.direction(key)) and not keymap.is_text(key):
+        _move(state, step)
+        return True
+    if keymap.is_text(key):
+        state.filter += chr(key)
+        state.selected = 0
+        return True
+    return True
+
+
 def handle(key: int, state: State) -> bool:
+    if state.help_open:
+        state.help_open = False          # any key closes it, as the note says
+        return True
     if state.confirm is not None:
         label, argv = state.confirm
         state.confirm = None
@@ -439,23 +591,26 @@ def handle(key: int, state: State) -> bool:
             if argv == QUIT_SENTINEL:
                 return False
             code = state.runner(argv)
-            state.message = f"{label} exited {code}" if code else f"{label}: done"
+            state.message = (f"{label} exited {code}" if code
+                             else f"{label}: done")
         else:
             state.message = f"cancelled: {label}"
         return True
     if key == KEY_MOUSE:
         return _text_mouse(state)
-    if key == 27:
-        # Esc walks out one level at a time: drill-down, then Home, then quit.
-        if state.submenu:
-            state.submenu = None
-            state.selected = 0
-            return True
-        if state.section != 0 or state.focus == "entries":
-            state.section = 0
-            state.focus = "sections"
-            state.selected = 0
-            state.message = ""
+    if state.filtering:
+        return _filter_key(key, state)
+    if keymap.is_help(key):
+        state.help_open = True
+        return True
+    if keymap.is_filter(key):
+        state.filtering = True
+        state.message = ""
+        return True
+    if key == keymap.ESCAPE:
+        # Esc walks out one level at a time, then asks before leaving.
+        if state.filter or state.path:
+            _back(state)
             return True
         return _quit(state)
     if key in (ord("q"), ord("Q")):
@@ -464,24 +619,13 @@ def handle(key: int, state: State) -> bool:
         _enter_section(state, key - ord("1"))
         return True
     if key == ord("\t"):
-        _enter_section(state, state.section + 1)
+        _enter_section(state, self_next_section(state))
         return True
     if key in keymap.LEFT:
-        if state.submenu:
-            state.submenu = None
-            state.selected = 0
-        elif state.focus == "entries":
-            state.focus = "sections"
+        _back(state)
         return True
     if key in keymap.RIGHT:
-        if state.focus == "sections":
-            if state.entries():
-                state.focus = "entries"
-                state.selected = 0
-        else:
-            entries = state.entries()
-            if entries and entries[state.selected].submenu:
-                _open(state, entries[state.selected])
+        _select(state)
         return True
     if (step := keymap.direction(key)):
         _move(state, step)
@@ -493,16 +637,10 @@ def handle(key: int, state: State) -> bool:
         _move(state, 5)
         return True
     if key in keymap.HOME:
-        if state.focus == "entries":
-            state.selected = 0
-        else:
-            _move(state, -len(SECTIONS))
+        state.selected = 0
         return True
     if key in keymap.END:
-        if state.focus == "entries":
-            state.selected = max(0, len(state.entries()) - 1)
-        else:
-            _move(state, len(SECTIONS))
+        state.selected = max(0, len(state.entries()) - 1)
         return True
     if key in keymap.SELECT:
         _select(state)
@@ -512,3 +650,8 @@ def handle(key: int, state: State) -> bool:
         state.message = ""
         return True
     return True
+
+
+def self_next_section(state: State) -> int:
+    """Tab cycles sections from wherever you are."""
+    return (state.section + 1) % len(SECTIONS)

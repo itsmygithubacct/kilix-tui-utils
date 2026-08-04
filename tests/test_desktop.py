@@ -81,17 +81,36 @@ class ContractTests(unittest.TestCase):
 
 
 class NavigationTests(unittest.TestCase):
-    def test_arrows_drive_the_focused_column(self):
+    def test_one_cursor_walks_in_and_out_of_places(self):
+        # Up/Down must mean the same thing everywhere: move the cursor in the
+        # list on screen. Right walks into a place, Left walks back out.
         state = make_state()
-        self.assertEqual(state.focus, "sections")
+        self.assertEqual([e.label for e in state.entries()],
+                         list(desk.SECTIONS))
         desk.handle(258, state)                               # down
-        self.assertEqual(desk.SECTIONS[state.section], "Programs")
-        desk.handle(261, state)                               # right: dive in
-        self.assertEqual(state.focus, "entries")
-        desk.handle(258, state)
+        self.assertEqual(state.entries()[state.selected].label, "Programs")
+        desk.handle(261, state)                               # right: walk in
+        self.assertEqual(state.path, ["Programs"])
+        self.assertEqual(state.entries()[0].label, desk.BACK_LABEL)
+        desk.handle(258, state)                               # down, same key
         self.assertEqual(state.selected, 1)
-        desk.handle(260, state)                               # left: back out
-        self.assertEqual(state.focus, "sections")
+        desk.handle(260, state)                               # left: walk out
+        self.assertEqual(state.path, [])
+
+    def test_walking_out_lands_on_the_place_just_left(self):
+        state = make_state()
+        desk.handle(ord("4"), state)                          # System
+        desk.handle(260, state)                               # back to root
+        self.assertEqual(state.entries()[state.selected].label, "System")
+
+    def test_the_back_row_is_reachable_by_cursor(self):
+        # ncdu's "/.." — going back must be in the list, not only on a key.
+        state = make_state()
+        desk.handle(ord("3"), state)
+        state.selected = 0
+        self.assertTrue(state.entries()[0].back)
+        desk.handle(10, state)                                # Enter on ".."
+        self.assertEqual(state.path, [])
 
     def test_escape_walks_out_one_level_at_a_time(self):
         state = make_state()
@@ -127,7 +146,6 @@ class SubmenuTests(unittest.TestCase):
              mock.patch.object(registry, "kilix_command",
                                return_value=["/opt/kilix/kilix"]):
             state.section = desk.SECTIONS.index("Programs")
-            state.focus = "entries"
             entries = state.entries()
             index = next(i for i, e in enumerate(entries)
                          if e.submenu == "games")
@@ -136,8 +154,9 @@ class SubmenuTests(unittest.TestCase):
             self.assertEqual(state.submenu, "games")
             listed = state.entries()
             self.assertEqual([e.label for e in listed],
-                             ["Kilix Pong", "Doom"])
-            self.assertEqual([e.hint for e in listed], ["on", "off"])
+                             [desk.BACK_LABEL, "Kilix Pong", "Doom"])
+            self.assertEqual([e.hint for e in listed[1:]], ["on", "off"])
+            state.selected = 1                                # past ".."
             desk.handle(10, state)                            # flip Kilix Pong
             self.assertEqual(
                 quiet_calls,
@@ -149,7 +168,7 @@ class SubmenuTests(unittest.TestCase):
         state = make_state()
         state.submenu = "games"
         with mock.patch.object(registry, "games", return_value=None):
-            entries = state.entries()
+            entries = [entry for entry in state.entries() if not entry.back]
         self.assertEqual(len(entries), 1)
         self.assertIsNone(entries[0].argv)
 
@@ -158,11 +177,10 @@ class TextMouseTests(unittest.TestCase):
     def test_render_records_the_hit_map(self):
         state = make_state()
         state.section = desk.SECTIONS.index("Machine")
-        state.focus = "entries"
         app.render_to_text(desk.render, state)
-        self.assertTrue(state.text_hits["sections"])
         self.assertEqual(state.text_hits["bar_row"], 1)
         self.assertGreater(state.text_hits["visible"], 0)
+        self.assertIn("top", state.text_hits)
 
     def test_mouse_key_is_safe_without_curses(self):
         state = make_state()
@@ -293,16 +311,29 @@ class PowerTests(unittest.TestCase):
     def test_every_power_entry_confirms(self):
         state = make_state()
         state.section = desk.SECTIONS.index("Power")
-        self.assertTrue(state.entries())
-        for entry in state.entries():
+        actions = [entry for entry in state.entries() if not entry.back]
+        self.assertTrue(actions)
+        for entry in actions:
             self.assertTrue(entry.confirm)
+
+    def test_the_back_row_carries_no_command(self):
+        # The one row in Power that does not confirm must also be unable to
+        # run anything at all.
+        state = make_state()
+        state.section = desk.SECTIONS.index("Power")
+        back = state.entries()[0]
+        self.assertTrue(back.back)
+        self.assertIsNone(back.argv)
 
     def test_nothing_runs_on_a_single_keypress(self):
         calls = []
         state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
         state.section = desk.SECTIONS.index("Power")
-        state.focus = "entries"
-        state.selected = 1                                    # Reboot
+        # Select by label: an index would silently follow list changes and
+        # confirm a different action than the one this test names.
+        state.selected = next(
+            index for index, entry in enumerate(state.entries())
+            if entry.label == "Reboot")
         desk.handle(list(keymap.SELECT)[0], state)
         self.assertEqual(calls, [])
         self.assertIsNotNone(state.confirm)
@@ -356,11 +387,68 @@ class TangoTextTests(unittest.TestCase):
         # styling is a picture, not a guess.
         self.assertTrue(surface.attr_shape().strip())
 
-    def test_the_active_section_is_marked_in_text_not_only_colour(self):
+    def test_where_you_are_is_stated_in_text_not_only_colour(self):
+        # A monochrome terminal must still answer "where am I?", so the trail
+        # and the cursor are both characters, not attributes.
         state = make_state()
         state.section = 2
         text = app.render_to_text(desk.render, state)
-        self.assertIn("▶3Machine", text.replace(" ", ""))
+        self.assertIn("Kilix › Machine", text)
+        self.assertIn("▶", text)
+
+    def test_the_trail_grows_with_each_level(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Programs")
+        state.submenu = "games"
+        self.assertEqual(state.breadcrumb(), "Kilix › Programs › Games")
+        self.assertIn("Kilix › Programs › Games",
+                      app.render_to_text(desk.render, state))
+
+    def test_every_screen_shows_the_keys_and_a_tip(self):
+        state = make_state()
+        text = app.render_to_text(desk.render, state)
+        self.assertIn("? keys", text)
+        self.assertIn("q quit", text)
+        self.assertIn("tip", text)
+
+    def test_the_key_line_is_never_cut_off(self):
+        # The keys at the end of the line are the ones a stuck user needs.
+        for width in (40, 60, 80, 120):
+            line = keymap.footer(width)
+            self.assertLessEqual(len(line), width, f"width {width}")
+            self.assertTrue(line.endswith("q quit"), f"width {width}: {line}")
+
+    def test_question_mark_opens_the_key_overlay_and_any_key_closes_it(self):
+        state = make_state()
+        desk.handle(ord("?"), state)
+        self.assertTrue(state.help_open)
+        text = app.render_to_text(desk.render, state)
+        self.assertIn("Kilix TUI keys", text)
+        self.assertIn("jump straight to a section", text)   # a non-footer key
+        desk.handle(ord("x"), state)
+        self.assertFalse(state.help_open)
+
+    def test_slash_filters_the_list_and_escape_restores_it(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Machine")
+        full = len(state.entries())
+        desk.handle(ord("/"), state)
+        for letter in "mem":
+            desk.handle(ord(letter), state)
+        labels = [entry.label for entry in state.entries() if not entry.back]
+        self.assertEqual(labels, ["Memory"])
+        desk.handle(27, state)                                # Esc clears
+        self.assertEqual(state.filter, "")
+        self.assertEqual(len(state.entries()), full)
+
+    def test_filtering_never_hides_the_way_back(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Machine")
+        desk.handle(ord("/"), state)
+        for letter in "zzzz":
+            desk.handle(ord(letter), state)
+        self.assertEqual([e.label for e in state.entries()],
+                         [desk.BACK_LABEL])
 
     def test_confirm_shows_the_exact_command(self):
         state = make_state()
