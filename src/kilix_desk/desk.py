@@ -51,6 +51,7 @@ TIPS: dict[str, str] = {
     "System": "settings, desktops and updates for the whole stack",
     "Session": "panes, pages and transcripts of what this terminal has shown",
     "Power": "every action here asks before it runs",
+    "Software": "Enter installs; already-installed entries reinstall to their pin",
     "Games": "Enter toggles a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
 }
@@ -146,6 +147,9 @@ class State:
         self.quiet = quiet or _quiet_run
         self.live = live or kitty_rc.available
         self.status = facts.status_rows()
+        # `entries()` runs on every keystroke, so the installable list is
+        # fetched once per visit rather than per frame. `r` drops it.
+        self.software: list[dict] | None = None
         self.text_hits: dict = {}
 
     # ── views over `path`, kept for the pixel renderer and the tests ─────────
@@ -210,6 +214,8 @@ class State:
     def _place_entries(self) -> list[Entry]:
         if not self.path:
             return self._section_entries()
+        if self.submenu == "software":
+            return self._software_entries()
         if self.submenu == "games":
             return self._game_entries()
         if self.submenu == "screensavers":
@@ -252,6 +258,32 @@ class State:
                 count = len(registry.SECTIONS.get(name, ()))
                 hint = f"{count} entries" if count else ""
             out.append(Entry(name, None, submenu=name, hint=hint))
+        return out
+
+    def _software_entries(self) -> list[Entry]:
+        """Everything installable, as `kilix install` reports it."""
+        if self.software is None:
+            self.software = registry.installable()
+        rows = self.software
+        kilix = registry.kilix_command()
+        if rows is None or kilix is None:
+            return [Entry("the installable list needs a Kilix checkout", None,
+                          reason="`kilix install` was not reachable")]
+        if not rows:
+            return [Entry("nothing to install", None, reason="empty catalog")]
+        out: list[Entry] = []
+        for row in sorted(rows, key=lambda r: (r.get("kind", ""),
+                                               str(r.get("label", "")).lower())):
+            installed = bool(row.get("installed"))
+            identifier = str(row.get("id", ""))
+            label = str(row.get("label", identifier))
+            # Installed entries stay listed and stay selectable: re-running an
+            # install is how a pinned thing is brought back to its pin.
+            out.append(Entry(
+                f"{label}",
+                (*kilix, "install", identifier),
+                hint="installed" if installed else str(row.get("kind", "")),
+            ))
         return out
 
     def _game_entries(self) -> list[Entry]:
@@ -651,6 +683,7 @@ def handle(key: int, state: State) -> bool:
         return True
     if keymap.is_refresh(key):
         state.status = facts.status_rows()
+        state.software = None            # re-ask the launcher for the list
         state.message = ""
         return True
     return True

@@ -136,6 +136,66 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(desk.visible_window(3, 8, 2), 0)
 
 
+class SoftwarePlaceTests(unittest.TestCase):
+    """Installing is a place, and it keeps no catalogue of its own."""
+
+    ROWS = [
+        {"id": "claude", "label": "Claude Code", "kind": "agent",
+         "installed": True},
+        {"id": "doom", "label": "Doom", "kind": "game", "installed": False},
+    ]
+
+    def _state(self):
+        state = make_state()
+        state.path = ["Programs", "Software"]
+        return state
+
+    def test_the_list_comes_from_the_launcher_not_from_here(self):
+        with mock.patch.object(registry, "installable", return_value=self.ROWS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            labels = [e.label for e in self._state().entries()]
+        self.assertEqual(labels, [desk.BACK_LABEL, "Claude Code", "Doom"])
+
+    def test_enter_installs_through_that_same_command(self):
+        with mock.patch.object(registry, "installable", return_value=self.ROWS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            rows = self._state().entries()
+            doom = next(e for e in rows if e.label == "Doom")
+        self.assertEqual(doom.argv, ("/opt/kilix/kilix", "install", "doom"))
+
+    def test_installed_entries_stay_selectable(self):
+        """Re-running an install is how a pinned thing returns to its pin."""
+        with mock.patch.object(registry, "installable", return_value=self.ROWS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            rows = self._state().entries()
+            claude = next(e for e in rows if e.label == "Claude Code")
+        self.assertEqual(claude.hint, "installed")
+        self.assertIsNotNone(claude.argv)
+
+    def test_the_launcher_is_asked_once_per_visit_not_once_per_frame(self):
+        """`entries()` runs on every keystroke; shelling out there would crawl."""
+        with mock.patch.object(registry, "installable",
+                               return_value=self.ROWS) as ask, \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state = self._state()
+            for _ in range(20):
+                state.entries()
+            self.assertEqual(ask.call_count, 1)
+            desk.handle(ord("r"), state)
+            state.entries()
+            self.assertEqual(ask.call_count, 2, "r must re-ask")
+
+    def test_it_degrades_to_an_explanation_without_a_checkout(self):
+        with mock.patch.object(registry, "installable", return_value=None):
+            rows = [e for e in self._state().entries() if not e.back]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].argv)
+
+
 class SubmenuTests(unittest.TestCase):
     def test_games_drilldown_lists_and_flips_toggles(self):
         quiet_calls = []

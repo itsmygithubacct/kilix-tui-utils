@@ -67,6 +67,13 @@ Tools where typing is text — the calculator, the package and pane filters —
 pass `help_key=False` and keep `?` as an ordinary character rather than
 advertising a key that would do nothing.
 
+Programs ▸ **Install software** is a place, not a shortcut out to a command:
+it lists everything installable — the pinned catalog and the coding agents —
+with its installed state, filterable like any other list, and Enter installs
+the highlighted entry. The list comes from `kilix install --json` rather than
+from a catalogue kept here, because a second reader is a second thing to keep
+true. It is fetched once per visit and re-asked on `r`.
+
 Six sections: Home (status), Programs, Machine,
 System, Session, and Power — the last being the point: it closes the stack's
 no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions

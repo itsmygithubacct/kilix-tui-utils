@@ -56,7 +56,7 @@ PROGRAMS = (
     # The whole installable surface — catalog games and applications plus the
     # coding agents — behind the same command the CLI uses, so the desktop is
     # not a second list that can disagree with `kilix install`.
-    Item("Install software", kilix=("install",)),
+    Item("Install software", submenu="software"),
     Item("Games", submenu="games"),
     Item("Screensavers", submenu="screensavers", kilix_only=True),
     Item("Music", command="kilix-music", sibling="music"),
@@ -174,6 +174,33 @@ def screensavers() -> list[str]:
     except OSError:
         return []
     return names
+
+
+def installable() -> list[dict] | None:
+    """Everything `kilix install` offers, as it reports it.
+
+    The desktop asks the launcher rather than reading the catalog itself. There
+    is one list in this system and one thing that knows how to install from it;
+    a second reader here would be a second catalogue to keep true.
+    """
+    import json
+    import subprocess
+    launcher = kilix_command()
+    if launcher is None:
+        return None
+    try:
+        result = subprocess.run([*launcher, "install", "--json"],
+                                capture_output=True, text=True, timeout=30,
+                                check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        rows = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return rows if isinstance(rows, list) else None
 
 
 def kilix_command() -> list[str] | None:
