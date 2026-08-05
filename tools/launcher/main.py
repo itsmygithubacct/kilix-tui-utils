@@ -7,7 +7,10 @@ second list UI to show them. This is that catalog once, as a text tool any
 desktop opens in a tab (`kilix launcher`): stack programs from the desktop
 registry, discovered XDG applications through the host SDK's shared scanner
 (`kilix_sdk.xdgapps`, SDK 1.8), the user's desktop-folder launchers, the
-executable scripts the stack checkouts ship, and a run-a-command row.
+executable scripts the stack checkouts ship, a run-a-command row, and the
+laptop session profiles through the host's `kilix laptop` verb — running
+sessions marked from the shared run registry, Enter opening a stopped
+profile or closing a running one.
 
 Launching keeps the registry's discipline: fixed argv into a Kilix page when
 remote control is reachable, in place otherwise. Graphical applications go
@@ -31,7 +34,7 @@ sys.path.insert(0, os.path.join(
 from kilix_desk import registry, sources, tango  # noqa: E402
 from kilix_tui import app, keys as keymap, kitty_rc, shell  # noqa: E402
 
-SECTIONS = ("Stack", "Apps", "Launchers", "Scripts")
+SECTIONS = ("Stack", "Apps", "Launchers", "Scripts", "Laptop")
 RUN_LABEL = "Run a command…"
 
 
@@ -72,6 +75,7 @@ class Row:
     right: str = ""                       # right-hand column text
     reason: str = ""
     command_row: bool = False             # the run-a-command prompt
+    sync: bool = False                    # run in place, report, and refresh
 
 
 def _kilix() -> list[str] | None:
@@ -190,6 +194,75 @@ def script_dirs() -> list[str]:
             os.path.join(kilix_home, "scripts")]
 
 
+# ── the laptop section ───────────────────────────────────────────────────────
+
+_LAPTOP_VERB = None
+
+
+def _laptop_verb_available() -> bool:
+    """Whether the host's kilix knows `kilix laptop`, probed once the way
+    the games handoff probes `kilix games play`: run `kilix laptop help`,
+    bounded, and require the usage token — an old launcher forwards
+    unknown words to the terminal engine, so exit codes alone lie."""
+    global _LAPTOP_VERB
+    if _LAPTOP_VERB is not None:
+        return _LAPTOP_VERB
+    _LAPTOP_VERB = False
+    kilix = _kilix()
+    if kilix:
+        try:
+            probe = subprocess.run(
+                [*kilix, "laptop", "help"], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if probe.returncode == 0 and "open PROFILE" in probe.stdout:
+            _LAPTOP_VERB = True
+    return _LAPTOP_VERB
+
+
+def laptop_rows() -> list[Row]:
+    """The laptop session profiles, straight from `kilix laptop status` —
+    the host verb owns the shared run registry, so what this list calls
+    running is exactly what every desktop's laptop shows open. A running
+    profile's row closes its session; a stopped one opens it. Both run
+    in place (the verb returns once the work is handed off) and the
+    section refreshes to show the registry's new word."""
+    kilix = _kilix()
+    if not kilix or not _laptop_verb_available():
+        return [Row("No laptop profiles",
+                    reason="needs a Kilix with the `kilix laptop` verb")]
+    try:
+        report = subprocess.run(
+            [*kilix, "laptop", "status"], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return [Row("No laptop profiles",
+                    reason="`kilix laptop status` did not answer")]
+    if report.returncode != 0:
+        return [Row("No laptop profiles",
+                    reason="`kilix laptop status` did not answer")]
+    rows = []
+    for line in report.stdout.splitlines():
+        profile_id, _, state = line.partition(" ")
+        if not profile_id:
+            continue
+        if state.startswith("running"):
+            rows.append(Row(profile_id,
+                            argv=(*kilix, "laptop", "close", profile_id),
+                            right=f"{state} · Enter closes", sync=True))
+        elif state == "stopped" or state == "desktop":
+            rows.append(Row(profile_id,
+                            argv=(*kilix, "laptop", "open", profile_id),
+                            right=state, sync=True))
+        else:
+            rows.append(Row(profile_id, reason="profile does not parse"))
+    if not rows:
+        rows.append(Row("No profiles yet",
+                        reason="~/.local/gpu_terminal/laptop is empty"))
+    return rows
+
+
 def script_rows(dirs: list[str] | None = None) -> list[Row]:
     """Executable *.sh under the pleb/kilix scripts directories."""
     rows = []
@@ -247,6 +320,7 @@ class State:
             1: app_rows(),
             2: launcher_rows(),
             3: script_rows(),
+            4: laptop_rows(),
         }
 
     def rows(self) -> list[Row]:
@@ -348,6 +422,22 @@ def _launch(state: State, argv: tuple[str, ...], title: str) -> None:
     state.message = f"{title} exited {code}" if code else ""
 
 
+def _run_sync(state: State, row: Row) -> None:
+    """Laptop opens/closes run in place — the verb returns once the work
+    is handed off — and the section re-reads the registry's answer."""
+    try:
+        result = subprocess.run(
+            list(row.argv), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        state.message = f"{row.label}: kilix did not answer"
+        return
+    line = (result.stdout or result.stderr).strip().splitlines()
+    state.message = line[-1] if line else (
+        f"{row.label}: exited {result.returncode}")
+    state.rows_by_section[state.section] = laptop_rows()
+
+
 def _open(state: State) -> None:
     row = state.current()
     if row is None:
@@ -357,6 +447,9 @@ def _open(state: State) -> None:
         return
     if row.argv is None:
         state.message = row.reason
+        return
+    if row.sync:
+        _run_sync(state, row)
         return
     _launch(state, row.argv, row.label)
 

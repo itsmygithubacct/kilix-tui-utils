@@ -18,7 +18,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-system` | Static machine facts (`--print` for plain output) |
 | `kilix-volume` | Output volume and sink selection |
 | `kilix-file` | File manager — navigate and open, never delete or move |
-| `kilix-launcher` | Launcher catalog: stack programs, discovered XDG apps, your `.desktop` launchers, stack scripts, and a run-a-command row (`kilix launcher` opens it) |
+| `kilix-launcher` | Launcher catalog: stack programs, discovered XDG apps, your `.desktop` launchers, stack scripts, a run-a-command row, and the laptop session profiles (running ones marked, Enter opens or closes them through `kilix laptop`); `kilix launcher` opens it |
 | `kilix-package` | Installed packages, read-only |
 | `kilix-rollout-resume` | Recover Claude Code, Codex, and Kimi Code sessions; install and update those agents |
 | `kilix-session-log` | Pane transcripts across the live and archived tiers |
