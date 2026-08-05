@@ -52,6 +52,7 @@ TIPS: dict[str, str] = {
     "Session": "panes, pages and transcripts of what this terminal has shown",
     "Power": "every action here asks before it runs",
     "Software": "Enter installs; already-installed entries reinstall to their pin",
+    "Default desktop": "Enter chooses what every later session starts with",
     "Games": "Enter toggles a game on or off for the whole stack",
     "Games+play": "Enter plays; t turns a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
@@ -157,6 +158,7 @@ class State:
         # subprocess or a filesystem walk is fetched once per visit rather
         # than per frame. `r` drops all of it.
         self.software: list[dict] | None = None
+        self.default_desktop: str | None = None
         self.apps: dict[str, list[dict]] | None = None
         self.play_support: bool | None = None
         self.text_hits: dict = {}
@@ -223,6 +225,8 @@ class State:
     def _place_entries(self) -> list[Entry]:
         if not self.path:
             return self._section_entries()
+        if self.submenu == "default desktop":
+            return self._default_desktop_entries()
         if self.submenu == "software":
             return self._software_entries()
         if self.submenu == "games":
@@ -275,6 +279,32 @@ class State:
                 hint = f"{count} entries" if count else ""
             out.append(Entry(name, None, submenu=name, hint=hint))
         return out
+
+    DESKTOP_CHOICES = (
+        ("auto", "pick the best available at login"),
+        ("external", "Kilix 95"),
+        ("xp", "Kilix 95, XP styling"),
+        ("cap", "Kilix Cap, the mansion"),
+        ("tui", "Kilix TUI, this desktop"),
+        ("land", "Kilix Land, walkable"),
+        ("builtin", "the bundled compatibility desktop"),
+        ("none", "no desktop; a plain Kilix session"),
+    )
+
+    def _default_desktop_entries(self) -> list[Entry]:
+        """Choose the desktop every later session starts with."""
+        kilix = registry.kilix_command()
+        if kilix is None:
+            return [Entry("selecting a default needs a Kilix checkout", None,
+                          reason="`kilix default-desktop` was not reachable")]
+        if self.default_desktop is None:
+            self.default_desktop = registry.default_desktop() or "auto"
+        current = self.default_desktop
+        return [
+            Entry(f"{name}", (*kilix, "default-desktop", "set", name),
+                  hint="current" if name == current else why)
+            for name, why in self.DESKTOP_CHOICES
+        ]
 
     def _software_entries(self) -> list[Entry]:
         """Everything installable, as `kilix install` reports it."""
@@ -838,6 +868,7 @@ def handle(key: int, state: State) -> bool:
     if keymap.is_refresh(key):
         state.status = facts.status_rows()
         state.software = None            # re-ask the launcher for the list
+        state.default_desktop = None
         state.apps = None                # rescan the .desktop entries
         state.play_support = None        # re-probe the launcher's verbs
         state.message = ""

@@ -103,6 +103,10 @@ SYSTEM = (
     Item("Kilix Cap desktop", kilix=("desktop", "kilix-cap"), kilix_only=True),
     Item("Kilix Land desktop", kilix=("desktop", "kilix-land"),
          kilix_only=True),
+    # Which desktop every later session starts with. The entries above run one
+    # now; this is the one that persists the choice, and every desktop offers
+    # it so the answer does not depend on which desktop you happen to be in.
+    Item("Default desktop", submenu="default desktop"),
 )
 
 SESSION = (
@@ -239,6 +243,22 @@ def installable() -> list[dict] | None:
     except ValueError:
         return None
     return rows if isinstance(rows, list) else None
+
+
+def default_desktop() -> str | None:
+    """The desktop every later session starts with, as Kilix reports it."""
+    import subprocess
+    launcher = kilix_command()
+    if launcher is None:
+        return None
+    try:
+        result = subprocess.run([*launcher, "default-desktop", "show"],
+                                capture_output=True, text=True, timeout=15,
+                                check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = (result.stdout or "").strip().splitlines()
+    return value[-1].strip() if result.returncode == 0 and value else None
 
 
 def kilix_command() -> list[str] | None:

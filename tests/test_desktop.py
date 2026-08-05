@@ -136,6 +136,41 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(desk.visible_window(3, 8, 2), 0)
 
 
+class DefaultDesktopPlaceTests(unittest.TestCase):
+    """Choosing the desktop every later session starts with."""
+
+    def _state(self):
+        state = make_state()
+        state.path = ["System", "Default desktop"]
+        return state
+
+    def test_the_choices_are_offered_with_the_current_one_marked(self):
+        with mock.patch.object(registry, "default_desktop", return_value="tui"), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            rows = [e for e in self._state().entries() if not e.back]
+        names = [e.label for e in rows]
+        self.assertIn("tui", names)
+        self.assertIn("auto", names)
+        current = next(e for e in rows if e.label == "tui")
+        self.assertEqual(current.hint, "current")
+
+    def test_choosing_one_goes_through_the_launcher(self):
+        with mock.patch.object(registry, "default_desktop", return_value="auto"), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            rows = self._state().entries()
+            cap = next(e for e in rows if e.label == "cap")
+        self.assertEqual(cap.argv,
+                         ("/opt/kilix/kilix", "default-desktop", "set", "cap"))
+
+    def test_it_degrades_without_a_checkout(self):
+        with mock.patch.object(registry, "kilix_command", return_value=None):
+            rows = [e for e in self._state().entries() if not e.back]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].argv)
+
+
 class SoftwarePlaceTests(unittest.TestCase):
     """Installing is a place, and it keeps no catalogue of its own."""
 
