@@ -1,22 +1,37 @@
-"""Freedesktop application discovery — the data half, no UI.
+"""Freedesktop application discovery, shared by every desktop and tool.
 
-This is Kilix 95's `xdgapps.py` discovery layer, carried into the shared TUI
-core so every text surface (the desktop's Applications place today, a catalog
-tool tomorrow) reads the same list the pixel desktop shows. Only the scan
-lives here: parsing `.desktop` files from `$XDG_DATA_HOME`/`$XDG_DATA_DIRS`,
-locale-aware names, `TryExec` filtering, `Exec` field-code stripping, and the
-category → bucket mapping. What to *do* with an entry — page, in place,
-`kilix run` — stays with the caller, because that is a per-surface decision.
+The scanner Kilix 95's Start menu has always used, promoted to the SDK so a
+launcher catalog is one implementation instead of one per desktop: it reads
+installed application ``.desktop`` files from the standard XDG data locations
+(the same way an XFCE/garcon menu does) and exposes them, grouped by
+freedesktop category.
+
+No UI and no launching here — pure stdlib, driven entirely by
+``$XDG_DATA_HOME`` / ``$XDG_DATA_DIRS`` (spec defaults when unset); nothing
+about the host machine is hardcoded.  ``scan()`` returns parsed entry dicts,
+``grouped()`` buckets them, ``entries_in()`` reads one folder of launchers,
+``parse_desktop_file()`` reads one file so user launchers (a desktop folder
+of ``.desktop`` files) share the same parser.  How an entry is *opened* stays
+with each consumer, because that is where the paradigms genuinely differ.
 
 The scan is cached on the mtimes of every applications directory and
-`.desktop` file, so calling `scan()` per frame costs a handful of `stat`s
-until something actually changes.
-"""
-from __future__ import annotations
+``.desktop`` file, so calling ``scan()`` or ``grouped()`` per frame costs a
+handful of ``stat`` calls until something actually changes.
 
+This module is deliberately location-independent — pure stdlib, no
+intra-package imports — because it exists twice by design: authored here in
+``kilix_sdk`` and mirrored byte-for-byte into the shared TUI core
+(kilix-tui-utils ``src/kilix_tui/xdgapps.py``, kept in step by that repo's
+``tools/sync_xdgapps.py`` and pinned by its parity test) so the TUI stack
+stays standalone-installable.
+
+Added in SDK 1.8; ``entries_in()`` and ``grouped(force=)`` added in SDK 1.9.
+"""
 import os
 import shutil
 
+# freedesktop main category → kilix bucket, in match priority order (a more
+# specific category wins over the generic Utility/System catch-alls)
 _CATEGORY_BUCKETS = [
     ("Game", "Games"),
     ("Graphics", "Graphics"),
@@ -32,11 +47,11 @@ _CATEGORY_BUCKETS = [
     ("Utility", "Accessories"),
 ]
 
-# Stable display order for grouped().
+# stable display order for grouped()
 BUCKET_ORDER = ["Accessories", "Development", "Education", "Games", "Graphics",
                 "Internet", "Multimedia", "Office", "System", "Other"]
 
-# Exec field codes to strip (%% is a literal percent).
+# Exec field codes to strip (%% is a literal percent)
 _FIELD_CODES = "fFuUichkdDnNvm"
 
 _cache = None
@@ -64,7 +79,7 @@ def app_dirs():
 
 # ── parsing ──────────────────────────────────────────────────────────────────
 
-def _unescape(v):
+def unescape(v):
     """Desktop Entry string escapes: \\s \\n \\t \\r \\\\."""
     out, i, n = [], 0, len(v)
     while i < n:
@@ -79,9 +94,9 @@ def _unescape(v):
     return "".join(out)
 
 
-def _strip_field_codes(exec_str):
-    # Collapse only the whitespace a removed field code left dangling; keep
-    # runs of spaces that belong to a (quoted) argument intact.
+def strip_field_codes(exec_str):
+    # collapse only the whitespace a removed field code left dangling; keep
+    # runs of spaces that belong to a (quoted) argument intact
     out, i, n = [], 0, len(exec_str)
     while i < n:
         c = exec_str[i]
@@ -105,7 +120,7 @@ def _strip_field_codes(exec_str):
     return "".join(out).strip()
 
 
-def _parse_file(path):
+def parse_desktop_file(path):
     """Return the [Desktop Entry] key→value dict, or None if unreadable.
     First value wins for a repeated key; only the Desktop Entry group."""
     entry, in_group = {}, False
@@ -151,7 +166,7 @@ def _locale_variants():
     return out
 
 
-def _localized(entry, key):
+def localized(entry, key):
     for loc in _locale_variants():
         v = entry.get("%s[%s]" % (key, loc))
         if v is not None:
@@ -159,42 +174,42 @@ def _localized(entry, key):
     return entry.get(key)
 
 
-def _truthy(v):
+def truthy(v):
     return str(v).strip().lower() == "true"
 
 
 def _tryexec_ok(prog):
     if not prog:
         return True
-    prog = _unescape(prog)
+    prog = unescape(prog)
     if os.path.isabs(prog):
         return os.path.isfile(prog) and os.access(prog, os.X_OK)
     return shutil.which(prog) is not None
 
 
-def _build_entry(p, path, fid):
+def build_entry(p, path, fid):
     """A parsed dict → an entry dict, or None if the spec says to skip it."""
     if p.get("Type") != "Application":
         return None
-    if _truthy(p.get("NoDisplay")) or _truthy(p.get("Hidden")):
+    if truthy(p.get("NoDisplay")) or truthy(p.get("Hidden")):
         return None
     if not _tryexec_ok(p.get("TryExec")):
         return None
     exec_raw = p.get("Exec")
     if not exec_raw:
         return None
-    name = (_localized(p, "Name")
+    name = (localized(p, "Name")
             or os.path.splitext(os.path.basename(path))[0])
-    cats = [c for c in _unescape(p.get("Categories", "")).split(";") if c]
+    cats = [c for c in unescape(p.get("Categories", "")).split(";") if c]
     return {
         "id": fid,
-        "name": _unescape(name),
-        "exec": _strip_field_codes(_unescape(exec_raw)),
+        "name": unescape(name),
+        "exec": strip_field_codes(unescape(exec_raw)),
         "icon": p.get("Icon", ""),
         "categories": cats,
-        "terminal": _truthy(p.get("Terminal")),
+        "terminal": truthy(p.get("Terminal")),
         "path": path,
-        "workdir": _unescape(p.get("Path", "")),
+        "workdir": unescape(p.get("Path", "")),
     }
 
 
@@ -246,11 +261,11 @@ def scan(force=False):
         for path, fid in _walk(d):
             if fid in seen:                 # a higher-precedence dir won
                 continue
-            parsed = _parse_file(path)
+            parsed = parse_desktop_file(path)
             if parsed is None:              # unreadable: let a lower dir try
                 continue
             seen.add(fid)
-            e = _build_entry(parsed, path, fid)
+            e = build_entry(parsed, path, fid)
             if e is not None:
                 entries.append(e)
     entries.sort(key=lambda e: e["name"].lower())
@@ -259,11 +274,11 @@ def scan(force=False):
 
 
 def entries_in(directory):
-    """Parsed entries from one folder of `.desktop` files, name-sorted.
+    """Parsed entries from one folder of ``.desktop`` files, name-sorted.
 
     No recursion and no cache: this is for a user's desktop-launcher folder
-    (the files Kilix 95's Create Launcher wizard writes), which is small and
-    read at the moment it is shown, not for the XDG application dirs.
+    (the files a Create Launcher wizard writes), which is small and read at
+    the moment it is shown, not for the XDG application dirs.
     """
     out = []
     try:
@@ -274,10 +289,10 @@ def entries_in(directory):
         if not fn.endswith(".desktop"):
             continue
         path = os.path.join(directory, fn)
-        parsed = _parse_file(path)
+        parsed = parse_desktop_file(path)
         if parsed is None:
             continue
-        entry = _build_entry(parsed, path, fn)
+        entry = build_entry(parsed, path, fn)
         if entry is not None:
             out.append(entry)
     out.sort(key=lambda e: e["name"].lower())
@@ -300,3 +315,19 @@ def grouped(force=False):
     for e in scan(force):
         out.setdefault(bucket(e), []).append(e)
     return {b: out[b] for b in BUCKET_ORDER if b in out}
+
+
+__all__ = [
+    "BUCKET_ORDER",
+    "app_dirs",
+    "bucket",
+    "build_entry",
+    "entries_in",
+    "grouped",
+    "localized",
+    "parse_desktop_file",
+    "scan",
+    "strip_field_codes",
+    "truthy",
+    "unescape",
+]

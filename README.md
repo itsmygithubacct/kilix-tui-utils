@@ -82,7 +82,9 @@ into a Kilix page when remote control is live and in place otherwise, with
 pipes refused by name rather than half-working. **Applications** lists what
 the machine itself advertises: freedesktop `.desktop` entries discovered
 exactly the way Kilix 95's Start menu discovers them (`kilix_tui/xdgapps.py`,
-shared so a future catalog tool cannot disagree with this list), bucketed by
+a byte-identical mirror of the host SDK's `kilix_sdk.xdgapps` kept by
+`tools/sync_xdgapps.py` and pinned by a parity test, so no desktop or
+catalog tool can disagree with this list), bucketed by
 category; terminal apps launch like any tool, graphical ones are contained in
 a `kilix run` page. And **Games** launches on Enter when the installed
 launcher knows `kilix games play` — probed from its own usage line, cached per
