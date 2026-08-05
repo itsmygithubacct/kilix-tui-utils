@@ -325,6 +325,32 @@ class SharedShellTests(unittest.TestCase):
                    help_key=False)
         self.assertNotIn("? keys", str(surface))
 
+    def test_the_help_key_never_displaces_the_way_out(self):
+        """`? keys` goes before the tool's last binding, not after it.
+
+        Appending it pushed "q quit" out of the one position `fit` protects,
+        and the trimmer then dropped quitting while keeping the help key — on
+        the widest tool in the suite, at ordinary terminal widths.
+        """
+        footer = ("Enter resume · x tmux · A attach · Space mark · R restore "
+                  "· / filter · y yolo · q quit")
+        for width in (95, 70, 50, 34, 20):
+            surface = app.TextSurface(height=12, width=width)
+            shell.draw(surface, title="Rollout Resume", footer=footer)
+            last = str(surface).splitlines()[-1]
+            self.assertIn("quit", last, f"width {width}: {last!r}")
+            self.assertLessEqual(len(last), width)
+
+    def test_the_desktop_home_place_shows_its_way_back(self):
+        """Home is a place, so the row that leaves it must be on screen."""
+        from kilix_desk import desk
+        state = desk.State(live=lambda: False)
+        state.path = ["Home"]
+        text = app.render_to_text(desk.render, state, height=18, width=76)
+        body = "\n".join(text.splitlines()[4:])
+        self.assertIn("..", body,
+                      "the cursor sat on a back row nothing drew")
+
     def test_the_overlay_is_built_from_the_tool_own_key_line(self):
         surface = app.TextSurface(height=20, width=76)
         shell.draw(surface, title="Disk",

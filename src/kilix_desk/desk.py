@@ -408,7 +408,11 @@ def render(surface, state: State) -> None:
             _put(surface, body.top + 1, body.left + 1,
                  f"$ {' '.join(argv)}"[: body.width - 1], tango.attr("muted"))
     elif state.place() == "Home":
-        _draw_home(surface, state, body.top, body.height, width)
+        # Home is a place like any other, so the way out of it has to be on
+        # screen. Drawing only the status rows left the cursor sitting on a
+        # ".." the user could not see: Enter went back, and nothing said so.
+        _draw_entries(surface, state, body.top, 1, width)
+        _draw_home(surface, state, body.top + 2, max(0, body.height - 2), width)
     else:
         _draw_entries(surface, state, body.top, body.height, width)
 

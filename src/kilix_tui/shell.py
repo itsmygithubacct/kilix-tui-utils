@@ -288,7 +288,14 @@ def draw(
     # advertise a key that does nothing there.
     line = str(footer)
     if line and help_key and "?" not in line:
-        line = f"{line} · ? keys"
+        # Inserted before the final segment, never after it. Appending pushed
+        # the tool's own last binding — almost always "q quit" — out of the one
+        # position `fit` protects, and the trimmer then dropped the way out of
+        # the tool while keeping the help key. The end of the line is reserved
+        # for quitting.
+        parts = line.split(" · ")
+        parts.insert(max(0, len(parts) - 1), "? keys")
+        line = " · ".join(parts)
     line = fit(line, inner_width)
     put(surface, height - 1, left, line, tango.attr("muted"))
 
