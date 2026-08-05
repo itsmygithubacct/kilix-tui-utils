@@ -136,13 +136,77 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(desk.visible_window(3, 8, 2), 0)
 
 
+class SoftwarePlaceTests(unittest.TestCase):
+    """Installing is a place, and it keeps no catalogue of its own."""
+
+    ROWS = [
+        {"id": "claude", "label": "Claude Code", "kind": "agent",
+         "installed": True},
+        {"id": "doom", "label": "Doom", "kind": "game", "installed": False},
+    ]
+
+    def _state(self):
+        state = make_state()
+        state.path = ["Programs", "Software"]
+        return state
+
+    def test_the_list_comes_from_the_launcher_not_from_here(self):
+        with mock.patch.object(registry, "installable", return_value=self.ROWS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            labels = [e.label for e in self._state().entries()]
+        self.assertEqual(labels, [desk.BACK_LABEL, "Claude Code", "Doom"])
+
+    def test_enter_installs_through_that_same_command(self):
+        with mock.patch.object(registry, "installable", return_value=self.ROWS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            rows = self._state().entries()
+            doom = next(e for e in rows if e.label == "Doom")
+        self.assertEqual(doom.argv, ("/opt/kilix/kilix", "install", "doom"))
+
+    def test_installed_entries_stay_selectable(self):
+        """Re-running an install is how a pinned thing returns to its pin."""
+        with mock.patch.object(registry, "installable", return_value=self.ROWS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            rows = self._state().entries()
+            claude = next(e for e in rows if e.label == "Claude Code")
+        self.assertEqual(claude.hint, "installed")
+        self.assertIsNotNone(claude.argv)
+
+    def test_the_launcher_is_asked_once_per_visit_not_once_per_frame(self):
+        """`entries()` runs on every keystroke; shelling out there would crawl."""
+        with mock.patch.object(registry, "installable",
+                               return_value=self.ROWS) as ask, \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state = self._state()
+            for _ in range(20):
+                state.entries()
+            self.assertEqual(ask.call_count, 1)
+            desk.handle(ord("r"), state)
+            state.entries()
+            self.assertEqual(ask.call_count, 2, "r must re-ask")
+
+    def test_it_degrades_to_an_explanation_without_a_checkout(self):
+        with mock.patch.object(registry, "installable", return_value=None):
+            rows = [e for e in self._state().entries() if not e.back]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].argv)
+
+
 class SubmenuTests(unittest.TestCase):
     def test_games_drilldown_lists_and_flips_toggles(self):
+        # An older launcher without `games play`: Enter stays the toggle so
+        # the list is never a dead end.
         quiet_calls = []
         state = make_state(quiet=lambda argv: quiet_calls.append(argv) or 0)
         games = [("kilix-pong", "Kilix Pong", True),
                  ("doom", "Doom", False)]
         with mock.patch.object(registry, "games", return_value=games), \
+             mock.patch.object(registry, "games_play_supported",
+                               return_value=False), \
              mock.patch.object(registry, "kilix_command",
                                return_value=["/opt/kilix/kilix"]):
             state.section = desk.SECTIONS.index("Programs")
@@ -164,6 +228,47 @@ class SubmenuTests(unittest.TestCase):
             self.assertTrue(desk.handle(27, state))           # Esc pops
             self.assertIsNone(state.submenu)
 
+    def test_games_launch_when_the_host_knows_play(self):
+        # A launcher that advertises `play`: Enter starts the game and `t`
+        # keeps the availability toggle one key away.
+        run_calls = []
+        quiet_calls = []
+        state = make_state(runner=lambda argv: run_calls.append(argv) or 0,
+                           quiet=lambda argv: quiet_calls.append(argv) or 0)
+        games = [("kilix-pong", "Kilix Pong", True)]
+        with mock.patch.object(registry, "games", return_value=games), \
+             mock.patch.object(registry, "games_play_supported",
+                               return_value=True), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state.submenu = "games"
+            listed = state.entries()
+            self.assertEqual([e.hint for e in listed[1:]], ["on"])
+            state.selected = 1
+            desk.handle(10, state)                            # Enter plays
+            self.assertEqual(
+                run_calls,
+                [("/opt/kilix/kilix", "games", "play", "kilix-pong")])
+            desk.handle(ord("t"), state)                      # t still flips
+            self.assertEqual(
+                quiet_calls,
+                [("/opt/kilix/kilix", "games", "disable", "kilix-pong")])
+
+    def test_the_play_probe_is_asked_once_per_visit(self):
+        state = make_state()
+        probes = []
+        with mock.patch.object(registry, "games",
+                               return_value=[("doom", "Doom", True)]), \
+             mock.patch.object(registry, "games_play_supported",
+                               side_effect=lambda k: probes.append(k) or True), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state.submenu = "games"
+            state.entries()
+            state.entries()
+            state.entries()
+        self.assertEqual(len(probes), 1)
+
     def test_submenus_degrade_without_a_kilix_checkout(self):
         state = make_state()
         state.submenu = "games"
@@ -171,6 +276,155 @@ class SubmenuTests(unittest.TestCase):
             entries = [entry for entry in state.entries() if not entry.back]
         self.assertEqual(len(entries), 1)
         self.assertIsNone(entries[0].argv)
+
+
+class RunCommandTests(unittest.TestCase):
+    def test_bang_opens_the_prompt_and_enter_runs_the_argv(self):
+        calls = []
+        state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
+        desk.handle(ord("!"), state)
+        self.assertTrue(state.running_prompt)
+        for ch in "echo hi":
+            desk.handle(ord(ch), state)
+        desk.handle(10, state)
+        self.assertEqual(calls, [("echo", "hi")])
+        self.assertFalse(state.running_prompt)
+
+    def test_the_programs_row_opens_the_same_prompt(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Programs")
+        entries = state.entries()
+        index = next(i for i, e in enumerate(entries) if e.prompt)
+        state.selected = index
+        desk.handle(10, state)
+        self.assertTrue(state.running_prompt)
+
+    def test_quoting_splits_like_a_shell_but_never_uses_one(self):
+        calls = []
+        state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
+        desk.handle(ord("!"), state)
+        for ch in 'printf "two words"':
+            desk.handle(ord(ch), state)
+        desk.handle(10, state)
+        self.assertEqual(calls, [("printf", "two words")])
+
+    def test_shell_operators_are_refused_with_a_reason(self):
+        state = make_state(runner=lambda argv: self.fail("must not run"))
+        desk.handle(ord("!"), state)
+        for ch in "ls | wc":
+            desk.handle(ord(ch), state)
+        desk.handle(10, state)
+        self.assertIn("pipes", state.message)
+        self.assertFalse(state.running_prompt)
+
+    def test_escape_cancels_without_running(self):
+        state = make_state(runner=lambda argv: self.fail("must not run"))
+        desk.handle(ord("!"), state)
+        for ch in "reboot":
+            desk.handle(ord(ch), state)
+        desk.handle(27, state)
+        self.assertFalse(state.running_prompt)
+        self.assertEqual(state.command, "")
+
+    def test_an_empty_enter_just_closes_the_prompt(self):
+        state = make_state(runner=lambda argv: self.fail("must not run"))
+        desk.handle(ord("!"), state)
+        desk.handle(10, state)
+        self.assertFalse(state.running_prompt)
+        self.assertEqual(state.message, "")
+
+    def test_the_prompt_echoes_and_backspace_edits(self):
+        state = make_state()
+        desk.handle(ord("!"), state)
+        for ch in "top":
+            desk.handle(ord(ch), state)
+        self.assertIn("$ top", state.message)
+        desk.handle(263, state)                               # Backspace
+        self.assertIn("$ to", state.message)
+
+    def test_the_footer_and_tip_explain_the_prompt(self):
+        state = make_state()
+        desk.handle(ord("!"), state)
+        self.assertIn("Enter runs it", desk.footer(state))
+        self.assertIn("page", state.tip())
+
+
+class ApplicationsPlaceTests(unittest.TestCase):
+    APPS = {
+        "Internet": [
+            {"id": "firefox.desktop", "name": "Firefox",
+             "exec": "firefox --new-window", "terminal": False},
+        ],
+        "Accessories": [
+            {"id": "htop.desktop", "name": "htop",
+             "exec": "htop", "terminal": True},
+        ],
+    }
+
+    def test_buckets_list_at_the_first_level(self):
+        state = make_state()
+        with mock.patch.object(registry, "applications",
+                               return_value=self.APPS):
+            state.submenu = "applications"
+            listed = state.entries()
+        self.assertEqual([e.label for e in listed],
+                         [desk.BACK_LABEL, "Internet", "Accessories"])
+        self.assertEqual([e.hint for e in listed[1:]],
+                         ["1 apps", "1 apps"])
+
+    def test_terminal_apps_launch_directly(self):
+        calls = []
+        state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
+        with mock.patch.object(registry, "applications",
+                               return_value=self.APPS):
+            state.path = ["Programs", "Applications", "Accessories"]
+            state.selected = 1                                # past ".."
+            desk.handle(10, state)
+        self.assertEqual(calls, [("htop",)])
+
+    def test_gui_apps_are_contained_by_kilix_run(self):
+        calls = []
+        state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
+        with mock.patch.object(registry, "applications",
+                               return_value=self.APPS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state.path = ["Programs", "Applications", "Internet"]
+            state.selected = 1
+            desk.handle(10, state)
+        self.assertEqual(calls, [("/opt/kilix/kilix", "run",
+                                  "firefox", "--new-window")])
+
+    def test_gui_apps_degrade_without_a_kilix_checkout(self):
+        state = make_state(runner=lambda argv: self.fail("must not run"))
+        with mock.patch.object(registry, "applications",
+                               return_value=self.APPS), \
+             mock.patch.object(registry, "kilix_command", return_value=None):
+            state.path = ["Programs", "Applications", "Internet"]
+            rows = [e for e in state.entries() if not e.back]
+        self.assertIsNone(rows[0].argv)
+        self.assertIn("Kilix", rows[0].reason)
+
+    def test_an_empty_catalog_is_a_state_not_an_error(self):
+        state = make_state()
+        with mock.patch.object(registry, "applications", return_value={}):
+            state.submenu = "applications"
+            rows = [e for e in state.entries() if not e.back]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].argv)
+
+    def test_the_scan_is_asked_once_per_visit_and_refresh_drops_it(self):
+        state = make_state()
+        asks = []
+        with mock.patch.object(registry, "applications",
+                               side_effect=lambda: asks.append(1) or self.APPS):
+            state.submenu = "applications"
+            state.entries()
+            state.entries()
+            self.assertEqual(len(asks), 1)
+            desk.handle(ord("r"), state)
+            state.entries()
+        self.assertEqual(len(asks), 2)
 
 
 class TextMouseTests(unittest.TestCase):

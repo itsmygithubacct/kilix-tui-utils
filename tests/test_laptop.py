@@ -1,163 +1,109 @@
-"""kilix-launcher's Laptop section: the host verb's registry, in a list.
+"""kilix-launcher's laptop rows: the host verb's registry, in the catalog.
 
-The laptop session profiles live host-side (`kilix laptop`, which owns
-the shared run registry beside ~/.local/gpu_terminal/laptop). This
-section is deliberately thin: it probes the verb before believing it
-exists — an old launcher forwards unknown words to the terminal engine,
-so exit codes alone lie — renders exactly what `kilix laptop status`
-reports, and maps Enter to `open` for a stopped profile and `close` for
-a running one, run in place with the section refreshed from the
-registry's new answer. These tests pin that thinness: no probe, no
-rows; a fake verb's report renders verbatim; the actions are the exact
-argv the host documents.
+The laptop session profiles live host-side (`kilix laptop`, which owns the
+shared run registry beside ~/.local/gpu_terminal/laptop). The rows are
+deliberately thin: the verb is probed before it is believed — an old
+launcher forwards unknown words to the terminal engine, so exit codes alone
+lie — `kilix laptop status` renders verbatim, and Enter maps to `open` for
+a stopped profile and `close` for a running one, run in place with the
+catalog refreshed from the registry's new answer. These tests pin that
+thinness.
 """
-import importlib.util
-import os
-import stat
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tools" / "launcher"))
 
-from kilix_tui import app  # noqa: E402
+import main as launcher  # noqa: E402
 
-
-def load():
-    path = ROOT / "tools" / "launcher" / "main.py"
-    spec = importlib.util.spec_from_file_location("tool_launcher_laptop",
-                                                  path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+KILIX = ["/opt/kilix/kilix"]
+USAGE = "usage: kilix laptop [list|open PROFILE|status|close PROFILE]"
 
 
-FAKE_KILIX = """#!/bin/sh
-[ "$1" = laptop ] || exit 2
-case "$2" in
-  help)
-    echo "usage: kilix laptop [list|open PROFILE|status|close PROFILE]"
-    exit 0 ;;
-  status)
-    echo "bench running (pid 4242)"
-    echo "house desktop"
-    echo "notes stopped"
-    echo "broken invalid"
-    exit 0 ;;
-  open|close)
-    echo "$2 $3" >> "$KILIX_LAPTOP_TEST_LOG"
-    echo "laptop $3: ${2}ed"
-    exit 0 ;;
-esac
-exit 2
-"""
+def completed(stdout="", rc=0, stderr=""):
+    return mock.Mock(returncode=rc, stdout=stdout, stderr=stderr)
 
 
-class LaptopSectionTests(unittest.TestCase):
+class LaptopRowTests(unittest.TestCase):
     def setUp(self):
-        self.launcher = load()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.kilix = Path(self.tmp.name) / "kilix"
-        self.kilix.write_text(FAKE_KILIX)
-        self.kilix.chmod(self.kilix.stat().st_mode | stat.S_IEXEC)
-        self.log = Path(self.tmp.name) / "actions.log"
-        os.environ["KILIX_LAPTOP_TEST_LOG"] = str(self.log)
-        self.addCleanup(os.environ.pop, "KILIX_LAPTOP_TEST_LOG", None)
+        launcher._LAPTOP_VERB = None
 
-    def _with_fake_kilix(self):
-        self.launcher._LAPTOP_VERB = None
-        return mock.patch.object(self.launcher, "_kilix",
-                                 lambda: [str(self.kilix)])
-
-    def test_laptop_is_a_catalog_section(self):
-        self.assertIn("Laptop", self.launcher.SECTIONS)
-        # Appended, so the four original sections keep their numbers.
-        self.assertEqual(self.launcher.SECTIONS.index("Laptop"), 4)
-
-    def test_no_verb_degrades_to_a_reason_row(self):
-        # A host that predates `kilix laptop` gets a row that says so —
-        # the SDK-1.8 degradation idiom, not a failure.
-        self.launcher._LAPTOP_VERB = None
-        with mock.patch.object(self.launcher, "_kilix", lambda: None):
-            rows = self.launcher.laptop_rows()
-        self.assertEqual(len(rows), 1)
-        self.assertIsNone(rows[0].argv)
-        self.assertIn("kilix laptop", rows[0].reason)
+    def tearDown(self):
+        launcher._LAPTOP_VERB = None
 
     def test_probe_requires_the_usage_token(self):
-        # Exit 0 without the token must read as "no verb": an old kilix
-        # hands unknown words to the engine, which may exit 0 too.
-        chatty = Path(self.tmp.name) / "chatty"
-        chatty.write_text("#!/bin/sh\necho something else\nexit 0\n")
-        chatty.chmod(chatty.stat().st_mode | stat.S_IEXEC)
-        self.launcher._LAPTOP_VERB = None
-        with mock.patch.object(self.launcher, "_kilix",
-                               lambda: [str(chatty)]):
-            self.assertFalse(self.launcher._laptop_verb_available())
+        # Exit 0 without the token is an old launcher echoing something else.
+        with mock.patch.object(launcher.subprocess, "run",
+                               return_value=completed(stdout="who?")):
+            self.assertFalse(launcher._laptop_verb_available(KILIX))
+        launcher._LAPTOP_VERB = None
+        with mock.patch.object(launcher.subprocess, "run",
+                               return_value=completed(stdout=USAGE)):
+            self.assertTrue(launcher._laptop_verb_available(KILIX))
+
+    def test_no_verb_degrades_to_a_reason_row(self):
+        rows = launcher.laptop_rows(None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "note")
+        self.assertIn("kilix laptop", rows[0]["detail"])
+        self.assertNotIn("action", rows[0])
 
     def test_status_report_becomes_rows(self):
-        with self._with_fake_kilix():
-            rows = self.launcher.laptop_rows()
-        by_label = {row.label: row for row in rows}
-        self.assertEqual(set(by_label),
-                         {"bench", "house", "notes", "broken"})
-        running = by_label["bench"]
-        self.assertIn("running (pid 4242)", running.right)
-        self.assertIn("Enter closes", running.right)
-        self.assertEqual(running.argv[-3:], ("laptop", "close", "bench"))
-        self.assertTrue(running.sync)
-        stopped = by_label["notes"]
-        self.assertEqual(stopped.right, "stopped")
-        self.assertEqual(stopped.argv[-3:], ("laptop", "open", "notes"))
-        self.assertTrue(stopped.sync)
-        self.assertEqual(by_label["house"].right, "desktop")
-        self.assertEqual(by_label["house"].argv[-3:],
-                         ("laptop", "open", "house"))
-        self.assertIsNone(by_label["broken"].argv)
+        answers = [completed(stdout=USAGE),
+                   completed(stdout="coding running (pid 4242)\n"
+                                    "remote-ops stopped\n"
+                                    "cap-desk desktop\n")]
+        with mock.patch.object(launcher.subprocess, "run",
+                               side_effect=answers):
+            rows = launcher.laptop_rows(KILIX)
+        by = {r["label"]: r for r in rows}
+        self.assertEqual(by["coding"]["action"],
+                         [*KILIX, "laptop", "close", "coding"])
+        self.assertIn("Enter closes", by["coding"]["detail"])
+        self.assertIn("running (pid 4242)", by["coding"]["detail"])
+        self.assertEqual(by["remote-ops"]["action"],
+                         [*KILIX, "laptop", "open", "remote-ops"])
+        self.assertEqual(by["cap-desk"]["action"],
+                         [*KILIX, "laptop", "open", "cap-desk"])
 
     def test_enter_runs_the_action_in_place_and_refreshes(self):
-        with self._with_fake_kilix():
-            state = self.launcher.State(live=lambda: False)
-            state.section = self.launcher.SECTIONS.index("Laptop")
-            state.rows_by_section = {
-                state.section: self.launcher.laptop_rows()}
-            rows = state.rows()
-            state.cursor = next(i for i, row in enumerate(rows)
-                                if row.label == "bench")
-            self.launcher._open(state)
-        self.assertEqual(self.log.read_text().strip(), "close bench")
-        self.assertEqual(state.message, "laptop bench: closeed")
-        # The section was re-read from the registry, not left stale.
-        self.assertTrue(state.rows_by_section[state.section])
+        row = {"kind": "laptop", "label": "coding",
+               "detail": "running (pid 4242) · Enter closes",
+               "action": [*KILIX, "laptop", "close", "coding"]}
+        state = launcher.State.__new__(launcher.State)
+        state.all = [row]
+        state.filter = ""
+        state.selected = 0
+        state.command = None
+        state.message = ""
+        calls = []
 
-    def test_open_action_reaches_the_verb(self):
-        with self._with_fake_kilix():
-            state = self.launcher.State(live=lambda: False)
-            state.section = self.launcher.SECTIONS.index("Laptop")
-            state.rows_by_section = {
-                state.section: self.launcher.laptop_rows()}
-            rows = state.rows()
-            state.cursor = next(i for i, row in enumerate(rows)
-                                if row.label == "notes")
-            self.launcher._open(state)
-        self.assertEqual(self.log.read_text().strip(), "open notes")
+        def record(argv, **_kwargs):
+            calls.append(list(argv))
+            return completed()
 
-    def test_laptop_section_renders_headlessly(self):
-        with self._with_fake_kilix():
-            state = self.launcher.State(live=lambda: False)
-            state.section = self.launcher.SECTIONS.index("Laptop")
-            state.rows_by_section = {
-                state.section: self.launcher.laptop_rows()}
-            frame = app.render_to_text(self.launcher.render, state,
-                                       height=24, width=100)
-        self.assertIn("Laptop", frame)
-        self.assertIn("bench", frame)
-        self.assertIn("Enter closes", frame)
+        with mock.patch.object(launcher.subprocess, "run",
+                               side_effect=record), \
+                mock.patch.object(launcher, "rows",
+                                  return_value=[]) as refreshed, \
+                mock.patch.object(launcher.os, "execvp",
+                                  side_effect=AssertionError("must not exec")):
+            self.assertTrue(launcher.activate(state))
+        self.assertEqual(calls, [[*KILIX, "laptop", "close", "coding"]])
+        refreshed.assert_called_once()
+        self.assertIn("coding", state.message)
+
+    def test_an_empty_registry_reads_as_no_profiles(self):
+        answers = [completed(stdout=USAGE), completed(stdout="")]
+        with mock.patch.object(launcher.subprocess, "run",
+                               side_effect=answers):
+            rows = launcher.laptop_rows(KILIX)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "note")
 
 
 if __name__ == "__main__":

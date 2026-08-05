@@ -56,9 +56,14 @@ PROGRAMS = (
     # The whole installable surface — catalog games and applications plus the
     # coding agents — behind the same command the CLI uses, so the desktop is
     # not a second list that can disagree with `kilix install`.
-    Item("Install software", kilix=("install",)),
+    Item("Install software", submenu="software"),
     Item("Games", submenu="games"),
     Item("Screensavers", submenu="screensavers", kilix_only=True),
+    # Everything the machine itself advertises: freedesktop `.desktop` entries
+    # discovered the same way Kilix 95's Start menu discovers them, bucketed
+    # by category. The stack programs above stay a curated list; this place is
+    # the uncurated rest of the computer.
+    Item("Applications", submenu="applications"),
     Item("Music", command="kilix-music", sibling="music"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
@@ -164,6 +169,39 @@ def games() -> list[tuple[str, str, bool]] | None:
         return None
 
 
+def applications() -> dict[str, list[dict]]:
+    """Discovered freedesktop applications, {bucket: [entry, …]}.
+
+    The scan itself is shared (`kilix_tui.xdgapps`) so a future catalog tool
+    lists exactly what this desktop lists. Failure to scan is an empty
+    catalog, not an error: a machine with no `.desktop` files is a state,
+    not a fault.
+    """
+    from kilix_tui import xdgapps
+    try:
+        return xdgapps.grouped()
+    except Exception:
+        return {}
+
+
+def games_play_supported(kilix: list[str]) -> bool:
+    """Whether the host launcher knows `kilix games play <id>`.
+
+    Probed from the usage line `kilix games help` prints, which lists every
+    action the installed launcher accepts — the same text a user would read.
+    Today's launchers answer list/settings/enable/disable; when the host
+    grows `play`, the desktop's Enter starts launching games with no change
+    here. The caller caches the answer per visit: this runs a subprocess.
+    """
+    import subprocess
+    try:
+        result = subprocess.run([*kilix, "games", "help"],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "play" in (result.stdout + result.stderr)
+
+
 def screensavers() -> list[str]:
     """The screensaver names a Kilix checkout ships, `kilix screensaver X`."""
     home = os.environ.get("KILIX_HOME") or sources.component_dir("kilix")
@@ -174,6 +212,33 @@ def screensavers() -> list[str]:
     except OSError:
         return []
     return names
+
+
+def installable() -> list[dict] | None:
+    """Everything `kilix install` offers, as it reports it.
+
+    The desktop asks the launcher rather than reading the catalog itself. There
+    is one list in this system and one thing that knows how to install from it;
+    a second reader here would be a second catalogue to keep true.
+    """
+    import json
+    import subprocess
+    launcher = kilix_command()
+    if launcher is None:
+        return None
+    try:
+        result = subprocess.run([*launcher, "install", "--json"],
+                                capture_output=True, text=True, timeout=30,
+                                check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        rows = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return rows if isinstance(rows, list) else None
 
 
 def kilix_command() -> list[str] | None:

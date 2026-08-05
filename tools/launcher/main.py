@@ -1,205 +1,91 @@
-"""kilix-launcher — one catalog of everything this machine can launch.
+"""kilix-launcher — the one catalog, for desktops that delegate to a tab.
 
-Four desktops each owed the user the same three lists — the stack's own
-programs, the applications freedesktop already describes, and the launchers
-the user made — and none of them should parse `.desktop` files or grow a
-second list UI to show them. This is that catalog once, as a text tool any
-desktop opens in a tab (`kilix launcher`): stack programs from the desktop
-registry, discovered XDG applications through the host SDK's shared scanner
-(`kilix_sdk.xdgapps`, SDK 1.8), the user's desktop-folder launchers, the
-executable scripts the stack checkouts ship, a run-a-command row, and the
-laptop session profiles through the host's `kilix laptop` verb — running
-sessions marked from the shared run registry, Enter opening a stopped
-profile or closing a running one.
+Kilix 95 grows menus, the TUI desktop grows places; the mansion and the house
+should grow neither — their idiom is an object that opens a surface in a tab.
+This is that surface: stack programs, the machine's discovered freedesktop
+applications, the user's own desktop-folder launchers, the stack's scripts,
+and the laptop session profiles, in one filterable list with a run-a-command
+row. `kilix launcher` opens it; picking a launch row replaces this process
+with the launch, so the tab becomes the thing chosen; laptop rows act in
+place and the list refreshes.
 
-Launching keeps the registry's discipline: fixed argv into a Kilix page when
-remote control is reachable, in place otherwise. Graphical applications go
-through `kilix run`, which is the same containment the reference desktop
-gives them; the run-a-command row splits its line shell-free, so nothing
-here ever interprets shell syntax.
+The list is assembled from the same single sources every other surface reads
+— `kilix_desk.registry` for the stack, `kilix_tui.xdgapps` for discovery,
+`kilix laptop status` for the shared run registry — so this can never
+disagree with the TUI desktop about what exists, nor with the desktops'
+laptops about what is running.
+
+Launch rules match the desktop's: an argv is executed, never a shell line;
+graphical applications are contained in a `kilix run` page; `report`-verb
+programs hold their output until Enter. `--list` prints the catalog and
+exits, which is what a test (or another desktop's tool) wants.
 """
 from __future__ import annotations
 
-import importlib
 import os
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_desk import registry, sources, tango  # noqa: E402
-from kilix_tui import app, keys as keymap, kitty_rc, shell  # noqa: E402
+from kilix_desk import registry                              # noqa: E402
+from kilix_desk.desk import report_argv                      # noqa: E402
+from kilix_tui import app, keys as keymap, shell, xdgapps    # noqa: E402
 
-SECTIONS = ("Stack", "Apps", "Launchers", "Scripts", "Laptop")
-RUN_LABEL = "Run a command…"
-
-
-# ── the shared scanner ───────────────────────────────────────────────────────
-
-_XDG = None
+RUN_ROW = "Run a command…"
 
 
-def _sdk_xdgapps():
-    """`kilix_sdk.xdgapps`, or None — resolved the way `theme.py` finds the
-    SDK. None means an absent or pre-1.8 Kilix checkout; every caller
-    degrades to a row that says so instead of failing."""
-    global _XDG
-    if _XDG is not None:
-        return _XDG or None
-    for home in (os.environ.get("KILIX_HOME", ""),
-                 sources.component_dir("kilix")):
-        config = os.path.join(home, "config") if home else ""
-        if config and os.path.isdir(os.path.join(config, "kilix_sdk")):
-            if config not in sys.path:
-                sys.path.insert(0, config)
-            try:
-                _XDG = importlib.import_module("kilix_sdk.xdgapps")
-                return _XDG
-            except Exception:
-                break
-    _XDG = False
-    return None
-
-
-# ── rows ─────────────────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class Row:
-    label: str
-    argv: tuple[str, ...] | None = None   # None: disabled, `reason` says why
-    right: str = ""                       # right-hand column text
-    reason: str = ""
-    command_row: bool = False             # the run-a-command prompt
-    sync: bool = False                    # run in place, report, and refresh
-
-
-def _kilix() -> list[str] | None:
-    return registry.kilix_command()
-
-
-def _wrap_gui(argv: list[str]) -> tuple[str, ...]:
-    """Contain a graphical argv the way the reference desktop does: a
-    `kilix run` tab. Without a Kilix checkout the bare argv is all there is."""
-    kilix = _kilix()
-    if kilix:
-        return (*kilix, "run", *argv)
-    return tuple(argv)
-
-
-def stack_rows(live: bool = True) -> list[Row]:
-    """The desktop registry's Programs, resolved; the catalog's first page."""
-    rows = [Row(RUN_LABEL, right="type it, runs in a page", command_row=True)]
-    for item in registry.SECTIONS["Programs"]:
-        if item.submenu:
-            continue                     # Games/Screensavers are desk places
-        if item.kilix_only and not live:
-            continue
-        plan = registry.resolve(item)
-        if plan is None:
-            rows.append(Row(item.label, reason=registry.disabled_reason(item)))
-            continue
-        rows.append(Row(item.label, argv=tuple(plan.argv),
-                        right=os.path.basename(plan.argv[-1])))
-    return rows
-
-
-def app_rows() -> list[Row]:
-    """Discovered freedesktop applications, bucketed by the shared scanner."""
-    sdk = _sdk_xdgapps()
-    if sdk is None:
-        return [Row("No application scanner",
-                    reason="needs a Kilix checkout with SDK 1.8")]
-    try:
-        entries = sdk.scan()
-    except Exception:
-        entries = []
-    rows = []
-    for entry in entries:
-        try:
-            argv = shlex.split(entry.get("exec", ""))
-        except ValueError:
-            argv = []
-        if not argv:
-            continue
-        if not entry.get("terminal"):
-            argv = list(_wrap_gui(argv))
-        rows.append(Row(entry.get("name", "app"), argv=tuple(argv),
-                        right=sdk.bucket(entry)))
-    if not rows:
-        rows.append(Row("No applications found",
-                        reason="nothing under $XDG_DATA_HOME / $XDG_DATA_DIRS"))
-    return rows
-
-
-def desktop_folder() -> str:
-    """The desktop folder the reference desktop writes launchers into."""
+def launcher_dirs() -> list[str]:
+    """The user's desktop-launcher folder: override first, then the roots
+    Kilix 95 and the host's bundled desktop actually write."""
     override = os.environ.get("KILIX_DESKTOP_DIR")
     if override:
-        return override
-    base = (os.environ.get("GPU_TERMINAL_HOME")
-            or os.path.expanduser("~/.local/gpu_terminal"))
-    return os.path.join(base, "kilix-95", "data", "desktop")
-
-
-def launcher_rows(directory: str | None = None) -> list[Row]:
-    """The user's own `.desktop` launchers, read with the shared parser."""
-    sdk = _sdk_xdgapps()
-    if sdk is None:
-        return [Row("No launcher parser",
-                    reason="needs a Kilix checkout with SDK 1.8")]
-    directory = desktop_folder() if directory is None else directory
-    rows = []
-    try:
-        names = sorted(n for n in os.listdir(directory)
-                       if n.endswith(".desktop"))
-    except OSError:
-        names = []
-    for name in names:
-        path = os.path.join(directory, name)
-        parsed = sdk.parse_desktop_file(path)
-        if not parsed:
-            continue
-        label = sdk.localized(parsed, "Name") or os.path.splitext(name)[0]
-        try:
-            argv = shlex.split(
-                sdk.strip_field_codes(sdk.unescape(parsed.get("Exec", ""))))
-        except ValueError:
-            argv = []
-        if not argv:
-            continue
-        # X-Kilix-Open is the launcher's own word for how it wants to open;
-        # everything but a plain tab is a graphical intent → `kilix run`.
-        mode = (parsed.get("X-Kilix-Open", "")
-                or ("tab" if sdk.truthy(parsed.get("Terminal")) else "run"))
-        if mode not in ("tab", "os-window", "fullscreen"):
-            argv = list(_wrap_gui(argv))
-        rows.append(Row(str(label), argv=tuple(argv), right="launcher"))
-    if not rows:
-        rows.append(Row("No launchers yet",
-                        reason=f"nothing in {directory}"))
-    return rows
+        return [override]
+    base = os.environ.get("GPU_TERMINAL_HOME") or os.path.expanduser(
+        "~/.local/gpu_terminal")
+    return [os.path.join(base, "kilix-95", "data", "desktop"),
+            os.path.join(base, "kilix", "data", "desktop")]
 
 
 def script_dirs() -> list[str]:
     """The stack's scripts/ directories, gated on presence like the
     reference desktop's System menu."""
-    kilix_home = (os.environ.get("KILIX_HOME")
-                  or sources.component_dir("kilix"))
-    return [os.path.expanduser(os.path.join("~", "pleb", "scripts")),
-            os.path.join(kilix_home, "scripts")]
+    dirs = [os.path.expanduser(os.path.join("~", "pleb", "scripts"))]
+    kilix_home = os.environ.get("KILIX_HOME", "")
+    if kilix_home:
+        dirs.append(os.path.join(kilix_home, "scripts"))
+    return dirs
 
 
-# ── the laptop section ───────────────────────────────────────────────────────
+def script_rows(dirs: list[str] | None = None) -> list[dict]:
+    """Executable *.sh under the pleb/kilix scripts directories — the same
+    files the reference desktop's System ▸ Scripts submenu offers."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for base in (script_dirs() if dirs is None else dirs):
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            if not name.endswith(".sh") or name in seen:
+                continue
+            path = os.path.join(base, name)
+            if not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            seen.add(name)
+            out.append({"kind": "script", "label": name, "detail": "script",
+                        "argv": [path], "verb": "inplace"})
+    return out
+
+
+# ── the laptop rows ─────────────────────────────────────────────────────────
 
 _LAPTOP_VERB = None
 
 
-def _laptop_verb_available() -> bool:
+def _laptop_verb_available(kilix: list[str] | None) -> bool:
     """Whether the host's kilix knows `kilix laptop`, probed once the way
     the games handoff probes `kilix games play`: run `kilix laptop help`,
     bounded, and require the usage token — an old launcher forwards
@@ -208,7 +94,6 @@ def _laptop_verb_available() -> bool:
     if _LAPTOP_VERB is not None:
         return _LAPTOP_VERB
     _LAPTOP_VERB = False
-    kilix = _kilix()
     if kilix:
         try:
             probe = subprocess.run(
@@ -221,310 +106,275 @@ def _laptop_verb_available() -> bool:
     return _LAPTOP_VERB
 
 
-def laptop_rows() -> list[Row]:
+def laptop_rows(kilix: list[str] | None) -> list[dict]:
     """The laptop session profiles, straight from `kilix laptop status` —
     the host verb owns the shared run registry, so what this list calls
     running is exactly what every desktop's laptop shows open. A running
-    profile's row closes its session; a stopped one opens it. Both run
-    in place (the verb returns once the work is handed off) and the
-    section refreshes to show the registry's new word."""
-    kilix = _kilix()
-    if not kilix or not _laptop_verb_available():
-        return [Row("No laptop profiles",
-                    reason="needs a Kilix with the `kilix laptop` verb")]
+    profile's row closes its session; a stopped one opens it. Both act in
+    place (the verb returns once the work is handed off) and the catalog
+    refreshes to show the registry's new word."""
+    def note(label: str, reason: str) -> dict:
+        return {"kind": "note", "label": label, "detail": reason}
+
+    if not kilix or not _laptop_verb_available(kilix):
+        return [note("No laptop profiles",
+                     "needs a Kilix with the `kilix laptop` verb")]
     try:
         report = subprocess.run(
             [*kilix, "laptop", "status"], stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
-        return [Row("No laptop profiles",
-                    reason="`kilix laptop status` did not answer")]
+        return [note("No laptop profiles",
+                     "`kilix laptop status` did not answer")]
     if report.returncode != 0:
-        return [Row("No laptop profiles",
-                    reason="`kilix laptop status` did not answer")]
-    rows = []
+        return [note("No laptop profiles",
+                     "`kilix laptop status` did not answer")]
+    out: list[dict] = []
     for line in report.stdout.splitlines():
         profile_id, _, state = line.partition(" ")
         if not profile_id:
             continue
         if state.startswith("running"):
-            rows.append(Row(profile_id,
-                            argv=(*kilix, "laptop", "close", profile_id),
-                            right=f"{state} · Enter closes", sync=True))
-        elif state == "stopped" or state == "desktop":
-            rows.append(Row(profile_id,
-                            argv=(*kilix, "laptop", "open", profile_id),
-                            right=state, sync=True))
+            out.append({"kind": "laptop", "label": profile_id,
+                        "detail": f"{state} · Enter closes",
+                        "action": [*kilix, "laptop", "close", profile_id]})
+        elif state in ("stopped", "desktop"):
+            out.append({"kind": "laptop", "label": profile_id,
+                        "detail": state,
+                        "action": [*kilix, "laptop", "open", profile_id]})
         else:
-            rows.append(Row(profile_id, reason="profile does not parse"))
-    if not rows:
-        rows.append(Row("No profiles yet",
-                        reason="~/.local/gpu_terminal/laptop is empty"))
-    return rows
+            out.append(note(profile_id, "profile does not parse"))
+    if not out:
+        out.append(note("No profiles yet",
+                        "~/.local/gpu_terminal/laptop is empty"))
+    return out
 
 
-def script_rows(dirs: list[str] | None = None) -> list[Row]:
-    """Executable *.sh under the pleb/kilix scripts directories."""
-    rows = []
-    for base in (script_dirs() if dirs is None else dirs):
-        if not os.path.isdir(base):
+def rows() -> list[dict]:
+    """The catalog: kind, label, detail, and how to launch each row."""
+    out: list[dict] = [{"kind": "run", "label": RUN_ROW,
+                        "detail": "type an argv; ! from anywhere"}]
+    kilix = registry.kilix_command()
+    for item in registry.PROGRAMS:
+        if item.submenu:
             continue
-        for name in sorted(os.listdir(base)):
-            path = os.path.join(base, name)
-            if name.endswith(".sh") and os.access(path, os.X_OK):
-                short = base.replace(os.path.expanduser("~"), "~", 1)
-                rows.append(Row(name, argv=(path,), right=short))
-    if not rows:
-        rows.append(Row("No scripts found",
-                        reason="no executable *.sh under the stack checkouts"))
-    return rows
+        plan = registry.resolve(item)
+        if plan is None:
+            continue
+        out.append({"kind": "program", "label": item.label,
+                    "detail": "stack", "argv": list(plan.argv),
+                    "verb": plan.verb})
+    for bucket, entries in xdgapps.grouped().items():
+        for entry in entries:
+            row = _app_row(entry, bucket.lower(), kilix)
+            if row is not None:
+                out.append(row)
+    seen_launchers = set()
+    for directory in launcher_dirs():
+        for entry in xdgapps.entries_in(directory):
+            if entry["id"] in seen_launchers:
+                continue
+            seen_launchers.add(entry["id"])
+            row = _app_row(entry, "launcher", kilix)
+            if row is not None:
+                out.append(row)
+    out.extend(script_rows())
+    out.extend(laptop_rows(kilix))
+    return out
 
 
-# ── state ────────────────────────────────────────────────────────────────────
-
-
-def _attached_run(argv) -> int:
-    """Hand the real terminal to a child and take it back afterwards."""
+def _app_row(entry: dict, detail: str, kilix: list[str] | None) -> dict | None:
     try:
-        import curses
-        curses.endwin()
-    except Exception:
-        pass
-    try:
-        return subprocess.call(list(argv))
-    except FileNotFoundError:
-        return 127
-    except OSError:
-        return 126
+        argv = shlex.split(entry["exec"])
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    if entry.get("terminal"):
+        return {"kind": "app", "label": entry["name"], "detail": detail,
+                "argv": argv, "verb": "inplace"}
+    if kilix is None:
+        return None            # nothing safe to contain a GUI app with
+    return {"kind": "app", "label": entry["name"], "detail": detail,
+            "argv": [*kilix, "run", *argv], "verb": "inplace"}
 
 
-@dataclass
+def launch_argv(row: dict) -> list[str] | None:
+    """What execing this row means; None for the run row."""
+    argv = row.get("argv")
+    if not argv:
+        return None
+    if row.get("verb") == "report":
+        return list(report_argv(argv))
+    return list(argv)
+
+
 class State:
-    section: int = 0
-    cursor: int = 0
-    offset: int = 0
-    message: str = ""
-    mode: str = "browse"              # browse | command
-    entry: str = ""                   # the command-row buffer
-    filter: shell.Filter = field(default_factory=shell.Filter)
-    rows_by_section: dict[int, list[Row]] = field(default_factory=dict)
-    runner: object = _attached_run
-    live: object = kitty_rc.available
+    def __init__(self) -> None:
+        self.all = rows()
+        self.filter = ""
+        self.selected = 0
+        self.command: str | None = None      # non-None: the run line is open
+        self.message = ""
 
-    # Construction is deliberately pure — `main()` calls `refresh()` — so a
-    # test can render a State without touching the machine it runs on.
-
-    def refresh(self) -> None:
-        self.rows_by_section = {
-            0: stack_rows(live=bool(self.live())),
-            1: app_rows(),
-            2: launcher_rows(),
-            3: script_rows(),
-            4: laptop_rows(),
-        }
-
-    def rows(self) -> list[Row]:
-        rows = self.rows_by_section.get(self.section, [])
-        return self.filter.apply(rows, key=lambda row: row.label)
-
-    def current(self) -> Row | None:
-        rows = self.rows()
-        if not rows:
-            return None
-        self.cursor = max(0, min(self.cursor, len(rows) - 1))
-        return rows[self.cursor]
+    @property
+    def rows(self) -> list[dict]:
+        needle = self.filter.lower()
+        return [r for r in self.all if needle in str(r["label"]).lower()]
 
 
-# ── drawing ──────────────────────────────────────────────────────────────────
-
-
-def _put(surface, row: int, col: int, text: str, attr: int = 0) -> None:
-    shell.put(surface, row, col, text, attr)
-
-
-def _draw_rows(surface, state: State, top: int, left: int,
-               height: int, width: int) -> None:
-    if height <= 0 or width <= 0:
-        return
-    rows = state.rows()
-    state.cursor = max(0, min(state.cursor, max(0, len(rows) - 1)))
-    if state.cursor < state.offset:
-        state.offset = state.cursor
-    elif state.cursor >= state.offset + height:
-        state.offset = state.cursor - height + 1
-    state.offset = max(0, min(state.offset, max(0, len(rows) - height)))
-    if not rows:
-        note = (f"nothing matches “{state.filter.text}”"
-                if state.filter.active() else "nothing here")
-        _put(surface, top, left, note[:width], tango.attr("alert"))
-        return
-    for line in range(min(height, len(rows) - state.offset)):
-        index = state.offset + line
-        row = rows[index]
-        selected = index == state.cursor
-        marker = "▶" if selected else " "
-        right = row.right or row.reason
-        body = f"{marker} {row.label}"
-        pad = width - len(body) - len(right) - 1
-        if pad < 1:
-            body = body[: max(0, width - len(right) - 2)]
-            pad = 1
-        text = f"{body}{' ' * pad}{right} "[:width]
-        if selected:
-            _put(surface, top + line, left, text.ljust(width),
-                 tango.attr("selected"))
-        elif row.argv is None and not row.command_row:
-            _put(surface, top + line, left, text, tango.attr("muted"))
-        else:
-            _put(surface, top + line, left, text)
-
-
-def footer(state: State) -> str:
-    if state.mode == "command":
-        return f"command: {state.entry}▏ · Enter run · Esc cancel"
-    if state.filter.typing:
-        return state.filter.footer()
-    return ("Enter open · ! command · / filter · Tab section · r reload"
-            " · q quit")
-
-
-def render(surface, state: State) -> None:
-    rows = state.rows()
-    launchable = sum(1 for row in rows if row.argv or row.command_row)
-    summary = state.message or state.filter.summary(launchable) or (
-        f"{launchable} launchable"
-        f"{' · ' + str(len(rows) - launchable) + ' unavailable' if len(rows) - launchable else ''}"
-    )
-    body = shell.draw(
-        surface,
-        title="Launcher",
-        sections=SECTIONS,
-        active=state.section,
-        summary=summary,
-        footer=footer(state),
-        summary_role="accent" if state.message else "muted",
-    )
-    _draw_rows(surface, state, body.top, body.left, body.height, body.width)
-
-
-# ── input ────────────────────────────────────────────────────────────────────
-
-
-def _launch(state: State, argv: tuple[str, ...], title: str) -> None:
-    if state.live():
-        try:
-            kitty_rc.launch_tab(list(argv), title=title)
-            state.message = f"{title}: opened in a page"
-            return
-        except kitty_rc.Unavailable:
-            pass                     # the floor: hand off in place instead
-    code = state.runner(argv)
-    state.message = f"{title} exited {code}" if code else ""
-
-
-def _run_sync(state: State, row: Row) -> None:
-    """Laptop opens/closes run in place — the verb returns once the work
-    is handed off — and the section re-reads the registry's answer."""
+def _exec(argv: list[str], state: State) -> bool:
+    """Replace this process with the launch; stay alive only on failure."""
     try:
-        result = subprocess.run(
-            list(row.argv), stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        state.message = f"{row.label}: kilix did not answer"
-        return
-    line = (result.stdout or result.stderr).strip().splitlines()
-    state.message = line[-1] if line else (
-        f"{row.label}: exited {result.returncode}")
-    state.rows_by_section[state.section] = laptop_rows()
-
-
-def _open(state: State) -> None:
-    row = state.current()
-    if row is None:
-        return
-    if row.command_row:
-        state.mode, state.entry = "command", ""
-        return
-    if row.argv is None:
-        state.message = row.reason
-        return
-    if row.sync:
-        _run_sync(state, row)
-        return
-    _launch(state, row.argv, row.label)
-
-
-def _handle_command(key: int, state: State) -> bool:
-    if key == keymap.ESCAPE:
-        state.mode, state.entry = "browse", ""
-    elif key in keymap.ENTER:
-        line = state.entry.strip()
-        state.mode, state.entry = "browse", ""
-        if line:
-            try:
-                argv = shlex.split(line)
-            except ValueError as error:
-                state.message = f"not runnable: {error}"
-                return True
-            if argv:
-                _launch(state, tuple(argv), argv[0])
-    elif key in keymap.BACKSPACE:
-        state.entry = state.entry[:-1]
-    elif keymap.is_text(key):
-        state.entry += chr(key)
+        os.execvp(argv[0], argv)
+    except OSError as error:
+        state.message = f"{argv[0]}: {error.strerror or error}"
     return True
 
 
+def _act(row: dict, state: State) -> bool:
+    """Run an in-place action (laptop open/close), then refresh the
+    catalog so the row states match the registry again."""
+    try:
+        done = subprocess.run(
+            row["action"], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        state.message = f"{row['label']}: {error}"
+        return True
+    if done.returncode == 0:
+        state.message = f"{row['label']}: done"
+    else:
+        noise = (done.stderr or done.stdout or "").strip()
+        state.message = noise.splitlines()[-1] if noise else (
+            f"{row['label']}: exit {done.returncode}")
+    state.all = rows()
+    state.selected = min(state.selected, max(0, len(state.rows) - 1))
+    return True
+
+
+def activate(state: State) -> bool:
+    rows_now = state.rows
+    if not rows_now:
+        return True
+    row = rows_now[min(state.selected, len(rows_now) - 1)]
+    if row["kind"] == "run":
+        state.command = ""
+        return True
+    if row.get("action"):
+        return _act(row, state)
+    argv = launch_argv(row)
+    if argv is None:
+        return True
+    return _exec(argv, state)
+
+
+def run_command(state: State) -> bool:
+    text = (state.command or "").strip()
+    state.command = None
+    if not text:
+        return True
+    try:
+        argv = shlex.split(text)
+    except ValueError as error:
+        state.message = f"unparsable: {error}"
+        return True
+    if any(part in ("|", ">", "<", ">>", "&&", "||", ";") for part in argv):
+        state.message = "plain commands only — pipes need a terminal"
+        return True
+    if not argv:
+        return True
+    return _exec(argv, state)
+
+
+def render(surface, state: State) -> None:
+    rows_now = state.rows
+    if state.command is not None:
+        summary = f"$ {state.command}▌"
+    elif state.message:
+        summary = state.message
+    else:
+        programs = sum(1 for r in state.all if r["kind"] == "program")
+        apps = sum(1 for r in state.all if r["kind"] == "app")
+        summary = (f"{programs} stack programs · {apps} applications"
+                   f"{f' · filter /{state.filter}' if state.filter else ''}")
+    footer = ("type a command · Enter runs it · Esc cancels"
+              if state.command is not None
+              else "type to filter · Enter launch · ! run · Esc quit")
+    body = shell.draw(
+        surface,
+        help_key=False,      # typing filters, so '?' stays text here
+        title="Launcher",
+        sections=("Everything",),
+        summary=summary,
+        footer=footer,
+    )
+    if not rows_now:
+        shell.put(surface, body.top, body.left,
+                  "nothing matches that filter", shell.tango.attr("alert"))
+        return
+    visible = max(1, body.height)
+    start = max(0, min(state.selected - visible // 2,
+                       max(0, len(rows_now) - visible)))
+    for index, row in enumerate(rows_now[start:start + visible]):
+        y = body.top + index
+        selected = start + index == state.selected
+        marker = "▶" if selected else " "
+        shell.put(
+            surface, y, body.left,
+            f"{marker} {str(row['label']):<44.44} {row['detail']}",
+            shell.tango.attr("selected") if selected else 0,
+        )
+
+
 def handle(key: int, state: State) -> bool:
-    if state.mode == "command":
-        return _handle_command(key, state)
-    if state.filter.handle(key):
-        state.cursor = 0
+    if state.command is not None:
+        if key == keymap.ESCAPE:
+            state.command = None
+            return True
+        if key in keymap.ENTER:
+            return run_command(state)
+        if key in keymap.BACKSPACE:
+            state.command = state.command[:-1]
+            return True
+        if keymap.is_text(key):
+            state.command += chr(key)
+            return True
         return True
-    if keymap.is_quit(key):
+    if key == keymap.ESCAPE or key in (ord("q"), ord("Q")):
         return False
-    if key in keymap.SELECT:
-        _open(state)
-        return True
-    if (step := keymap.direction(key)):
-        state.cursor = max(0, min(state.cursor + step,
-                                  max(0, len(state.rows()) - 1)))
-        return True
     if key == ord("!"):
-        state.mode, state.entry = "command", ""
-        return True
-    if key == ord("\t"):
-        state.section = (state.section + 1) % len(SECTIONS)
-        state.cursor = state.offset = 0
-        state.filter.clear()
-        return True
-    if ord("1") <= key <= ord(str(len(SECTIONS))):
-        state.section = key - ord("1")
-        state.cursor = state.offset = 0
-        state.filter.clear()
-        return True
-    if keymap.is_refresh(key):
-        state.refresh()
+        state.command = ""
         state.message = ""
         return True
-    if key in keymap.HOME:
-        state.cursor = 0
+    if key in keymap.ENTER:
+        return activate(state)
+    if key in keymap.BACKSPACE:
+        state.filter = state.filter[:-1]
         return True
-    if key in keymap.END:
-        state.cursor = max(0, len(state.rows()) - 1)
+    if (step := keymap.direction(key)) and state.rows:
+        state.selected = max(0, min(len(state.rows) - 1,
+                                    state.selected + step))
+        return True
+    if keymap.is_text(key):
+        state.filter += chr(key)
+        state.selected = 0
         return True
     return True
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "--list" in argv:
+        for row in rows():
+            command = " ".join(row.get("argv", row.get("action", []))) or "-"
+            print(f"{row['kind']}\t{row['label']}\t{command}")
+        return 0
     state = State()
-    state.refresh()
     if path := app.screenshot_argv(argv):
         with open(path, "w", encoding="utf-8") as handle_:
             handle_.write(app.render_to_text(render, state) + "\n")
         return 0
-    # `/` and `!` read typed text, so `?` stays an ordinary character here.
     return app.run(render, state, handle=handle, help_key=False)
 
 
