@@ -27,6 +27,7 @@ TOOLS=(
     "switcher:kilix-switch"
     "weather:kilix-weather"
     "music:kilix-music"
+    "launcher:kilix-launcher"
     "plebian_control:plebian-os"
 )
 

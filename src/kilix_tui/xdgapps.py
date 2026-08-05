@@ -258,6 +258,32 @@ def scan(force=False):
     return entries
 
 
+def entries_in(directory):
+    """Parsed entries from one folder of `.desktop` files, name-sorted.
+
+    No recursion and no cache: this is for a user's desktop-launcher folder
+    (the files Kilix 95's Create Launcher wizard writes), which is small and
+    read at the moment it is shown, not for the XDG application dirs.
+    """
+    out = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".desktop"):
+            continue
+        path = os.path.join(directory, fn)
+        parsed = _parse_file(path)
+        if parsed is None:
+            continue
+        entry = _build_entry(parsed, path, fn)
+        if entry is not None:
+            out.append(entry)
+    out.sort(key=lambda e: e["name"].lower())
+    return out
+
+
 # ── categorization ───────────────────────────────────────────────────────────
 
 def bucket(entry):
