@@ -308,6 +308,27 @@ class PowerTests(unittest.TestCase):
         self.assertTrue(any(argv[:2] == ("loginctl", "terminate-session")
                             for argv in argvs))
 
+    def test_the_frozen_contract_with_kilix_power(self):
+        """`kilix power logout|reboot|poweroff` mirrors this exact list.
+
+        The host verb exists for the desktops that cannot import this module;
+        the two must never diverge. This pins the whole shape — three actions,
+        these commands, every one confirming — so a drift on this side fails
+        here rather than in a desktop.
+        """
+        actions = privileged.power_actions()
+        self.assertEqual(len(actions), 3)
+        commands = [tuple(argv[:2]) for _label, argv, _c in actions]
+        self.assertEqual(commands, [
+            ("loginctl", "terminate-session"),   # kilix power logout
+            ("systemctl", "reboot"),             # kilix power reboot
+            ("systemctl", "poweroff"),           # kilix power poweroff
+        ])
+        logout = actions[0][1]
+        self.assertEqual(logout[2], os.environ.get("XDG_SESSION_ID", ""))
+        for label, _argv, needs_confirmation in actions:
+            self.assertTrue(needs_confirmation, f"{label} must confirm")
+
     def test_every_power_entry_confirms(self):
         state = make_state()
         state.section = desk.SECTIONS.index("Power")

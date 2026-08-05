@@ -7,6 +7,12 @@ as what "Shut down" actually runs. Both draw from here.
 Nothing in this module executes anything. It returns argv lists and leaves
 confirmation and execution to the caller, which is what lets the tests pin the
 exact commands without a terminal or root.
+
+FROZEN CONTRACT: the Kilix host's `kilix power logout|reboot|poweroff` verb
+mirrors these exact argvs for the desktops that cannot import Python (Cap,
+Land, 95's shutdown dialog). The two lists must never diverge — a change here
+is a change there, in the same landing, and `tests/test_desktop.py` pins the
+argvs on this side.
 """
 from __future__ import annotations
 

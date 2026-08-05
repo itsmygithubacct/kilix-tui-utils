@@ -21,6 +21,7 @@ TOOLS=(
     "system:kilix-system"
     "volume:kilix-volume"
     "file:kilix-file"
+    "launcher:kilix-launcher"
     "package:kilix-package"
     "rollout_resume:kilix-rollout-resume"
     "session_log:kilix-session-log"

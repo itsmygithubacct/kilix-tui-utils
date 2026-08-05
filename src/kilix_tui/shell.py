@@ -29,6 +29,7 @@ TIPS: dict[str, str] = {
     "CPU": "the busiest processes are listed under the per-core bars",
     "Disk": "Enter scans a filesystem; it stays interruptible while it runs",
     "Files": "this manager only opens and navigates — it never deletes or moves",
+    "Launcher": "one catalog: stack programs, installed apps, your launchers, scripts",
     "Music": "this drives kilix-amp over its control socket, so the player can be anywhere",
     "Packages": "read-only: type to filter, Tab re-sorts by size",
     "Plebian-OS Control": "every power and update action confirms before it runs",
