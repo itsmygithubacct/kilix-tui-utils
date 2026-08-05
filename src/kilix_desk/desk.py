@@ -53,7 +53,9 @@ TIPS: dict[str, str] = {
     "Power": "every action here asks before it runs",
     "Software": "Enter installs; already-installed entries reinstall to their pin",
     "Games": "Enter toggles a game on or off for the whole stack",
+    "Games+play": "Enter plays; t turns a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
+    "Applications": "what this machine itself installs — the stack list is above",
 }
 
 
@@ -68,6 +70,8 @@ class Entry:
     toggle: bool = False             # Enter flips a setting, quietly
     hint: str = ""                   # overrides the derived right-hand text
     back: bool = False               # the ".." row
+    prompt: bool = False             # Enter opens the run-a-command prompt
+    alt_argv: tuple[str, ...] | None = None   # `t` runs this quietly
 
 
 def entry_hint(entry: Entry) -> str:
@@ -143,13 +147,18 @@ class State:
         self.help_open = False
         self.message = ""
         self.confirm: tuple[str, tuple[str, ...]] | None = None
+        self.running_prompt = False      # the `!` run-a-command line is open
+        self.command = ""                # what has been typed into it
         self.runner = runner or _attached_run
         self.quiet = quiet or _quiet_run
         self.live = live or kitty_rc.available
         self.status = facts.status_rows()
-        # `entries()` runs on every keystroke, so the installable list is
-        # fetched once per visit rather than per frame. `r` drops it.
+        # `entries()` runs on every keystroke, so anything that costs a
+        # subprocess or a filesystem walk is fetched once per visit rather
+        # than per frame. `r` drops all of it.
         self.software: list[dict] | None = None
+        self.apps: dict[str, list[dict]] | None = None
+        self.play_support: bool | None = None
         self.text_hits: dict = {}
 
     # ── views over `path`, kept for the pixel renderer and the tests ─────────
@@ -220,6 +229,8 @@ class State:
             return self._game_entries()
         if self.submenu == "screensavers":
             return self._screensaver_entries()
+        if self.submenu == "applications":
+            return self._application_entries()
         name = self.path[0]
         if name == "Home":
             return []
@@ -228,6 +239,11 @@ class State:
                     for label, argv, _needs in privileged.power_actions()]
         live = bool(self.live())
         out: list[Entry] = []
+        if name == "Programs":
+            # F-RUN: the desk owns this row — it opens a prompt, not a
+            # program, so it has no registry Item behind it.
+            out.append(Entry("Run a command", None, prompt=True,
+                             hint="type it yourself"))
         for item in registry.SECTIONS.get(name, ()):
             if item.kilix_only and not live:
                 continue
@@ -292,11 +308,65 @@ class State:
         if rows is None or kilix is None:
             return [Entry("games need a Kilix checkout", None,
                           reason="no kilix_sdk reachable")]
+        if self.play_support is None:
+            self.play_support = registry.games_play_supported(kilix)
         out = []
         for game_id, label, enabled in rows:
             action = "disable" if enabled else "enable"
-            out.append(Entry(label, (*kilix, "games", action, game_id),
-                             toggle=True, hint="on" if enabled else "off"))
+            flip = (*kilix, "games", action, game_id)
+            if self.play_support:
+                # Enter plays — the natural reading of a games list — and `t`
+                # keeps the availability toggle one key away.
+                out.append(Entry(label, (*kilix, "games", "play", game_id),
+                                 verb="tab", hint="on" if enabled else "off",
+                                 alt_argv=flip))
+            else:
+                # Older launchers know no `play`: Enter stays the toggle so
+                # the list is never a dead end.
+                out.append(Entry(label, flip, toggle=True,
+                                 hint="on" if enabled else "off"))
+        return out
+
+    def _application_entries(self) -> list[Entry]:
+        """Discovered freedesktop apps: buckets at depth two, apps below.
+
+        Terminal applications launch like any tool (a page inside Kilix, in
+        place elsewhere). GUI applications go through `kilix run`, the same
+        containment Kilix 95 uses for browsers — so without a Kilix checkout
+        they are listed disabled with the reason, not launched raw onto
+        whatever display may or may not exist.
+        """
+        if self.apps is None:
+            self.apps = registry.applications()
+        groups = self.apps
+        if not groups:
+            return [Entry("no applications discovered", None,
+                          reason="no .desktop entries under the XDG dirs")]
+        if len(self.path) == 2:
+            return [Entry(bucket, None, submenu=bucket,
+                          hint=f"{len(rows)} apps")
+                    for bucket, rows in groups.items()]
+        bucket = self.path[2]
+        kilix = registry.kilix_command()
+        out: list[Entry] = []
+        for app in groups.get(bucket, ()):
+            try:
+                argv = tuple(shlex.split(app["exec"]))
+            except ValueError:
+                continue
+            if not argv:
+                continue
+            if app.get("terminal"):
+                out.append(Entry(app["name"], argv, verb="tab"))
+            elif kilix is None:
+                out.append(Entry(app["name"], None,
+                                 reason="needs a Kilix checkout to contain it"))
+            else:
+                out.append(Entry(app["name"], (*kilix, "run", *argv),
+                                 verb="tab"))
+        if not out:
+            return [Entry("nothing launchable in this bucket", None,
+                          reason="every entry here failed to parse")]
         return out
 
     def _screensaver_entries(self) -> list[Entry]:
@@ -311,8 +381,12 @@ class State:
         return " › ".join(["Kilix", *self.path])
 
     def tip(self) -> str:
+        if self.running_prompt:
+            return "runs in a page inside Kilix, in place anywhere else"
         if self.filtering:
             return "type to narrow the list · Esc clears it · Enter keeps it"
+        if self.place() == "Games" and self.play_support:
+            return TIPS["Games+play"]
         return TIPS.get(self.place(), TIPS[""])
 
 
@@ -398,6 +472,8 @@ def _draw_entries(surface, state: State, top: int,
 def footer(state: State, width: int = 0) -> str:
     if state.confirm is not None:
         return "y confirm · any other key cancels"
+    if state.running_prompt:
+        return "type a command · Enter runs it · Esc cancels"
     if state.filtering:
         return "type to filter · Enter keep · Esc clear · ↑↓ move"
     return keymap.footer(width)
@@ -470,9 +546,80 @@ def _place_summary(state: State) -> str:
 # ── input ────────────────────────────────────────────────────────────────────
 
 
+def _open_prompt(state: State) -> None:
+    state.running_prompt = True
+    state.command = ""
+    state.message = "$ ▌"
+
+
+def _run_command(state: State) -> None:
+    """Execute what the prompt holds: a page inside Kilix, in place outside.
+
+    The command is split like a shell would split it but never given to one —
+    the same argv-only discipline every launcher in this fleet follows. What
+    it cannot do is pipes and redirects, and the message says so rather than
+    letting `foo | bar` fail somewhere less explainable.
+    """
+    state.running_prompt = False
+    text = state.command.strip()
+    state.command = ""
+    if not text:
+        state.message = ""
+        return
+    try:
+        argv = tuple(shlex.split(text))
+    except ValueError as error:
+        state.message = f"unparsable: {error}"
+        return
+    if any(part in ("|", ">", "<", ">>", "&&", "||", ";") for part in argv):
+        state.message = "plain commands only — pipes need a terminal"
+        return
+    if not argv:
+        state.message = ""
+        return
+    _launch(state, Entry(text, argv, verb="tab"))
+
+
+def _run_key(key: int, state: State) -> bool:
+    """Keys while the `!` prompt is open: text builds the command."""
+    if key == keymap.ESCAPE:
+        state.running_prompt = False
+        state.command = ""
+        state.message = "cancelled"
+        return True
+    if key in keymap.ENTER:
+        _run_command(state)
+        return True
+    if key in keymap.BACKSPACE:
+        state.command = state.command[:-1]
+        state.message = f"$ {state.command}▌"
+        return True
+    if keymap.is_text(key):
+        state.command += chr(key)
+        state.message = f"$ {state.command}▌"
+        return True
+    return True
+
+
+def _launch(state: State, entry: Entry) -> None:
+    """The verbs shared by list entries and the run prompt."""
+    if entry.verb == "tab" and state.live():
+        try:
+            kitty_rc.launch_tab(list(entry.argv), title=entry.label)
+            state.message = f"{entry.label}: opened in a page"
+            return
+        except kitty_rc.Unavailable:
+            pass                     # the floor: hand off in place instead
+    code = state.runner(entry.argv)
+    state.message = f"{entry.label} exited {code}" if code else ""
+
+
 def _open(state: State, entry: Entry) -> None:
     if entry.back:
         _back(state)
+        return
+    if entry.prompt:
+        _open_prompt(state)
         return
     if entry.submenu:
         # A section from the root, or a drill-down inside one.
@@ -494,15 +641,7 @@ def _open(state: State, entry: Entry) -> None:
     if entry.confirm:
         state.confirm = (entry.label, entry.argv)
         return
-    if entry.verb == "tab" and state.live():
-        try:
-            kitty_rc.launch_tab(list(entry.argv), title=entry.label)
-            state.message = f"{entry.label}: opened in a page"
-            return
-        except kitty_rc.Unavailable:
-            pass                     # the floor: hand off in place instead
-    code = state.runner(entry.argv)
-    state.message = f"{entry.label} exited {code}" if code else ""
+    _launch(state, entry)
 
 
 def _back(state: State) -> None:
@@ -634,6 +773,8 @@ def handle(key: int, state: State) -> bool:
         return True
     if key == KEY_MOUSE:
         return _text_mouse(state)
+    if state.running_prompt:
+        return _run_key(key, state)
     if state.filtering:
         return _filter_key(key, state)
     if keymap.is_help(key):
@@ -643,6 +784,19 @@ def handle(key: int, state: State) -> bool:
         state.filtering = True
         state.message = ""
         return True
+    if key == ord("!"):
+        _open_prompt(state)
+        return True
+    if key in (ord("t"), ord("T")):
+        entries = state.entries()
+        if state.selected < len(entries):
+            entry = entries[state.selected]
+            if entry.alt_argv is not None:
+                code = state.quiet(entry.alt_argv)
+                state.message = (f"{entry.label}: {entry.alt_argv[-2]}d"
+                                 if not code
+                                 else f"{entry.label}: failed ({code})")
+                return True
     if key == keymap.ESCAPE:
         # Esc walks out one level at a time, then asks before leaving.
         if state.filter or state.path:
@@ -684,6 +838,8 @@ def handle(key: int, state: State) -> bool:
     if keymap.is_refresh(key):
         state.status = facts.status_rows()
         state.software = None            # re-ask the launcher for the list
+        state.apps = None                # rescan the .desktop entries
+        state.play_support = None        # re-probe the launcher's verbs
         state.message = ""
         return True
     return True

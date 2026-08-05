@@ -74,6 +74,20 @@ the highlighted entry. The list comes from `kilix install --json` rather than
 from a catalogue kept here, because a second reader is a second thing to keep
 true. It is fetched once per visit and re-asked on `r`.
 
+Three more Programs surfaces follow the same discipline. **Run a command**
+(also `!` from anywhere) opens a one-line prompt on the summary row; what you
+type is split like a shell would split it but never given to one — argv only,
+into a Kilix page when remote control is live and in place otherwise, with
+pipes refused by name rather than half-working. **Applications** lists what
+the machine itself advertises: freedesktop `.desktop` entries discovered
+exactly the way Kilix 95's Start menu discovers them (`kilix_tui/xdgapps.py`,
+shared so a future catalog tool cannot disagree with this list), bucketed by
+category; terminal apps launch like any tool, graphical ones are contained in
+a `kilix run` page. And **Games** launches on Enter when the installed
+launcher knows `kilix games play` — probed from its own usage line, cached per
+visit — while `t` keeps the availability toggle one key away; older launchers
+keep Enter as the toggle, so the list is never a dead end.
+
 Six sections: Home (status), Programs, Machine,
 System, Session, and Power — the last being the point: it closes the stack's
 no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions
