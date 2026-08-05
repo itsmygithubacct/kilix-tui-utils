@@ -53,6 +53,10 @@ PROGRAMS = (
     # text browser in a pane. On a machine with no X server they end up at
     # the same program, and naming it is how you can ask for it directly.
     Item("Text browser", kilix=("chawan",), verb="tab", kilix_only=True),
+    # The whole installable surface — catalog games and applications plus the
+    # coding agents — behind the same command the CLI uses, so the desktop is
+    # not a second list that can disagree with `kilix install`.
+    Item("Install software", kilix=("install",)),
     Item("Games", submenu="games"),
     Item("Screensavers", submenu="screensavers", kilix_only=True),
     Item("Music", command="kilix-music", sibling="music"),
