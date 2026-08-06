@@ -1364,3 +1364,56 @@ class SafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class WellKnownInstallResolutionTests(unittest.TestCase):
+    """A vendor install must be findable even when PATH cannot see it."""
+
+    def _home_with_kimi(self, tmp):
+        binary = Path(tmp) / ".kimi-code" / "bin" / "kimi"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        return binary
+
+    def test_unconfigured_kimi_falls_back_to_its_landing_spot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = self._home_with_kimi(tmp)
+            with mock.patch.dict(os.environ, {"HOME": tmp, "PATH": "/x"},
+                                 clear=False):
+                resolved = config.resolve_program("kimi", "kimi")
+        self.assertEqual(resolved, str(binary))
+
+    def test_an_explicit_override_never_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._home_with_kimi(tmp)
+            with mock.patch.dict(os.environ, {
+                    "HOME": tmp, "PATH": "/x",
+                    "KILIX_ROLLOUT_RESUME_KIMI": "/nonexistent/kimi"},
+                    clear=False):
+                resolved = config.resolve_program("kimi", "kimi")
+        self.assertEqual(resolved, "")
+
+    def test_post_install_report_flags_a_path_invisible_install(self):
+        item = providers.provider("kimi")
+        with mock.patch.object(manage, "installed",
+                               return_value="/home/u/.kimi-code/bin/kimi"), \
+                mock.patch.object(manage.shutil, "which", return_value=None):
+            report = manage.post_install_report(item)
+        self.assertIn("not on this shell's PATH", report)
+        self.assertIn("/home/u/.kimi-code/bin/kimi", report)
+
+    def test_post_install_report_is_plain_when_path_reaches_it(self):
+        item = providers.provider("claude")
+        with mock.patch.object(manage, "installed",
+                               return_value="/usr/local/bin/claude"), \
+                mock.patch.object(manage.shutil, "which",
+                                  return_value="/usr/local/bin/claude"):
+            report = manage.post_install_report(item)
+        self.assertEqual(report, "Claude Code installed at /usr/local/bin/claude")
+
+    def test_post_install_report_admits_an_unresolvable_install(self):
+        item = providers.provider("codex")
+        with mock.patch.object(manage, "installed", return_value=""):
+            report = manage.post_install_report(item)
+        self.assertIn("does not resolve", report)

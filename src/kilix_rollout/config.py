@@ -209,6 +209,18 @@ def configured_program(key: str, default: str) -> str:
     return str(value) if isinstance(value, str) and value else default
 
 
+# Where each vendor's installer actually lands its binary. Debian only adds
+# ~/.local/bin to PATH in login shells, and kimi installs under ~/.kimi-code,
+# so a freshly installed agent is routinely invisible to PATH lookups from
+# panes and desktop processes. These are consulted only for an UNCONFIGURED
+# program — an explicit override must stay strict.
+_WELL_KNOWN_INSTALLS = {
+    "claude": ("~/.local/bin/claude",),
+    "codex": ("~/.local/bin/codex",),
+    "kimi": ("~/.local/bin/kimi", "~/.kimi-code/bin/kimi"),
+}
+
+
 def resolve_program(key: str, default: str) -> str:
     """Resolve a configured program to an executable path, or return ``""``."""
     value = configured_program(key, default)
@@ -217,7 +229,15 @@ def resolve_program(key: str, default: str) -> str:
             os.access(candidate, os.X_OK)
             or (key == "tb" and candidate.suffix == ".py")):
         return str(candidate.absolute())
-    return shutil.which(value) or ""
+    found = shutil.which(value)
+    if found:
+        return found
+    if value == default:
+        for known in _WELL_KNOWN_INSTALLS.get(key, ()):
+            path = Path(known).expanduser()
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+    return ""
 
 
 def launch_gap() -> float:

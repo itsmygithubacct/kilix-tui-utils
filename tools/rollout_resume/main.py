@@ -632,7 +632,7 @@ def _run_install(item) -> str:
     if code != 0:
         return f"{item.label} install exited {code}."
     menu.sync(providers.PROVIDERS)
-    return f"{item.label} installed; start-menu entries updated."
+    return f"{manage.post_install_report(item)}; start-menu entries updated."
 
 
 def _run_update(item) -> str:
@@ -873,6 +873,7 @@ def _cmd_install(key: str, assume_yes: bool) -> int:
     code = manage.run_install(item)
     if code == 0:
         menu.sync(providers.PROVIDERS)
+        print(manage.post_install_report(item))
     return code
 
 

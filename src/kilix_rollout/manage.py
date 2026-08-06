@@ -12,6 +12,7 @@ script, so the agent stays in charge of how it upgrades itself.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 
 from . import config
@@ -61,6 +62,27 @@ def run_install(item: Provider, *, runner=subprocess.run) -> int:
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError(f"could not run the installer: {error}") from error
     return int(result.returncode)
+
+
+def post_install_report(item: Provider) -> str:
+    """One honest line about where the install actually landed.
+
+    An installer's zero exit says nothing about reachability: claude lands
+    in ~/.local/bin (which Debian only puts on PATH for login shells), kimi
+    under ~/.kimi-code/bin. Resolve again and say what happened, so a
+    PATH-invisible install never reads as a plain success.
+    """
+    path = installed(item)
+    if not path:
+        return (f"{item.label}: the installer finished but "
+                f"`{item.command}` does not resolve — check its output")
+    on_path = bool(shutil.which(
+        config.configured_program(item.key, item.command)))
+    if on_path:
+        return f"{item.label} installed at {path}"
+    return (f"{item.label} installed at {path} — not on this shell's "
+            "PATH; new kilix panes resolve it, current shells need "
+            f"{os.path.dirname(path)} added")
 
 
 def run_update(item: Provider, *, runner=subprocess.run) -> int:
