@@ -9,6 +9,7 @@ because that is what makes it safe to make a session out of.
 """
 import importlib.util
 import os
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -275,7 +276,8 @@ class SubmenuTests(unittest.TestCase):
              mock.patch.object(registry, "games_play_supported",
                                return_value=True), \
              mock.patch.object(registry, "kilix_command",
-                               return_value=["/opt/kilix/kilix"]):
+                               return_value=["/opt/kilix/kilix"]), \
+             mock.patch.object(desk, "_resolve_program", lambda name: name):
             state.submenu = "games"
             listed = state.entries()
             self.assertEqual([e.hint for e in listed[1:]], ["on"])
@@ -322,7 +324,9 @@ class RunCommandTests(unittest.TestCase):
         for ch in "echo hi":
             desk.handle(ord(ch), state)
         desk.handle(10, state)
-        self.assertEqual(calls, [("echo", "hi")])
+        # The program is resolved to an absolute path in the desk's own
+        # environment, so the spawn does not depend on the terminal's PATH.
+        self.assertEqual(calls, [(shutil.which("echo"), "hi")])
         self.assertFalse(state.running_prompt)
 
     def test_the_programs_row_opens_the_same_prompt(self):
@@ -341,7 +345,7 @@ class RunCommandTests(unittest.TestCase):
         for ch in 'printf "two words"':
             desk.handle(ord(ch), state)
         desk.handle(10, state)
-        self.assertEqual(calls, [("printf", "two words")])
+        self.assertEqual(calls, [(shutil.which("printf"), "two words")])
 
     def test_shell_operators_are_refused_with_a_reason(self):
         state = make_state(runner=lambda argv: self.fail("must not run"))
@@ -411,11 +415,13 @@ class ApplicationsPlaceTests(unittest.TestCase):
         calls = []
         state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
         with mock.patch.object(registry, "applications",
-                               return_value=self.APPS):
+                               return_value=self.APPS), \
+             mock.patch.object(desk.shutil, "which",
+                               lambda name: f"/usr/bin/{name}"):
             state.path = ["Programs", "Applications", "Accessories"]
             state.selected = 1                                # past ".."
             desk.handle(10, state)
-        self.assertEqual(calls, [("htop",)])
+        self.assertEqual(calls, [("/usr/bin/htop",)])
 
     def test_gui_apps_are_contained_by_kilix_run(self):
         calls = []
@@ -423,7 +429,8 @@ class ApplicationsPlaceTests(unittest.TestCase):
         with mock.patch.object(registry, "applications",
                                return_value=self.APPS), \
              mock.patch.object(registry, "kilix_command",
-                               return_value=["/opt/kilix/kilix"]):
+                               return_value=["/opt/kilix/kilix"]), \
+             mock.patch.object(desk, "_resolve_program", lambda name: name):
             state.path = ["Programs", "Applications", "Internet"]
             state.selected = 1
             desk.handle(10, state)
@@ -578,9 +585,55 @@ class VerbTests(unittest.TestCase):
                            live=lambda: True)
         entry = desk.Entry("Temps", ("/usr/bin/tool",), verb="tab")
         with mock.patch.object(kitty_rc, "launch_tab",
-                               side_effect=kitty_rc.Unavailable("refused")):
+                               side_effect=kitty_rc.Unavailable("refused")), \
+             mock.patch.object(desk, "_resolve_program", lambda name: name):
             desk._open(state, entry)
         self.assertEqual(calls, [("/usr/bin/tool",)])
+
+    def test_bare_names_are_made_absolute_before_the_page_spawn(self):
+        # kitty spawns a page's child from its own environment, whose PATH
+        # may lack ~/.local/bin; a bare name then dies before its first
+        # prompt and leaves a corpse page (the 0.1.7 dead rollout-resume
+        # tab). The desk resolves in its own environment and hands the
+        # terminal an absolute path.
+        spawned = []
+        state = make_state(runner=lambda argv: self.fail("page verb expected"),
+                           live=lambda: True)
+        entry = desk.Entry("Coding agents", ("kilix-rollout-resume",),
+                           verb="tab")
+        with mock.patch.object(
+                kitty_rc, "launch_tab",
+                lambda argv, **kw: spawned.append(tuple(argv)) or 7), \
+             mock.patch.object(desk.shutil, "which",
+                               lambda name: f"/home/someone/.local/bin/{name}"):
+            desk._open(state, entry)
+        self.assertEqual(
+            spawned, [("/home/someone/.local/bin/kilix-rollout-resume",)])
+
+    def test_a_missing_tool_fails_with_words_not_a_dead_page(self):
+        state = make_state(runner=lambda argv: self.fail("must not spawn"),
+                           live=lambda: True)
+        entry = desk.Entry("Coding agents", ("no-such-tool-qq",), verb="tab")
+        with mock.patch.object(
+                kitty_rc, "launch_tab",
+                side_effect=AssertionError("must not reach the terminal")), \
+             mock.patch.object(desk.shutil, "which", lambda name: None):
+            desk._open(state, entry)
+        self.assertIn("no-such-tool-qq", state.message)
+        self.assertIn("not installed", state.message)
+
+    def test_local_bin_is_reached_when_path_misses_it(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            local = Path(home) / ".local" / "bin"
+            local.mkdir(parents=True)
+            tool = local / "kilix-rollout-resume"
+            tool.write_text("#!/bin/sh\n")
+            tool.chmod(0o755)
+            with mock.patch.dict(os.environ, {"HOME": home}), \
+                 mock.patch.object(desk.shutil, "which", lambda name: None):
+                self.assertEqual(
+                    desk._resolve_program("kilix-rollout-resume"), str(tool))
 
     def test_disabled_entry_reports_its_reason(self):
         state = make_state(runner=lambda argv: self.fail("must not run"))

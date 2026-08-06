@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -631,16 +632,44 @@ def _run_key(key: int, state: State) -> bool:
     return True
 
 
+def _resolve_program(name: str) -> str | None:
+    """An absolute path for `name`, resolved in the desk's own environment.
+
+    PATH first, then ~/.local/bin explicitly: that is where the stack
+    installs its tools, and desktop sessions do not reliably carry it on
+    PATH. Names that are already paths only have to be executable.
+    """
+    if os.path.sep in name:
+        return name if os.access(name, os.X_OK) else None
+    if found := shutil.which(name):
+        return found
+    local = os.path.join(os.path.expanduser("~"), ".local", "bin", name)
+    return local if os.access(local, os.X_OK) else None
+
+
 def _launch(state: State, entry: Entry) -> None:
     """The verbs shared by list entries and the run prompt."""
+    # Resolved here, not by the terminal: kitty spawns a page's child from
+    # its own environment, whose PATH may lack ~/.local/bin — the child then
+    # dies before its first prompt and the page is a corpse whose only trace
+    # is a resize warning (the 0.1.7 review's dead rollout-resume tab). An
+    # absolute argv[0] launches the same everywhere, and a name that cannot
+    # be resolved fails right here, with words.
+    argv = list(entry.argv)
+    program = _resolve_program(argv[0])
+    if program is None:
+        state.message = (f"{entry.label}: {argv[0]} is not installed "
+                         "(not on PATH or in ~/.local/bin)")
+        return
+    argv[0] = program
     if entry.verb == "tab" and state.live():
         try:
-            kitty_rc.launch_tab(list(entry.argv), title=entry.label)
+            kitty_rc.launch_tab(argv, title=entry.label)
             state.message = f"{entry.label}: opened in a page"
             return
         except kitty_rc.Unavailable:
             pass                     # the floor: hand off in place instead
-    code = state.runner(entry.argv)
+    code = state.runner(tuple(argv))
     state.message = f"{entry.label} exited {code}" if code else ""
 
 
