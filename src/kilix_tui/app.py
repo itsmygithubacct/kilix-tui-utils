@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import curses
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -151,9 +152,11 @@ def run(
     filter box — set it False and keep `?` as an ordinary character.
     """
     showing_help = False
+    started = False
 
     def _loop(stdscr: Any) -> int:
-        nonlocal showing_help
+        nonlocal showing_help, started
+        started = True
         curses.curs_set(0)
         stdscr.keypad(True)
         if mouse:
@@ -194,7 +197,19 @@ def run(
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))
         print(render_to_text(render, state, height=rows, width=columns))
         return 0
-    return curses.wrapper(_loop)
+    try:
+        return curses.wrapper(_loop)
+    except curses.error:
+        if started:
+            raise            # a real failure inside the tool, not the setup
+        # The screen never opened: no terminal on this side of a pipe or an
+        # ssh command, or a TERM this machine has no terminfo entry for.
+        # Say which, because the remedy differs.
+        term = os.environ.get("TERM") or ""
+        detail = (f"TERM={term} is not a terminal type this machine knows"
+                  if term else "no TERM is set")
+        print(f"this needs a terminal to draw on: {detail}", file=sys.stderr)
+        return 1
 
 
 def screenshot_argv(argv: list[str]) -> str | None:

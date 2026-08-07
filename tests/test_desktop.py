@@ -986,3 +986,39 @@ class GraphicsBackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TerminalRequirementTests(unittest.TestCase):
+    """Answering a question must not need a screen, and a missing screen
+    must not be a traceback."""
+
+    def test_version_answers_without_a_terminal(self):
+        import io
+        from contextlib import redirect_stdout
+        path = ROOT / "tools" / "plebian_control" / "main.py"
+        spec = importlib.util.spec_from_file_location("tool_plebian", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        out = io.StringIO()
+        with mock.patch.object(module.app, "run",
+                               side_effect=AssertionError("no curses")), \
+                redirect_stdout(out):
+            code = module.main(["--version"])
+        self.assertEqual(code, 0)
+        self.assertIn("kilix", out.getvalue())
+
+    def test_a_terminal_that_cannot_open_reports_instead_of_raising(self):
+        import io
+        from contextlib import redirect_stderr
+        from kilix_tui import app as app_module
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"TERM": "nonesuch-terminal"},
+                             clear=False), \
+                mock.patch.object(app_module.curses, "wrapper",
+                                  side_effect=app_module.curses.error(
+                                      "setupterm: could not find terminal")), \
+                redirect_stderr(err):
+            code = app_module.run(lambda *_: None, object())
+        self.assertEqual(code, 1)
+        self.assertIn("needs a terminal", err.getvalue())
+        self.assertIn("nonesuch-terminal", err.getvalue())

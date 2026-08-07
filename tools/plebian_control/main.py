@@ -233,6 +233,12 @@ def handle(key: int, state: State) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("--version", "-V", "version"):
+        # Asking what is installed must never need a screen: this answers over
+        # an ssh command, from a script, and inside a pipe.
+        for label, value in component_versions():
+            print(f"{label:<16}{value}")
+        return 0
     state = State()
     if argv and argv[0] in ("--status", "-s"):
         for label, value in state.status:
