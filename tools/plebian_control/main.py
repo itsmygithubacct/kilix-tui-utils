@@ -55,21 +55,22 @@ def build_info() -> dict[str, str]:
     return values
 
 
+COMPONENTS = (
+    ("plebian-os", "plebian-os"),
+    ("pleb", "pleb"),
+    ("kilix", "kilix"),
+    ("kilix-95", os.path.join("kilix-desktops", "kilix-95")),
+    ("kilix-tui-utils", os.path.join("kilix-desktops", "kilix-tui-utils")),
+)
+
+
 def component_versions() -> list[tuple[str, str]]:
     # Resolve through the shared finder: a provisioned machine keeps its
     # checkouts under ~/.local/gpu_terminal/sources, a development one under
     # ~/gpu_terminal, and reading only the latter reported every component of
     # a working installation as "not present".
     rows = []
-    components = (
-        ("plebian-os", "plebian-os"),
-        ("pleb", "pleb"),
-        ("kilix", "kilix"),
-        ("kilix-95", os.path.join("kilix-desktops", "kilix-95")),
-        ("kilix-tui-utils",
-         os.path.join("kilix-desktops", "kilix-tui-utils")),
-    )
-    for name, relative_path in components:
+    for name, relative_path in COMPONENTS:
         version = _read(os.path.join(
             sources.component_dir(relative_path), "VERSION")).strip()
         rows.append((name, version or "not present"))
@@ -240,8 +241,15 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("--version", "-V", "version"):
         # Asking what is installed must never need a screen: this answers over
         # an ssh command, from a script, and inside a pipe.
-        for label, value in component_versions():
-            print(f"{label:<16}{value}")
+        #
+        # Name the directory each answer came from. A machine can carry both a
+        # provisioned checkout and a development workspace, and then a bare
+        # version number is a claim about a directory the reader cannot see —
+        # the wrong one reads as an upgrade that never happened.
+        for name, relative_path in COMPONENTS:
+            where = sources.component_dir(relative_path)
+            version = _read(os.path.join(where, "VERSION")).strip()
+            print(f"{name:<16}{version or 'not present':<10}{where}")
         return 0
     state = State()
     if argv and argv[0] in ("--status", "-s"):
