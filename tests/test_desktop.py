@@ -10,6 +10,7 @@ because that is what makes it safe to make a session out of.
 import importlib.util
 import os
 import shutil
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -1022,3 +1023,23 @@ class TerminalRequirementTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("needs a terminal", err.getvalue())
         self.assertIn("nonesuch-terminal", err.getvalue())
+
+    def test_versions_read_a_provisioned_layout(self):
+        import io
+        from contextlib import redirect_stdout
+        path = ROOT / "tools" / "plebian_control" / "main.py"
+        spec = importlib.util.spec_from_file_location("tool_plebian2", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            # The provisioned layout: checkouts under .local/gpu_terminal/sources
+            root = Path(tmp) / ".local" / "gpu_terminal" / "sources"
+            (root / "kilix").mkdir(parents=True)
+            (root / "kilix" / "VERSION").write_text("0.1.8\n")
+            env = {"HOME": tmp, "GPU_TERMINAL_SOURCE_HOME": str(root)}
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    redirect_stdout(out):
+                module.main(["--version"])
+        self.assertIn("0.1.8", out.getvalue())
+        self.assertNotIn("kilix           not present", out.getvalue())

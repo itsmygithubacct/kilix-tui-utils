@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
+from kilix_desk import sources  # noqa: E402
 from kilix_tui import app, keys as keymap, privileged, proc, shell  # noqa: E402
 
 SECTIONS = ("Status", "Update", "Session", "Power", "Health")
@@ -55,8 +56,10 @@ def build_info() -> dict[str, str]:
 
 
 def component_versions() -> list[tuple[str, str]]:
-    source = os.environ.get("GPU_TERMINAL_SOURCE_HOME") or os.path.join(
-        os.path.expanduser("~"), "gpu_terminal")
+    # Resolve through the shared finder: a provisioned machine keeps its
+    # checkouts under ~/.local/gpu_terminal/sources, a development one under
+    # ~/gpu_terminal, and reading only the latter reported every component of
+    # a working installation as "not present".
     rows = []
     components = (
         ("plebian-os", "plebian-os"),
@@ -67,7 +70,8 @@ def component_versions() -> list[tuple[str, str]]:
          os.path.join("kilix-desktops", "kilix-tui-utils")),
     )
     for name, relative_path in components:
-        version = _read(os.path.join(source, relative_path, "VERSION")).strip()
+        version = _read(os.path.join(
+            sources.component_dir(relative_path), "VERSION")).strip()
         rows.append((name, version or "not present"))
     return rows
 
