@@ -39,6 +39,7 @@ TIPS: dict[str, str] = {
     "System": "--print gives the same facts as plain text for scripts",
     "Volume": "this sets the sink Kilix itself uses, not just this pane",
     "Weather": "forecast comes from Open-Meteo; r refetches it",
+    "Cameras": "views come from kilix-rtsp; n writes a new stream profile",
     "Temperatures": "green below 80°C, yellow to 89°C, red above",
     "Memory": "pressure matters more than free bytes — watch the stall lines",
     "VirtualBox": "machines launch into their own Kilix tab",

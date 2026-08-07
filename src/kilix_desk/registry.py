@@ -79,6 +79,7 @@ MACHINE = (
          kilix=("temps",), verb="tab"),
     Item("VirtualBox VPN", command="kilix-virtualbox-manager",
          source="kilix-virtualbox-manager"),
+    Item("Cameras", command="kilix-cameras", sibling="cameras"),
     Item("Disk", command="kilix-disk", sibling="disk"),
     Item("System facts", command="kilix-system", sibling="system"),
     Item("Volume", command="kilix-volume", sibling="volume"),

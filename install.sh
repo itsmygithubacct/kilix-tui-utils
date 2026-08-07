@@ -27,6 +27,7 @@ TOOLS=(
     "session_log:kilix-session-log"
     "switcher:kilix-switch"
     "weather:kilix-weather"
+    "cameras:kilix-cameras"
     "music:kilix-music"
     "plebian_control:plebian-os"
 )

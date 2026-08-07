@@ -23,7 +23,7 @@ from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 TOOLS = [
     "calculator", "cpu", "disk", "system", "volume",
     "file", "launcher", "package", "session_log", "weather", "music",
-    "plebian_control", "rollout_resume", "switcher",
+    "plebian_control", "rollout_resume", "switcher", "cameras",
 ]
 
 
