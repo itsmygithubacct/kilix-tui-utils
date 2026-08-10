@@ -47,6 +47,8 @@ PROGRAMS = (
     Item("Coding agents", command="kilix-rollout-resume",
          sibling="rollout_resume"),
     Item("Model store", command="kilix-bonsai", kilix=("bonsai",), verb="tab"),
+    Item("PDF Conversion",
+         kilix=("app", "run", "kilix-pdf-conversion"), verb="tab"),
     Item("Web browser", kilix=("open-url",), verb="tab", kilix_only=True),
     # Listed separately from "Web browser" because it is a different promise:
     # that one reaches for a desktop browser first, this one is always the

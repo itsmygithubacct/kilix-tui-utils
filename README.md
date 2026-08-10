@@ -31,6 +31,11 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-virtualbox-manager` | Discover, launch, focus, and control VirtualBox VPN machines in Kilix tabs |
 | `kilix-tui` | **The text-native desktop** — see below |
 
+The shared Programs registry includes **PDF Conversion** as a direct tab/pane
+application through `kilix app run kilix-pdf-conversion`. The same registry
+feeds both the TUI desktop and `kilix-launcher`, which is also the Programs
+object used by Kilix Land.
+
 ## Watch the episode
 
 https://github.com/user-attachments/assets/be594a53-03b3-466f-8d8e-f1687c92ca0e

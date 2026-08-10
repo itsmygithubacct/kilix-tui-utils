@@ -539,6 +539,21 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(plan.argv, ("/opt/kilix/kilix", "open-url"))
         self.assertNotIn("browse", plan.argv)
 
+    def test_pdf_conversion_uses_the_shared_app_verb_in_a_tab(self):
+        item = next(
+            item for item in registry.PROGRAMS
+            if item.label == "PDF Conversion"
+        )
+        with mock.patch.object(
+                registry, "kilix_command",
+                return_value=["/opt/kilix/kilix"]):
+            plan = registry.resolve(item)
+        self.assertEqual(
+            plan.argv,
+            ("/opt/kilix/kilix", "app", "run", "kilix-pdf-conversion"),
+        )
+        self.assertEqual(plan.verb, "tab")
+
     def test_unresolvable_items_carry_a_reason_not_a_crash(self):
         item = registry.Item("x", command="kilix-bonsai", kilix=("bonsai",))
         with mock.patch.object(registry.shutil, "which", return_value=None), \

@@ -53,6 +53,19 @@ class CatalogTests(unittest.TestCase):
         registry_labels = {item.label for item in registry.PROGRAMS}
         self.assertTrue(labels <= registry_labels)
 
+    def test_pdf_conversion_is_a_direct_pane_program(self):
+        rows = {r["label"]: r for r in catalog()}
+        self.assertEqual(
+            rows["PDF Conversion"]["argv"],
+            [
+                "/opt/kilix/kilix",
+                "app",
+                "run",
+                "kilix-pdf-conversion",
+            ],
+        )
+        self.assertEqual(rows["PDF Conversion"]["verb"], "tab")
+
     def test_terminal_apps_run_directly_and_gui_apps_are_contained(self):
         rows = {r["label"]: r for r in catalog()}
         self.assertEqual(rows["htop"]["argv"], ["htop"])
