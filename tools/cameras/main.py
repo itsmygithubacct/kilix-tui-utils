@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_desk import sources  # noqa: E402
+from kilix_desk import registry, sources  # noqa: E402
 from kilix_tui import app, keys as keymap, shell  # noqa: E402
 
 # The parser these limits mirror is kilix-rtsp's krtsp_config.c: a profile
@@ -70,6 +70,13 @@ def kilix_rtsp_command() -> list[str] | None:
         sources.component_dir("kilix-modules/kilix-rtsp"), "build", "kilix-rtsp")
     if os.access(built, os.X_OK):
         return [built]
+    # Nothing installed and nothing built: hand it to the host, whose `rtsp`
+    # verb installs the pinned build on first use.  That is the registry's
+    # own fallback order, and it is what turns "no viewer on this machine"
+    # from a dead end into a first run.
+    host = registry.kilix_command()
+    if host:
+        return host + ["rtsp"]
     return None
 
 
