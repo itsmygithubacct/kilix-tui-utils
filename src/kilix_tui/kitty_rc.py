@@ -240,7 +240,7 @@ def _text(value: Any) -> str:
     return str(value)
 
 
-def parse(state: list[dict[str, Any]]) -> Tree:
+def _parse(state: list[dict[str, Any]]) -> Tree:
     """Turn kitty's `ls` payload into the page/pane tree.
 
     Split out from `tree()` so the whole model is testable against a recorded
@@ -283,6 +283,18 @@ def parse(state: list[dict[str, Any]]) -> Tree:
     return tree
 
 
+def parse(state: list[dict[str, Any]]) -> Tree:
+    """Validate and turn kitty's ``ls`` payload into the page/pane tree."""
+    if not isinstance(state, list):
+        raise Unavailable("the terminal returned an unexpected payload")
+    try:
+        return _parse(state)
+    except (AttributeError, OverflowError, TypeError, ValueError) as exc:
+        raise Unavailable(
+            "the terminal returned malformed page or pane data"
+        ) from exc
+
+
 def tree() -> Tree:
     """The live page/pane tree."""
     raw = _run(["ls"])
@@ -290,8 +302,6 @@ def tree() -> Tree:
         state = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise Unavailable(f"could not parse the terminal's reply: {exc}") from exc
-    if not isinstance(state, list):
-        raise Unavailable("the terminal returned an unexpected payload")
     return parse(state)
 
 

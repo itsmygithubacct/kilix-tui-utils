@@ -157,7 +157,13 @@ def run(
     def _loop(stdscr: Any) -> int:
         nonlocal showing_help, started
         started = True
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            # Some otherwise usable terminals cannot change cursor
+            # visibility.  That cosmetic capability must not prevent the
+            # event loop from opening or its wrapper from restoring the tty.
+            pass
         stdscr.keypad(True)
         if mouse:
             try:

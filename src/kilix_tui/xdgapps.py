@@ -14,9 +14,11 @@ about the host machine is hardcoded.  ``scan()`` returns parsed entry dicts,
 of ``.desktop`` files) share the same parser.  How an entry is *opened* stays
 with each consumer, because that is where the paradigms genuinely differ.
 
-The scan is cached on the mtimes of every applications directory and
-``.desktop`` file, so calling ``scan()`` or ``grouped()`` per frame costs a
-handful of ``stat`` calls until something actually changes.
+The scan is cached on nanosecond metadata for every applications directory and
+``.desktop`` file. On Linux, recursive inotify watches make repeated calls
+constant-time while invalidating on the next call after a filesystem change;
+other platforms retain the metadata-walk fallback. ``force=True`` always
+refreshes immediately.
 
 This module is deliberately location-independent — pure stdlib, no
 intra-package imports — because it exists twice by design: authored here in
@@ -27,8 +29,11 @@ stays standalone-installable.
 
 Added in SDK 1.8; ``entries_in()`` and ``grouped(force=)`` added in SDK 1.9.
 """
+import ctypes
 import os
 import shutil
+import stat
+import threading
 
 # freedesktop main category → kilix bucket, in match priority order (a more
 # specific category wins over the generic Utility/System catch-alls)
@@ -56,6 +61,78 @@ _FIELD_CODES = "fFuUichkdDnNvm"
 
 _cache = None
 _cache_sig = None
+_cache_context = None
+_cache_watcher = None
+_cache_lock = threading.RLock()
+_MAX_DESKTOP_BYTES = 1024 * 1024
+
+_IN_MODIFY = 0x00000002
+_IN_ATTRIB = 0x00000004
+_IN_CLOSE_WRITE = 0x00000008
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_WATCH_MASK = (
+    _IN_MODIFY | _IN_ATTRIB | _IN_CLOSE_WRITE | _IN_MOVED_FROM | _IN_MOVED_TO
+    | _IN_CREATE | _IN_DELETE | _IN_DELETE_SELF | _IN_MOVE_SELF
+)
+
+
+class _Watcher:
+    """A private nonblocking inotify set; unavailable means metadata fallback."""
+
+    def __init__(self, fd, add_watch):
+        self.fd = fd
+        self._add_watch = add_watch
+
+    @classmethod
+    def create(cls):
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            init = libc.inotify_init1
+            add_watch = libc.inotify_add_watch
+        except (AttributeError, OSError):
+            return None
+        init.argtypes = [ctypes.c_int]
+        init.restype = ctypes.c_int
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+        fd = init(getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+        if fd < 0:
+            return None
+        return cls(fd, add_watch)
+
+    @property
+    def usable(self):
+        return self.fd >= 0
+
+    def add(self, path):
+        if self.fd < 0:
+            return
+        if self._add_watch(self.fd, os.fsencode(path), _WATCH_MASK) < 0:
+            self.close()
+
+    def changed(self):
+        if self.fd < 0:
+            return True
+        try:
+            return bool(os.read(self.fd, 65536))
+        except BlockingIOError:
+            return False
+        except OSError:
+            self.close()
+            return True
+
+    def close(self):
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
 
 
 # ── XDG locations ────────────────────────────────────────────────────────────
@@ -124,23 +201,37 @@ def parse_desktop_file(path):
     """Return the [Desktop Entry] key→value dict, or None if unreadable.
     First value wins for a repeated key; only the Desktop Entry group."""
     entry, in_group = {}, False
+    fd = -1
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                if s.startswith("[") and s.endswith("]"):
-                    in_group = (s == "[Desktop Entry]")
-                    continue
-                if not in_group or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                if k:
-                    entry.setdefault(k, v.strip())
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            data = stream.read(_MAX_DESKTOP_BYTES + 1)
+        if len(data) > _MAX_DESKTOP_BYTES:
+            return None
+        text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError, ValueError):
         return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            in_group = (s == "[Desktop Entry]")
+            continue
+        if not in_group or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k:
+            entry.setdefault(k, v.strip())
     return entry or None
 
 
@@ -215,62 +306,110 @@ def build_entry(p, path, fid):
 
 # ── scanning (cached on app-dir mtimes) ──────────────────────────────────────
 
-def _walk(root):
-    """(full_path, desktop-file id) for every *.desktop under root."""
-    out = []
-    for base, _dirs, files in os.walk(root):
-        for fn in files:
-            if fn.endswith(".desktop"):
-                full = os.path.join(base, fn)
-                rel = os.path.relpath(full, root)
-                out.append((full, rel.replace(os.sep, "-")))
-    return sorted(out, key=lambda t: t[1])
-
-
-def _mtime(d):
+def _stamp(path):
     try:
-        return os.stat(d).st_mtime
+        found = os.stat(path)
     except OSError:
-        return 0.0
+        return (0, 0, 0, 0, 0)
+    return (
+        found.st_mtime_ns,
+        found.st_ctime_ns,
+        found.st_size,
+        found.st_ino,
+        found.st_dev,
+    )
 
 
-def _sig(dirs):
-    """Mtimes of every dir and .desktop file under the app dirs, so an
-    in-place edit or a change inside a subdir invalidates the cache."""
-    out = []
-    for d in dirs:
-        for base, _subdirs, files in os.walk(d):
-            out.append((base, _mtime(base)))
-            for fn in files:
-                if fn.endswith(".desktop"):
-                    p = os.path.join(base, fn)
-                    out.append((p, _mtime(p)))
-    return tuple(out)
+def _snapshot(dirs, watcher=None):
+    """Return one stable file walk and its change-detection signature."""
+    walked, signature = [], []
+    for root in dirs:
+        root_files = []
+        pending = [root]
+        while pending:
+            base = pending.pop()
+            if watcher is not None:
+                watcher.add(base)
+            signature.append((base, *_stamp(base)))
+            try:
+                with os.scandir(base) as listing:
+                    entries = sorted(listing, key=lambda entry: entry.name)
+            except OSError:
+                continue
+            subdirs = []
+            for entry in entries:
+                try:
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_directory = False
+                if is_directory:
+                    subdirs.append(entry.path)
+                elif entry.name.endswith(".desktop"):
+                    rel = os.path.relpath(entry.path, root)
+                    root_files.append(
+                        (entry.path, rel.replace(os.sep, "-")))
+                    signature.append((entry.path, *_stamp(entry.path)))
+            pending.extend(reversed(subdirs))
+        walked.append(tuple(sorted(root_files, key=lambda item: item[1])))
+    return tuple(walked), tuple(signature)
+
+
+def _replace_watcher(watcher):
+    global _cache_watcher
+    old, _cache_watcher = _cache_watcher, watcher
+    if old is not None and old is not watcher:
+        old.close()
 
 
 def scan(force=False):
     """Parsed application entries, deduped by id (user dir wins), name-sorted.
-    Cached; only rescans when an app dir/file mtime changed or force=True."""
-    global _cache, _cache_sig
+    Cached; filesystem changes invalidate the next call and ``force`` rescans."""
+    global _cache, _cache_sig, _cache_context
     dirs = app_dirs()
-    sig = _sig(dirs)
-    if not force and _cache is not None and sig == _cache_sig:
-        return _cache
-    seen, entries = set(), []
-    for d in dirs:
-        for path, fid in _walk(d):
-            if fid in seen:                 # a higher-precedence dir won
-                continue
-            parsed = parse_desktop_file(path)
-            if parsed is None:              # unreadable: let a lower dir try
-                continue
-            seen.add(fid)
-            e = build_entry(parsed, path, fid)
-            if e is not None:
-                entries.append(e)
-    entries.sort(key=lambda e: e["name"].lower())
-    _cache, _cache_sig = entries, sig
-    return entries
+    context = (
+        tuple(os.path.abspath(directory) for directory in dirs),
+        tuple(_locale_variants()),
+        os.environ.get("PATH", ""),
+    )
+    with _cache_lock:
+        if (
+            not force
+            and _cache is not None
+            and context == _cache_context
+            and _cache_watcher is not None
+            and not _cache_watcher.changed()
+        ):
+            return _cache
+        watcher = _Watcher.create()
+        walked, sig = _snapshot(dirs, watcher)
+        if watcher is not None and not watcher.usable:
+            watcher = None
+        if (
+            not force
+            and _cache is not None
+            and context == _cache_context
+            and sig == _cache_sig
+        ):
+            _replace_watcher(watcher)
+            return _cache
+        seen, entries = set(), []
+        for files in walked:
+            for path, fid in files:
+                if fid in seen:                 # a higher-precedence dir won
+                    continue
+                parsed = parse_desktop_file(path)
+                if parsed is None:              # unreadable: let a lower dir try
+                    continue
+                seen.add(fid)
+                entry = build_entry(parsed, path, fid)
+                if entry is not None:
+                    entries.append(entry)
+        entries.sort(key=lambda entry: entry["name"].lower())
+        _cache = entries
+        _cache_sig = sig
+        _cache_context = context
+        _replace_watcher(watcher)
+        return entries
 
 
 def entries_in(directory):

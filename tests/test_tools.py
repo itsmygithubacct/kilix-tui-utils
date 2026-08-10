@@ -11,9 +11,14 @@ import glob
 import importlib.util
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -177,6 +182,99 @@ class SafetyTests(unittest.TestCase):
         # It must drive the existing commands, not carry its own logic.
         self.assertTrue({"pleb", "plebian-os-update", "systemctl"} <= seen)
 
+    def test_installer_refuses_a_symlinked_command_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            prefix = base / "prefix"
+            prefix.mkdir()
+            target = base / "unrelated"
+            target.mkdir()
+            (prefix / "bin").symlink_to(target, target_is_directory=True)
+            result = subprocess.run(
+                ["bash", str(ROOT / "install.sh")],
+                env=dict(
+                    os.environ,
+                    HOME=str(base / "home"),
+                    KILIX_TUI_UTILS_PREFIX=str(prefix),
+                ),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("symlinked install directory", result.stderr)
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_installer_uses_exclusive_random_temporary_launchers(self):
+        source = (ROOT / "install.sh").read_text()
+        self.assertIn('mktemp "$BIN/.${command_name}.XXXXXX"', source)
+        self.assertNotIn(".tmp.$", source)
+
+    def test_installer_replaces_launcher_symlink_instead_of_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            prefix = base / "prefix"
+            bin_dir = prefix / "bin"
+            unrelated = base / "unrelated"
+            bin_dir.mkdir(parents=True)
+            unrelated.mkdir()
+            (bin_dir / "kilix-calculator").symlink_to(
+                unrelated, target_is_directory=True,
+            )
+            result = subprocess.run(
+                ["bash", str(ROOT / "install.sh")],
+                env=dict(
+                    os.environ,
+                    HOME=str(base / "home"),
+                    KILIX_HOME=str(base / "missing-kilix"),
+                    KILIX_TUI_UTILS_PREFIX=str(prefix),
+                ),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            launcher = bin_dir / "kilix-calculator"
+            self.assertFalse(launcher.is_symlink())
+            self.assertTrue(launcher.is_file())
+            self.assertEqual(list(unrelated.iterdir()), [])
+
+    def test_installed_launcher_quotes_the_checkout_path_as_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            checkout = base / "repo $KILIX_TEST_EXPANSION ' quote"
+            tool = checkout / "tools" / "calculator"
+            tool.mkdir(parents=True)
+            shutil.copy2(ROOT / "install.sh", checkout / "install.sh")
+            (tool / "main.py").write_text(
+                "import sys\nprint('OK:' + '|'.join(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            prefix = base / "prefix"
+            installed = subprocess.run(
+                ["bash", str(checkout / "install.sh")],
+                env=dict(
+                    os.environ,
+                    HOME=str(base / "home"),
+                    KILIX_HOME=str(base / "missing-kilix"),
+                    KILIX_TUI_UTILS_PREFIX=str(prefix),
+                ),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            launched = subprocess.run(
+                [str(prefix / "bin" / "kilix-calculator"),
+                 "a b", "$literal"],
+                env=dict(os.environ, KILIX_TEST_EXPANSION="wrong"),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(launched.returncode, 0, launched.stderr)
+            self.assertEqual(launched.stdout.strip(), "OK:a b|$literal")
+
 
 class SharedCoreTests(unittest.TestCase):
     def test_human_bytes_and_duration(self):
@@ -212,6 +310,14 @@ class SharedCoreTests(unittest.TestCase):
         self.assertEqual(proc.disk_usage("/nonexistent/path/here"), (0, 0, 0))
         self.assertEqual(proc.pressure("nonexistent"), {})
 
+    def test_malformed_proc_values_degrade_instead_of_raising(self):
+        for malformed in ("not-a-number\n", "nan\n", "inf\n", "-1\n"):
+            with self.subTest(malformed=malformed), \
+                 mock.patch.object(proc, "_read", return_value=malformed):
+                self.assertEqual(proc.uptime_seconds(), 0.0)
+        with mock.patch.object(proc, "_read", return_value="model name\n"):
+            self.assertEqual(proc.cpu_model(), "unknown")
+
     def test_keymap_is_shared_not_per_tool(self):
         self.assertTrue(keymap.is_quit(ord("q")))
         self.assertTrue(keymap.is_quit(27))
@@ -223,6 +329,50 @@ class SharedCoreTests(unittest.TestCase):
         from kilix_tui import theme
         self.assertEqual(theme.setting("KILIX_DEFINITELY_NOT_SET", "fallback"),
                          "fallback")
+
+    def test_theme_loads_the_selected_sdk_without_poisoning_sys_path(self):
+        from kilix_tui import theme
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "kilix"
+            package = home / "config" / "kilix_sdk"
+            package.mkdir(parents=True)
+            (package / "settings.py").write_text(
+                "def load():\n    return {'KILIX_TEST_VALUE': 'selected'}\n",
+                encoding="utf-8",
+            )
+            poisoned_package = types.ModuleType("kilix_sdk")
+            poisoned_settings = types.ModuleType("kilix_sdk.settings")
+            poisoned_settings.load = lambda: {"KILIX_TEST_VALUE": "poisoned"}
+            previous_sdk = theme._SDK
+            before_path = list(sys.path)
+            private_before = {
+                name for name in sys.modules
+                if name.startswith("_kilix_tui_host_settings_")
+            }
+            try:
+                theme._SDK = None
+                with mock.patch.dict(
+                    sys.modules,
+                    {
+                        "kilix_sdk": poisoned_package,
+                        "kilix_sdk.settings": poisoned_settings,
+                    },
+                ), mock.patch.dict(
+                    os.environ,
+                    {"KILIX_HOME": str(home)},
+                    clear=False,
+                ):
+                    self.assertEqual(
+                        theme.setting("KILIX_TEST_VALUE", "fallback"),
+                        "selected",
+                    )
+                self.assertEqual(sys.path, before_path)
+            finally:
+                theme._SDK = previous_sdk
+                for name in list(sys.modules):
+                    if (name.startswith("_kilix_tui_host_settings_")
+                            and name not in private_before):
+                        sys.modules.pop(name, None)
 
     def test_only_the_main_tango_renderer_remains(self):
         self.assertFalse((ROOT / "src/kilix_tui/panel.py").exists())
@@ -378,6 +528,29 @@ class SharedShellTests(unittest.TestCase):
         # manager uses for "go up". The shared loop must only take "?".
         self.assertTrue(keymap.is_help_char(ord("?")))
         self.assertFalse(keymap.is_help_char(8))
+
+    def test_cursor_visibility_failure_does_not_abort_the_event_loop(self):
+        class Screen:
+            def keypad(self, _enabled):
+                pass
+
+            def erase(self):
+                pass
+
+            def refresh(self):
+                pass
+
+            def getch(self):
+                return ord("q")
+
+        def wrapper(loop):
+            return loop(Screen())
+
+        with mock.patch.object(app.curses, "wrapper", side_effect=wrapper), \
+             mock.patch.object(
+                 app.curses, "curs_set", side_effect=app.curses.error,
+             ):
+            self.assertEqual(app.run(lambda _surface, _state: None, None), 0)
 
     def test_every_tool_title_that_draws_a_frame_has_a_tip(self):
         titles = set()

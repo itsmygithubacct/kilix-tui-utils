@@ -1362,10 +1362,6 @@ class SafetyTests(unittest.TestCase):
             object.__setattr__(providers.PROVIDERS[0], "discover", original)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class WellKnownInstallResolutionTests(unittest.TestCase):
     """A vendor install must be findable even when PATH cannot see it."""
 
@@ -1417,3 +1413,7 @@ class WellKnownInstallResolutionTests(unittest.TestCase):
         with mock.patch.object(manage, "installed", return_value=""):
             report = manage.post_install_report(item)
         self.assertIn("does not resolve", report)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

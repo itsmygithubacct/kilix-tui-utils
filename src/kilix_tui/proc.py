@@ -8,6 +8,7 @@ worse than one that shows a blank field.
 """
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import time
@@ -23,7 +24,11 @@ def _read(path: str, default: str = "") -> str:
 
 
 def uptime_seconds() -> float:
-    return float((_read("/proc/uptime", "0 0").split() or ["0"])[0])
+    try:
+        value = float((_read("/proc/uptime", "0 0").split() or ["0"])[0])
+    except ValueError:
+        return 0.0
+    return value if math.isfinite(value) and value >= 0.0 else 0.0
 
 
 def loadavg() -> tuple[float, float, float]:
@@ -94,7 +99,9 @@ def per_core_usage(previous: CpuSample, current: CpuSample) -> list[float]:
 def cpu_model() -> str:
     for line in _read("/proc/cpuinfo").splitlines():
         if line.startswith("model name"):
-            return line.split(":", 1)[1].strip()
+            _key, separator, value = line.partition(":")
+            if separator and value.strip():
+                return value.strip()
     return "unknown"
 
 

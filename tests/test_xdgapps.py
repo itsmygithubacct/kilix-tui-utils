@@ -108,6 +108,59 @@ class ScanTests(unittest.TestCase):
         ]))
         self.assertEqual(self.scan(), [])
 
+    def test_hot_cache_keeps_identity_and_sees_same_size_replacement(self):
+        write_desktop(self.user, "same.desktop", "\n".join([
+            "[Desktop Entry]", "Type=Application", "Name=Cat",
+            "Exec=cat",
+        ]))
+        first = self.scan()
+        self.assertIs(xdgapps.scan(), first)
+        path = self.user / "applications" / "same.desktop"
+        before = path.stat()
+        replacement = path.with_suffix(".replacement")
+        replacement.write_text("\n".join([
+            "[Desktop Entry]", "Type=Application", "Name=Dog",
+            "Exec=dog",
+        ]), encoding="utf-8")
+        self.assertEqual(replacement.stat().st_size, before.st_size)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, path)
+        second = xdgapps.scan()
+        self.assertIsNot(second, first)
+        self.assertEqual([entry["name"] for entry in second], ["Dog"])
+
+    def test_metadata_fallback_still_invalidates_on_the_next_call(self):
+        write_desktop(self.user, "a.desktop", "\n".join([
+            "[Desktop Entry]", "Type=Application", "Name=A", "Exec=a",
+        ]))
+        xdgapps._replace_watcher(None)
+        with mock.patch.object(xdgapps._Watcher, "create", return_value=None):
+            first = self.scan()
+            write_desktop(self.user, "b.desktop", "\n".join([
+                "[Desktop Entry]", "Type=Application", "Name=B", "Exec=b",
+            ]))
+            applications = self.user / "applications"
+            timestamp = applications.stat().st_mtime + 100
+            os.utime(applications, (timestamp, timestamp))
+            second = xdgapps.scan()
+        self.assertIsNot(second, first)
+        self.assertEqual([entry["name"] for entry in second], ["A", "B"])
+
+    def test_special_and_oversized_files_are_ignored_without_blocking(self):
+        write_desktop(self.user, "good.desktop", "\n".join([
+            "[Desktop Entry]", "Type=Application", "Name=Good", "Exec=good",
+        ]))
+        applications = self.user / "applications"
+        (applications / "huge.desktop").write_bytes(
+            b"x" * (xdgapps._MAX_DESKTOP_BYTES + 1)
+        )
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFOs are unavailable on this platform")
+        os.mkfifo(applications / "pipe.desktop")
+        self.assertEqual(
+            [entry["name"] for entry in self.scan()], ["Good"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

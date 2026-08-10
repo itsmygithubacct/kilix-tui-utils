@@ -76,6 +76,17 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(got.panes), 5)
         self.assertEqual([p.index for p in got.pages], [1, 2, 3])
 
+    def test_malformed_terminal_payload_is_a_domain_error(self):
+        for payload in (
+            {},
+            [None],
+            [{"tabs": [{"id": "not-an-int"}]}],
+            [{"tabs": [{"id": float("inf")}]}],
+        ):
+            with self.subTest(payload=payload), \
+                 self.assertRaises(kitty_rc.Unavailable):
+                kitty_rc.parse(payload)
+
     def test_process_name_comes_from_the_last_foreground_process(self):
         got = tree()
         self.assertEqual(got.pages[0].panes[0].process, "nvim")

@@ -142,19 +142,9 @@ SECTIONS: dict[str, tuple[Item, ...]] = {
 
 
 def _sdk_settings():
-    """`kilix_sdk.settings`, or None — resolved the way `theme.py` does."""
-    import importlib
-    for home in (os.environ.get("KILIX_HOME", ""),
-                 sources.component_dir("kilix")):
-        config = os.path.join(home, "config") if home else ""
-        if config and os.path.isdir(os.path.join(config, "kilix_sdk")):
-            if config not in sys.path:
-                sys.path.insert(0, config)
-            try:
-                return importlib.import_module("kilix_sdk.settings")
-            except Exception:
-                return None
-    return None
+    """The one pinned SDK-settings loader shared with the TUI theme."""
+    from kilix_tui import theme
+    return theme.sdk_settings()
 
 
 def games() -> list[tuple[str, str, bool]] | None:

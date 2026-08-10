@@ -985,10 +985,6 @@ class GraphicsBackendTests(unittest.TestCase):
         self.assertNotEqual(frame.rgb.count(b"\0"), len(frame.rgb))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TerminalRequirementTests(unittest.TestCase):
     """Answering a question must not need a screen, and a missing screen
     must not be a traceback."""
@@ -1043,3 +1039,7 @@ class TerminalRequirementTests(unittest.TestCase):
                 module.main(["--version"])
         self.assertIn("0.1.8", out.getvalue())
         self.assertNotIn("kilix           not present", out.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
