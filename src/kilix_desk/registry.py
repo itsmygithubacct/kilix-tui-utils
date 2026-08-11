@@ -59,6 +59,7 @@ PROGRAMS = (
     # The whole installable surface — catalog games and applications plus the
     # coding agents — behind the same command the CLI uses, so the desktop is
     # not a second list that can disagree with `kilix install`.
+    Item("Kilix applications", submenu="catalog apps"),
     Item("Install software", submenu="software"),
     Item("Games", submenu="games"),
     Item("Screensavers", submenu="screensavers", kilix_only=True),

@@ -53,6 +53,7 @@ TIPS: dict[str, str] = {
     "Session": "panes, pages and transcripts of what this terminal has shown",
     "Power": "every action here asks before it runs",
     "Software": "Enter installs; already-installed entries reinstall to their pin",
+    "Catalog apps": "every application comes from the host's one content catalog",
     "Voice": "speech tools share the stack's models, settings and diagnostics",
     "Default desktop": "Enter chooses what every later session starts with",
     "Games": "Enter toggles a game on or off for the whole stack",
@@ -235,6 +236,8 @@ class State:
             return self._default_desktop_entries()
         if self.submenu == "software":
             return self._software_entries()
+        if self.submenu == "catalog apps":
+            return self._catalog_application_entries()
         if self.submenu == "games":
             return self._game_entries()
         if self.submenu == "screensavers":
@@ -347,6 +350,33 @@ class State:
                 hint="installed" if installed else str(row.get("kind", "")),
             ))
         return out
+
+    def _catalog_application_entries(self) -> list[Entry]:
+        """Every catalog app, launched by the host in a page or in place."""
+        if self.software is None:
+            self.software = registry.installable()
+        rows = self.software
+        kilix = registry.kilix_command()
+        if rows is None or kilix is None:
+            return [Entry("the application catalog needs a Kilix checkout", None,
+                          reason="`kilix install --json` was not reachable")]
+        apps = [row for row in rows if row.get("kind") == "app"]
+        if not apps:
+            return [Entry("no catalog applications", None,
+                          reason="the host catalog returned no apps")]
+        verb = "tab" if self.live() else "inplace"
+        return [
+            Entry(
+                str(row.get("label") or row.get("id") or "Application"),
+                (*kilix, "app", "run", str(row.get("id", ""))),
+                verb=verb,
+                hint=("installed" if row.get("installed")
+                      else "installs on first use"),
+            )
+            for row in sorted(
+                apps, key=lambda item: str(item.get("label", "")).casefold())
+            if row.get("id")
+        ]
 
     def _game_entries(self) -> list[Entry]:
         rows = registry.games()

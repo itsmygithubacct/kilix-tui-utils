@@ -236,6 +236,25 @@ class SoftwarePlaceTests(unittest.TestCase):
         self.assertEqual(claude.hint, "installed")
         self.assertIsNotNone(claude.argv)
 
+    def test_catalog_app_place_launches_every_app_through_the_host(self):
+        state = make_state()
+        state.path = ["Programs", "Catalog apps"]
+        app_rows = [
+            *self.ROWS,
+            {"id": "kilix-file", "label": "File Manager", "kind": "app",
+             "installed": True},
+        ]
+        with mock.patch.object(registry, "installable", return_value=app_rows), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            rows = [row for row in state.entries() if not row.back]
+        self.assertEqual([row.label for row in rows], ["File Manager"])
+        self.assertEqual(
+            rows[0].argv,
+            ("/opt/kilix/kilix", "app", "run", "kilix-file"),
+        )
+        self.assertEqual(rows[0].verb, "inplace")
+
     def test_the_launcher_is_asked_once_per_visit_not_once_per_frame(self):
         """`entries()` runs on every keystroke; shelling out there would crawl."""
         with mock.patch.object(registry, "installable",

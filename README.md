@@ -96,6 +96,11 @@ the highlighted entry. The list comes from `kilix install --json` rather than
 from a catalogue kept here, because a second reader is a second thing to keep
 true. It is fetched once per visit and re-asked on `r`.
 
+Programs ▸ **Kilix applications** filters that same host response to
+applications and launches each through `kilix app run ID`. The row is generic:
+new catalog apps appear in TUI panes and in Kilix Land's shared Programs
+computer without another desktop-specific edit.
+
 Three more Programs surfaces follow the same discipline. **Run a command**
 (also `!` from anywhere) opens a one-line prompt on the summary row; what you
 type is split like a shell would split it but never given to one — argv only,
