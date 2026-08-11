@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from collections import defaultdict
 import math
 import os
-from pathlib import Path
 import re
 import time
-from typing import Iterable
-
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable
 
 _NATURAL_PART = re.compile(r"(\d+)")
 
@@ -133,6 +132,69 @@ class Sample:
     temperatures: dict[str, float]
     fans: dict[str, int]
     metrics: SystemMetrics
+
+
+def sensors_from_telemetry(
+    snapshot: Any,
+) -> tuple[list[TemperatureSensor], list[FanSensor]]:
+    temperatures = [
+        TemperatureSensor(
+            key=sensor.key,
+            chip=sensor.chip,
+            label=sensor.label,
+            source=sensor.source,
+            path=None,
+            warning_hint=sensor.warning_celsius,
+            critical_hint=sensor.critical_celsius,
+        )
+        for sensor in snapshot.thermal
+    ]
+    fans = [
+        FanSensor(
+            key=sensor.key,
+            chip=sensor.chip,
+            label=sensor.label,
+            source=sensor.source,
+            path=None,
+        )
+        for sensor in snapshot.fans
+    ]
+    return temperatures, fans
+
+
+def sample_from_telemetry(snapshot: Any) -> Sample:
+    grouped_cpu: defaultdict[str, float] = defaultdict(float)
+    grouped_instances: defaultdict[str, int] = defaultdict(int)
+    for process in snapshot.processes:
+        percent = max(0.0, float(process.cpu_cores) * 100.0)
+        if percent < 0.05:
+            continue
+        grouped_cpu[process.name] += percent
+        grouped_instances[process.name] += 1
+    top_processes = [
+        ProcessLoad(name, grouped_cpu[name], grouped_instances[name])
+        for name in grouped_cpu
+    ]
+    top_processes.sort(key=lambda process: (-process.cpu_percent, process.name.lower()))
+    system = snapshot.system
+    return Sample(
+        timestamp=datetime.fromtimestamp(
+            snapshot.wall_time_ns / 1_000_000_000
+        ).astimezone(),
+        monotonic=snapshot.monotonic_ns / 1_000_000_000,
+        temperatures={sensor.key: sensor.celsius for sensor in snapshot.thermal},
+        fans={sensor.key: sensor.rpm for sensor in snapshot.fans},
+        metrics=SystemMetrics(
+            cpu_percent=system.cpu_percent,
+            load_1=system.load_1,
+            load_5=system.load_5,
+            load_15=system.load_15,
+            cpu_count=system.logical_cpus,
+            uptime_seconds=system.uptime_seconds,
+            memory_percent=system.memory_percent,
+            top_processes=tuple(top_processes[:5]),
+        ),
+    )
 
 
 class ProcSampler:
@@ -298,6 +360,16 @@ class SensorBackend:
         self.root = Path(root)
         self._proc = ProcSampler(self.root)
 
+    def _shared_snapshot(self) -> Any | None:
+        if self.root != Path("/"):
+            return None
+        try:
+            from kilix_tui.telemetry import snapshot
+
+            return snapshot()
+        except (ImportError, OSError):
+            return None
+
     def discover_temperatures(self) -> list[TemperatureSensor]:
         sensors: list[TemperatureSensor] = []
         thermal_root = self.root / "sys/class/thermal"
@@ -381,6 +453,8 @@ class SensorBackend:
         return fans
 
     def discover(self) -> tuple[list[TemperatureSensor], list[FanSensor]]:
+        if shared := self._shared_snapshot():
+            return sensors_from_telemetry(shared)
         return self.discover_temperatures(), self.discover_fans()
 
     def sample(
@@ -388,6 +462,8 @@ class SensorBackend:
         temperatures: Iterable[TemperatureSensor],
         fans: Iterable[FanSensor],
     ) -> Sample:
+        if shared := self._shared_snapshot():
+            return sample_from_telemetry(shared)
         now = datetime.now().astimezone()
         monotonic = time.monotonic()
         temperature_values: dict[str, float] = {}

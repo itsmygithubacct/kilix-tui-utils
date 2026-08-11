@@ -7,14 +7,14 @@ psutil while retaining an injectable root for deterministic tests.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 import math
-from pathlib import Path
 import pwd
 import socket
 import time
-
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable
 
 KIB = 1024
 MIB = 1024 * KIB
@@ -313,6 +313,103 @@ def _parse_status(text: str) -> dict[str, str]:
     return values
 
 
+def snapshot_from_telemetry(
+    snapshot: Any,
+    *,
+    hostname: str,
+    user_name: Callable[[int], str],
+) -> MemorySnapshot:
+    """Adapt the shared schema without making this standalone app depend on it."""
+    system = snapshot.system
+    pressure_values = system.pressure.get("memory", {})
+
+    def pressure_line(kind: str) -> PressureLine:
+        return PressureLine(
+            avg10=float(pressure_values.get(f"{kind}_avg10", 0.0)),
+            avg60=float(pressure_values.get(f"{kind}_avg60", 0.0)),
+            avg300=float(pressure_values.get(f"{kind}_avg300", 0.0)),
+            total_us=max(0, int(pressure_values.get(f"{kind}_total", 0))),
+        )
+
+    vm = system.vm
+
+    def sum_prefix(prefix: str) -> int:
+        return sum(int(value) for key, value in vm.items() if key.startswith(prefix))
+
+    def reclaim_total(prefix: str) -> int:
+        caller_keys = (f"{prefix}_kswapd", f"{prefix}_direct")
+        if any(key in vm for key in caller_keys):
+            return sum(int(vm.get(key, 0)) for key in caller_keys)
+        return int(vm.get(f"{prefix}_anon", 0)) + int(
+            vm.get(f"{prefix}_file", 0)
+        )
+
+    processes = tuple(
+        ProcessMemory(
+            pid=process.pid,
+            ppid=process.ppid,
+            uid=process.uid,
+            user=user_name(process.uid),
+            name=process.name,
+            state=process.state,
+            threads=process.threads,
+            rss=process.rss_bytes,
+            virtual=process.virtual_bytes,
+            anon=process.anon_bytes,
+            file=process.file_bytes,
+            shared=process.shared_bytes,
+            command=process.command,
+        )
+        for process in snapshot.processes
+    )
+    return MemorySnapshot(
+        timestamp=datetime.fromtimestamp(
+            snapshot.wall_time_ns / 1_000_000_000
+        ).astimezone(),
+        monotonic=snapshot.monotonic_ns / 1_000_000_000,
+        hostname=hostname,
+        memory=MemoryStats(
+            total=system.memory_total,
+            available=system.memory_available,
+            free=system.memory_free,
+            buffers=system.memory_buffers,
+            cached=system.memory_cached,
+            reclaimable=system.memory_reclaimable,
+            shmem=system.memory_shared,
+            active=system.memory_active,
+            inactive=system.memory_inactive,
+            anon=system.memory_anon,
+            slab=system.memory_slab,
+            page_tables=system.memory_page_tables,
+            kernel_stack=system.memory_kernel_stack,
+            dirty=system.memory_dirty,
+            writeback=system.memory_writeback,
+            swap_total=system.swap_total,
+            swap_free=system.swap_free,
+            huge_total=system.memory_huge_total,
+            huge_free=system.memory_huge_free,
+            huge_page_size=system.memory_huge_page_size,
+        ),
+        pressure=MemoryPressure(
+            some=pressure_line("some"),
+            full=pressure_line("full"),
+            supported=bool(pressure_values),
+        ),
+        vm=VmCounters(
+            page_faults=int(vm.get("pgfault", 0)),
+            major_faults=int(vm.get("pgmajfault", 0)),
+            swap_in=int(vm.get("pswpin", 0)),
+            swap_out=int(vm.get("pswpout", 0)),
+            page_scan=reclaim_total("pgscan"),
+            page_steal=reclaim_total("pgsteal"),
+            oom_kills=int(vm.get("oom_kill", 0)),
+            alloc_stalls=sum_prefix("allocstall"),
+            compact_stalls=int(vm.get("compact_stall", 0)),
+        ),
+        processes=processes,
+    )
+
+
 class LinuxMemoryBackend:
     """Collect one coherent-enough snapshot from a Linux procfs tree."""
 
@@ -400,6 +497,20 @@ class LinuxMemoryBackend:
         return tuple(rows)
 
     def sample(self) -> MemorySnapshot:
+        if self.root == Path("/"):
+            try:
+                from kilix_tui.telemetry import snapshot as shared_snapshot
+
+                shared = shared_snapshot()
+            except (ImportError, OSError):
+                shared = None
+            if shared is not None:
+                try:
+                    return snapshot_from_telemetry(
+                        shared, hostname=self.hostname, user_name=self._user
+                    )
+                except (AttributeError, OverflowError, TypeError, ValueError):
+                    pass
         memory = parse_meminfo(_read_text(self.proc / "meminfo"))
         pressure_text = _read_text(self.proc / "pressure" / "memory")
         pressure = parse_pressure(pressure_text)

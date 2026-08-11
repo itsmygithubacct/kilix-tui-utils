@@ -1,10 +1,12 @@
 # Kilix Temps
 
 `kilix-temps` is a live thermal-headroom dashboard for **Kilix**, **Pleb**, and
-**Plebian-OS**. It reads Linux thermal zones, hardware-monitor temperatures,
+**Plebian-OS**. It displays Linux thermal zones, hardware-monitor temperatures,
 fan tachometers, CPU utilization, load, memory, and uptime without requiring
-root access or a background service. A low-frequency `/proc` sampler also
-groups the hottest CPU consumers, so an alert identifies likely heat sources
+root access. Under Kilix 0.1.9 and later these come from the same private local
+`kilix-telemetry` ring used by chrome and the other dashboards; standalone
+launches transparently read procfs/sysfs instead. Current process CPU rates
+also group the hottest consumers, so an alert identifies likely heat sources
 such as several concurrent compiler, emulator, game, or agent processes.
 
 The default interface is the canonical Kilix text TUI, with the same header,

@@ -23,7 +23,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
+from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402, I001
 
 TOOLS = [
     "calculator", "cpu", "disk", "system", "volume",
@@ -556,6 +556,42 @@ class SharedShellTests(unittest.TestCase):
                  app.curses, "curs_set", side_effect=app.curses.error,
              ):
             self.assertEqual(app.run(lambda _surface, _state: None, None), 0)
+
+    def test_timeout_tick_updates_state_before_the_next_frame(self):
+        state = object()
+        updates = []
+
+        class Screen:
+            keys = iter((-1, ord("q")))
+
+            def keypad(self, _enabled):
+                pass
+
+            def timeout(self, _milliseconds):
+                pass
+
+            def erase(self):
+                pass
+
+            def refresh(self):
+                pass
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch.object(
+            app.curses, "wrapper", side_effect=lambda loop: loop(Screen())
+        ), mock.patch.object(app.curses, "curs_set"):
+            self.assertEqual(
+                app.run(
+                    lambda _surface, _state: None,
+                    state,
+                    tick_ms=10,
+                    on_tick=updates.append,
+                ),
+                0,
+            )
+        self.assertEqual(updates, [state])
 
     def test_every_tool_title_that_draws_a_frame_has_a_tip(self):
         titles = set()

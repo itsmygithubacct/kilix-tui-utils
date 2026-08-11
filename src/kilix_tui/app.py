@@ -138,14 +138,16 @@ def run(
     *,
     handle: Callable[[int, Any], bool] | None = None,
     tick_ms: int | None = None,
+    on_tick: Callable[[Any], None] | None = None,
     mouse: bool = False,
     help_key: bool = True,
 ) -> int:
     """Run a tool interactively until it quits.
 
-    `handle` returns False to exit. `tick_ms` makes the loop wake up on its own
-    so a monitoring tool can refresh without input. `mouse` reports clicks and
-    the wheel as `curses.KEY_MOUSE` for `handle` to interpret via `getmouse`.
+    `handle` returns False to exit. `tick_ms` makes the loop wake up on its own;
+    `on_tick` updates state before the redraw, so monitors do not repaint stale
+    data. `mouse` reports clicks and the wheel as `curses.KEY_MOUSE` for
+    `handle` to interpret via `getmouse`.
 
     `help_key` puts `?` on every tool from here, so seventeen tools do not each
     implement the same overlay. Tools that read typed text — a calculator, a
@@ -179,7 +181,9 @@ def run(
                 help_overlay(stdscr, mouse=mouse)
             stdscr.refresh()
             key = stdscr.getch()
-            if key == -1:            # timeout tick: redraw only
+            if key == -1:
+                if on_tick is not None:
+                    on_tick(state)
                 continue
             if key == curses.KEY_RESIZE:
                 continue

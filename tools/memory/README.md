@@ -98,6 +98,11 @@ than one process. Scanning every process's `smaps` for PSS would make the
 monitor itself materially heavier, so Kilix Memory does not do that in its
 continuous process table.
 
+Inside Kilix 0.1.9 and later, these fields and the process table come from the
+single per-user `kilix-telemetry` snapshot already used by terminal chrome and
+the other system dashboards. A standalone launch uses the direct procfs reader
+described above; the presentation and accounting are identical.
+
 Some process rows can disappear during a sample because Linux processes are
 created and exit while `/proc` is scanned. Permission-restricted processes are
 skipped rather than failing the dashboard.
@@ -105,8 +110,9 @@ skipped rather than failing the dashboard.
 ## Privacy and storage
 
 Kilix Memory reads local kernel statistics and writes no history by default.
-It has no network client, telemetry, process-control action, configuration
-database, or background service.
+It has no network client, process-control action, or configuration database.
+Shared telemetry is a private local mmap ring; no measurements leave the
+machine, and the direct reader remains available without its daemon.
 
 ## License
 

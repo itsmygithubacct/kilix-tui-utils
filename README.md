@@ -51,6 +51,15 @@ Kilix-page launch behavior as the full desktop. The accessory tools share the
 shell, keymap, document opener, and OSC-52 clipboard support with the rest of
 the suite.
 
+CPU, Memory, and Temperatures consume one versioned `kilix-telemetry` snapshot
+when the suite is launched by Kilix. That record supplies global and per-core
+CPU use, frequency, RAM, swap, PSI, VM counters, processes, temperatures, and
+fan speeds to every surface without each pane walking `/proc` and `/sys`
+again. The same utilities retain their direct read-only collectors when run
+standalone or when the shared sampler is unavailable, so TUI, IceWM, Land, and
+remote-shell launches have the same data model without a hard service
+dependency.
+
 ## Watch the episode
 
 https://github.com/user-attachments/assets/be594a53-03b3-466f-8d8e-f1687c92ca0e
@@ -169,8 +178,10 @@ next tool gets it free.
 - `theme.py` — reads the shared `settings.conf` every Kilix component already
   uses, and falls back to built-in defaults when Kilix is not installed, so the
   tools still work over SSH or from a bare checkout.
-- `proc.py` — `/proc` and `/sys` readers shared by the monitors, so they agree
-  on what a number means. Readers never raise on a missing path.
+- `telemetry.py` — the optional client for Kilix's private shared-memory ring;
+  daemon startup is rate-limited and every utility keeps its direct fallback.
+- `proc.py` — resilient `/proc` and `/sys` fallback readers shared by the
+  monitors. Readers never raise on a missing path.
 - `kitty_rc.py` — the authenticated client for the terminal's own remote
   control. It is a convenience, never a privilege: Kilix scopes the credential
   it hands each pane at the terminal, so a tool asking for anything outside
