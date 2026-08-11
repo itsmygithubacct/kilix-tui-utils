@@ -179,7 +179,8 @@ next tool gets it free.
   uses, and falls back to built-in defaults when Kilix is not installed, so the
   tools still work over SSH or from a bare checkout.
 - `telemetry.py` — the optional client for Kilix's private shared-memory ring;
-  daemon startup is rate-limited and every utility keeps its direct fallback.
+  daemon startup requests are rate-limited and do not wait for readiness, and
+  every utility keeps its direct fallback.
 - `proc.py` — resilient `/proc` and `/sys` fallback readers shared by the
   monitors. Readers never raise on a missing path.
 - `kitty_rc.py` — the authenticated client for the terminal's own remote

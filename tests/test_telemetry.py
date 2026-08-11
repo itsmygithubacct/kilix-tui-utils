@@ -141,10 +141,14 @@ def shared_snapshot() -> SimpleNamespace:
 class SharedClientTests(unittest.TestCase):
     def test_client_start_is_rate_limited_and_direct_fallback_stays_in_app(self):
         client = mock.Mock()
+        client.paths = object()
+        starter = mock.Mock()
+        package = SimpleNamespace(ensure_running=starter)
         expected = shared_snapshot()
         client.snapshot.return_value = expected
         with (
             mock.patch.object(telemetry, "_CLIENT", client),
+            mock.patch.object(telemetry, "_package", return_value=package),
             mock.patch.object(telemetry, "_NEXT_START_ATTEMPT", 0.0),
             mock.patch("kilix_tui.telemetry.time.monotonic", side_effect=(1.0, 2.0)),
         ):
@@ -153,10 +157,11 @@ class SharedClientTests(unittest.TestCase):
         self.assertEqual(
             client.snapshot.call_args_list,
             [
-                mock.call(start=True, fallback=False, force=True),
+                mock.call(start=False, fallback=False, force=True),
                 mock.call(start=False, fallback=False, force=True),
             ],
         )
+        starter.assert_called_once_with(client.paths, timeout=0.0)
 
 
 class ConsumerAdapterTests(unittest.TestCase):

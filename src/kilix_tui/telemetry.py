@@ -119,7 +119,7 @@ def _client() -> Any | None:
 
 
 def snapshot(*, force: bool = True) -> Any | None:
-    """Return one shared record, leaving direct fallback to each utility."""
+    """Return one shared record without waiting for sampler readiness."""
     global _NEXT_START_ATTEMPT
     client = _client()
     if client is None:
@@ -129,9 +129,15 @@ def snapshot(*, force: bool = True) -> Any | None:
     if start:
         _NEXT_START_ATTEMPT = now + 30.0
     try:
-        return client.snapshot(start=start, fallback=False, force=force)
+        result = client.snapshot(start=False, fallback=False, force=force)
     except Exception:
-        return None
+        result = None
+    if start and (package := _package()) is not None:
+        try:
+            package.ensure_running(client.paths, timeout=0.0)
+        except Exception:
+            pass
+    return result
 
 
 __all__ = ["snapshot"]
