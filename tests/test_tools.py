@@ -29,6 +29,7 @@ TOOLS = [
     "calculator", "cpu", "disk", "system", "volume",
     "file", "launcher", "package", "session_log", "weather", "music",
     "plebian_control", "rollout_resume", "switcher", "cameras",
+    "character_map", "find_files", "notepad",
 ]
 
 
@@ -98,6 +99,10 @@ class ToolContractTests(unittest.TestCase):
                 continue
             with self.subTest(tool=name):
                 state = make_state(module)
+                # Text editors type ordinary q; their exit chord is Ctrl-Q.
+                if name == "notepad":
+                    self.assertFalse(module.handle(ord("q") - 96, state))
+                    continue
                 # The calculator types 'q' into a non-empty entry by design.
                 if name == "calculator":
                     state.entry = ""

@@ -320,7 +320,11 @@ def _soft_raster_module() -> Any:
         # packaged installations may provide it normally through site-packages.
         repository_root = Path(__file__).resolve().parents[3]
         candidates = (
+            repository_root.parents[1]
+            / "kilix-modules/soft-raster/python/src",
             repository_root.parents[1] / "kilix-modules/soft-raster-py/src",
+            repository_root.parents[1]
+            / "kilix/third_party/soft-raster/python/src",
             repository_root.parents[1] / "kilix/third_party/soft-raster-py/src",
         )
         for candidate in candidates:

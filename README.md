@@ -18,6 +18,11 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-system` | Static machine facts (`--print` for plain output) |
 | `kilix-volume` | Output volume and sink selection |
 | `kilix-file` | File manager — navigate and open, never delete or move |
+| `kilix-system-center` | Focused machine center over CPU, memory, thermal, disk, network, audio, camera, package, and VM tools |
+| `kilix-settings-center` | Shared Kilix settings, display, audio, voice, and default-desktop center |
+| `kilix-software-center` | Catalog browser and confirmed installer using `kilix install` |
+| `kilix-session-center` | Panes, PTYs, switcher, logs, and remote-session tools in one place |
+| `kilix-voice-studio` | Speech commands, settings, models, status, and diagnostics |
 | `kilix-launcher` | Launcher catalog: stack programs, discovered XDG apps, your `.desktop` launchers, stack scripts, a run-a-command row, and the laptop session profiles (running ones marked, Enter opens or closes them through `kilix laptop`); `kilix launcher` opens it |
 | `kilix-package` | Installed packages, read-only |
 | `kilix-rollout-resume` | Recover Claude Code, Codex, and Kimi Code sessions; install and update those agents |
@@ -27,6 +32,9 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-cameras` | Camera views and stream profiles for kilix-rtsp — view a camera, mosaic a group, `n` writes a profile to `cameras.conf` |
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
 | `kilix-music` | Player driving kilix-amp over its control socket |
+| `kilix-character-map` | Search Unicode names/codepoints and copy with OSC 52 |
+| `kilix-notepad` | Portable UTF-8 editor with atomic saves and guarded discard |
+| `kilix-find-files` | Bounded filename/glob search that does not follow directory symlinks |
 | `kilix-temps` | Live temperature, fan, and thermal-headroom [dashboard](tools/temps/README.md) |
 | `kilix-virtualbox-manager` | Discover, launch, focus, and control VirtualBox VPN machines in Kilix tabs |
 | `kilix-tui` | **The text-native desktop** — see below |
@@ -35,6 +43,13 @@ The shared Programs registry includes **PDF Conversion** as a direct tab/pane
 application through `kilix app run kilix-pdf-conversion`. The same registry
 feeds both the TUI desktop and `kilix-launcher`, which is also the Programs
 object used by Kilix Land.
+
+The five center commands are focused applications over that same state and
+registry, not parallel menus. They stop at their own root when the user walks
+back, accept catalog action deep links, and retain the same in-place floor and
+Kilix-page launch behavior as the full desktop. The accessory tools share the
+shell, keymap, document opener, and OSC-52 clipboard support with the rest of
+the suite.
 
 ## Watch the episode
 
@@ -120,10 +135,14 @@ config. When it is the whole session
 ```sh
 ./install.sh                      # into ~/.local/bin
 KILIX_TUI_UTILS_PREFIX=/usr/local ./install.sh
+make runtime-check                # immutable-package launcher closure
 ```
 
 Each command is a small launcher that runs the tool from this checkout, so
 updating is `git pull` rather than a reinstall.
+`make runtime` builds the same closure under `.runtime/bin` without mutating
+the user's Start menu; `kilix-content` uses that explicit target when one
+package provides the full application suite.
 
 The pixel interfaces use workspace checkouts under
 `<source-root>/kilix-modules` (`../../kilix-modules` from this repository), or
@@ -153,6 +172,8 @@ next tool gets it free.
   that set is refused even though it holds the credential.
 - `shell.py` — the one four-row frame used by the desktop, managers, and every
   installed text utility.
+- `openers.py` — argv-only document dispatch shared by Files and Find Files.
+- `clipboard.py` — bounded OSC-52 copy support for text-native applications.
 - `kilix_desk/desk.py` and `kilix_desk/tango.py` — the one canonical text
   layout and palette used by `kilix-tui/main.py` and the interactive managers.
 

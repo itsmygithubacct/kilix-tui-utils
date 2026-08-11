@@ -8,7 +8,6 @@ one keystroke from a menu is how people lose data. Opening a file hands it to
 from __future__ import annotations
 
 import stat as stat_module
-import subprocess
 import time
 
 import os
@@ -18,7 +17,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
+from kilix_tui import app, keys as keymap, openers, proc, shell  # noqa: E402
 
 
 class State:
@@ -72,14 +71,7 @@ class State:
 
     def open_file(self, path: str) -> None:
         """Hand the file to the environment; never interpret it here."""
-        opener = os.environ.get("EDITOR") or "kilix"
-        args = [opener, "run", path] if opener == "kilix" else [opener, path]
-        try:
-            subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-            self.message = f"opened {os.path.basename(path)}"
-        except OSError as error:
-            self.message = f"cannot open: {error}"
+        _opened, self.message = openers.open_document(path)
 
 
 def render(surface, state: State) -> None:
@@ -119,6 +111,16 @@ def render(surface, state: State) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "--open" in argv:
+        index = argv.index("--open")
+        if index + 1 >= len(argv):
+            print("kilix-file: --open needs a path", file=sys.stderr)
+            return 2
+        opened, message = openers.open_document(os.path.abspath(argv[index + 1]))
+        if not opened:
+            print(f"kilix-file: {message}", file=sys.stderr)
+            return 1
+        return 0
     start = next((a for a in argv if not a.startswith("-")), None)
     state = State(start)
     if path := app.screenshot_argv(argv):

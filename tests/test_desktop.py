@@ -81,6 +81,30 @@ class ContractTests(unittest.TestCase):
         desk.handle(ord("6"), state)
         self.assertEqual(desk.SECTIONS[state.section], "Power")
 
+    def test_focused_centers_share_state_but_cannot_back_into_the_desktop(self):
+        module = load_entry()
+        state, action, action_input = module._focused_state(
+            ["--app", "system", "--action", "memory"])
+        module._apply_action(state, "system", action, action_input)
+        self.assertEqual(state.root_path, ("Machine",))
+        self.assertEqual(state.breadcrumb(), "System Center")
+        self.assertFalse(any(row.back for row in state.entries()))
+        self.assertEqual(state.entries()[state.selected].label, "Memory")
+        self.assertFalse(desk.handle(27, state))
+
+    def test_software_install_action_opens_the_shared_confirmation_boundary(self):
+        module = load_entry()
+        rows = [{"id": "doom", "label": "Doom", "kind": "game"}]
+        with mock.patch.object(registry, "installable", return_value=rows), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state, action, value = module._focused_state(
+                ["--app", "software", "--action", "install", "doom"])
+            module._apply_action(state, "software", action, value)
+        self.assertEqual(state.root_path, ("Programs", "Software"))
+        self.assertEqual(state.confirm,
+                         ("Install Doom", ("/opt/kilix/kilix", "install", "doom")))
+
 
 class NavigationTests(unittest.TestCase):
     def test_one_cursor_walks_in_and_out_of_places(self):

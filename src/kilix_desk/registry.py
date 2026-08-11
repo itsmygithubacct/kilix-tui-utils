@@ -47,6 +47,7 @@ PROGRAMS = (
     Item("Coding agents", command="kilix-rollout-resume",
          sibling="rollout_resume"),
     Item("Model store", command="kilix-bonsai", kilix=("bonsai",), verb="tab"),
+    Item("Region painter", kilix=("mask",), verb="tab"),
     Item("PDF Conversion",
          kilix=("app", "run", "kilix-pdf-conversion"), verb="tab"),
     Item("Web browser", kilix=("open-url",), verb="tab", kilix_only=True),
@@ -69,9 +70,23 @@ PROGRAMS = (
     Item("Music", command="kilix-music", sibling="music"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
+    Item("Voice Studio", submenu="voice"),
     Item("Read aloud", command="kilix-tts"),
     Item("Dictation", command="kilix-stt"),
     Item("File manager", command="kilix-file", sibling="file"),
+    Item("Find files", command="kilix-find-files", sibling="find_files"),
+    Item("Notepad", command="kilix-notepad", sibling="notepad"),
+    Item("Character map", command="kilix-character-map",
+         sibling="character_map"),
+)
+
+VOICE = (
+    Item("Read aloud", command="kilix-tts"),
+    Item("Dictation", command="kilix-stt"),
+    Item("Model store", command="kilix-bonsai", kilix=("bonsai",), verb="tab"),
+    Item("Voice settings", command="kilix-settings", kilix=("settings",)),
+    Item("Voice status", kilix=("voice", "status"), verb="report"),
+    Item("Voice doctor", kilix=("voice", "doctor"), verb="report"),
 )
 
 MACHINE = (
@@ -91,6 +106,7 @@ MACHINE = (
 
 SYSTEM = (
     Item("OS control", command="plebian-os", sibling="plebian_control"),
+    Item("Audio settings", command="kilix-volume", sibling="volume"),
     Item("Chrome settings", command="kilix-settings", kilix=("settings",)),
     Item("Screen size", kilix=("screen-size", "show"), verb="report"),
     Item("Stack status", kilix=("status",), verb="report"),

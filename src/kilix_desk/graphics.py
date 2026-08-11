@@ -74,7 +74,11 @@ def _soft_raster_backend() -> tuple[Any, Any]:
     except ImportError as original:
         package_root = Path(__file__).resolve().parents[2]
         candidates = (
+            package_root.parents[1]
+            / "kilix-modules/soft-raster/python/src",
             package_root.parents[1] / "kilix-modules/soft-raster-py/src",
+            package_root.parents[1]
+            / "kilix/third_party/soft-raster/python/src",
             package_root.parents[1] / "kilix/third_party/soft-raster-py/src",
         )
         module = None

@@ -53,6 +53,7 @@ TIPS: dict[str, str] = {
     "Session": "panes, pages and transcripts of what this terminal has shown",
     "Power": "every action here asks before it runs",
     "Software": "Enter installs; already-installed entries reinstall to their pin",
+    "Voice": "speech tools share the stack's models, settings and diagnostics",
     "Default desktop": "Enter chooses what every later session starts with",
     "Games": "Enter toggles a game on or off for the whole stack",
     "Games+play": "Enter plays; t turns a game on or off for the whole stack",
@@ -139,10 +140,14 @@ def visible_window(count: int, height: int, selected: int) -> int:
 
 
 class State:
-    def __init__(self, *, runner: Callable[[Sequence[str]], int] | None = None,
+    def __init__(self, *, root_path: Sequence[str] = (),
+                 application_name: str = "",
+                 runner: Callable[[Sequence[str]], int] | None = None,
                  quiet: Callable[[Sequence[str]], int] | None = None,
                  live: Callable[[], bool] | None = None) -> None:
-        self.path: list[str] = []        # [] | ["Programs"] | [..., "Games"]
+        self.root_path = tuple(root_path)
+        self.application_name = application_name
+        self.path: list[str] = list(self.root_path)
         self.selected = 0
         self.filter = ""
         self.filtering = False
@@ -219,7 +224,7 @@ class State:
         if self.filter:
             needle = self.filter.lower()
             rows = [row for row in rows if needle in row.label.lower()]
-        if self.path:
+        if len(self.path) > len(self.root_path):
             rows.insert(0, Entry(BACK_LABEL, None, back=True))
         return rows
 
@@ -236,6 +241,8 @@ class State:
             return self._screensaver_entries()
         if self.submenu == "applications":
             return self._application_entries()
+        if self.submenu == "voice":
+            return self._registry_entries(registry.VOICE)
         name = self.path[0]
         if name == "Home":
             return []
@@ -249,7 +256,15 @@ class State:
             # program, so it has no registry Item behind it.
             out.append(Entry("Run a command", None, prompt=True,
                              hint="type it yourself"))
-        for item in registry.SECTIONS.get(name, ()):
+        out.extend(self._registry_entries(registry.SECTIONS.get(name, ()), live=live))
+        return out
+
+    def _registry_entries(self, items, *, live: bool | None = None) -> list[Entry]:
+        """Resolve one registry list through the desktop's common launch policy."""
+        if live is None:
+            live = bool(self.live())
+        out: list[Entry] = []
+        for item in items:
             if item.kilix_only and not live:
                 continue
             if item.submenu:
@@ -409,6 +424,9 @@ class State:
         return [Entry(name, (*kilix, "screensaver", name)) for name in names]
 
     def breadcrumb(self) -> str:
+        if self.application_name:
+            tail = self.path[len(self.root_path):]
+            return " › ".join([self.application_name, *tail])
         return " › ".join(["Kilix", *self.path])
 
     def tip(self) -> str:
@@ -522,7 +540,8 @@ def render(surface, state: State) -> None:
         summary = state.message
         summary_role = "accent"
     elif state.filter:
-        count = max(0, len(state.entries()) - (1 if state.path else 0))
+        has_back = len(state.path) > len(state.root_path)
+        count = max(0, len(state.entries()) - int(has_back))
         summary = f"filter: {state.filter}_  ({count} match"
         summary += ")" if count == 1 else "es)"
         summary_role = "accent"
@@ -709,7 +728,7 @@ def _back(state: State) -> None:
         state.filtering = False
         state.selected = 0
         return
-    if state.path:
+    if len(state.path) > len(state.root_path):
         leaving = state.path[-1]
         state.path = state.path[:-1]
         state.message = ""
@@ -721,6 +740,8 @@ def _back(state: State) -> None:
 
 
 def _enter_section(state: State, section: int) -> None:
+    if state.root_path:
+        return
     state.path = [SECTIONS[section % len(SECTIONS)]]
     state.selected = 0
     state.message = ""
@@ -731,7 +752,7 @@ def _enter_section(state: State, section: int) -> None:
 def _quit(state: State) -> bool:
     # When the desktop is the whole session, quitting means a respawn or a
     # black screen, so it asks first. In a pane or over ssh it just quits.
-    if os.environ.get("KILIX_TUI_SESSION") == "1":
+    if not state.root_path and os.environ.get("KILIX_TUI_SESSION") == "1":
         state.confirm = ("Leave this session", QUIT_SENTINEL)
         return True
     return False
@@ -858,7 +879,7 @@ def handle(key: int, state: State) -> bool:
                 return True
     if key == keymap.ESCAPE:
         # Esc walks out one level at a time, then asks before leaving.
-        if state.filter or state.path:
+        if state.filter or len(state.path) > len(state.root_path):
             _back(state)
             return True
         return _quit(state)
@@ -868,7 +889,8 @@ def handle(key: int, state: State) -> bool:
         _enter_section(state, key - ord("1"))
         return True
     if key == ord("\t"):
-        _enter_section(state, self_next_section(state))
+        if not state.root_path:
+            _enter_section(state, self_next_section(state))
         return True
     if key in keymap.LEFT:
         _back(state)

@@ -100,7 +100,11 @@ def _soft_raster_backend() -> tuple[Any, Any]:
             "soft_raster",
             (
                 repository_root.parents[1]
+                / "kilix-modules/soft-raster/python/src",
+                repository_root.parents[1]
                 / "kilix-modules/soft-raster-py/src",
+                repository_root.parents[1]
+                / "kilix/third_party/soft-raster/python/src",
                 repository_root.parents[1]
                 / "kilix/third_party/soft-raster-py/src",
             ),
