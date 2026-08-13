@@ -6,6 +6,7 @@ all: runtime
 # argv boundaries and point back into the selected immutable checkout.
 runtime:
 	KILIX_TUI_UTILS_PREFIX="$(CURDIR)/.runtime" \
+	KILIX_TUI_UTILS_RELOCATABLE=1 \
 	KILIX_TUI_UTILS_SYNC_MENU=0 ./install.sh
 
 runtime-check: runtime

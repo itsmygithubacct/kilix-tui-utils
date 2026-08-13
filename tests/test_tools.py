@@ -280,6 +280,44 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(launched.returncode, 0, launched.stderr)
             self.assertEqual(launched.stdout.strip(), "OK:a b|$literal")
 
+    def test_relocatable_runtime_launcher_survives_checkout_rename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            stage = base / ".kilix-tui-utils.install-random"
+            tool = stage / "tools" / "calculator"
+            tool.mkdir(parents=True)
+            shutil.copy2(ROOT / "install.sh", stage / "install.sh")
+            (tool / "main.py").write_text(
+                "import sys\nprint('MOVED:' + '|'.join(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            installed = subprocess.run(
+                ["bash", str(stage / "install.sh")],
+                env=dict(
+                    os.environ,
+                    HOME=str(base / "home"),
+                    KILIX_TUI_UTILS_PREFIX=str(stage / ".runtime"),
+                    KILIX_TUI_UTILS_RELOCATABLE="1",
+                    KILIX_TUI_UTILS_SYNC_MENU="0",
+                ),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            selected = base / "kilix-tui-utils"
+            stage.rename(selected)
+            launcher = selected / ".runtime" / "bin" / "kilix-calculator"
+            self.assertNotIn(str(stage), launcher.read_text())
+            launched = subprocess.run(
+                [str(launcher), "after rename"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(launched.returncode, 0, launched.stderr)
+            self.assertEqual(launched.stdout.strip(), "MOVED:after rename")
+
 
 class SharedCoreTests(unittest.TestCase):
     def test_human_bytes_and_duration(self):
