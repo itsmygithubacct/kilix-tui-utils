@@ -19,7 +19,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 
-from kilix_desk import sources
+from kilix_desk import manual, sources
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -37,6 +37,7 @@ class Item:
     sibling: str | None = None       # tools/<dir> in this checkout
     source: str | None = None        # <dir>/main.py in this checkout
     kilix: tuple[str, ...] = ()      # `kilix <subcommand>` fallback
+    topic: str = ""                  # a help-book topic, paged by manual.py
     verb: str = "inplace"            # inplace | tab | report
     kilix_only: bool = False         # hidden outside a Kilix session
     submenu: str = ""                # opens a drill-down list instead
@@ -115,6 +116,9 @@ MACHINE = (
 
 SYSTEM = (
     Item("OS control", command="plebian-os", sibling="plebian_control"),
+    # The stack's help book — the topics Kilix 95's Help renders, with the
+    # recovery guide one Enter away rather than buried inside OS control.
+    Item("Manual", submenu="manual"),
     # `passwd` behind the held-output wrapper: the change itself is
     # interactive, the result is worth reading, and Home's security alert
     # points here when the login password is still the shipped default.
@@ -358,6 +362,10 @@ def resolve(item: Item) -> Plan | None:
         root = os.path.realpath(ROOT) + os.sep
         if path.startswith(root) and os.path.isfile(path):
             return Plan((sys.executable, path), item.verb)
+    if item.topic:
+        # The help book ships with the desktop, so this never misses: the
+        # book and the desk are the same checkout by construction.
+        return Plan((sys.executable, manual.PATH, item.topic), item.verb)
     if item.kilix:
         launcher = kilix_command()
         if launcher:

@@ -10,6 +10,7 @@ because that is what makes it safe to make a session out of.
 import importlib.util
 import os
 import shutil
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -19,7 +20,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_desk import desk, facts, graphics, gui, registry, tango  # noqa: E402
+from kilix_desk import desk, facts, graphics, gui, manual, registry, tango  # noqa: E402
 from kilix_tui import app, keys as keymap, kitty_rc, privileged  # noqa: E402
 
 
@@ -508,6 +509,171 @@ class SystemMenuTests(unittest.TestCase):
             desk.handle(ord("r"), state)
             state.entries()
         self.assertEqual(len(asks), 2, "r must relist")
+
+
+class ManualPlaceTests(unittest.TestCase):
+    """System ▸ Manual: the stack's help book, paged in place."""
+
+    def test_manual_is_a_system_place(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("System")
+        entry = next(e for e in state.entries() if e.label == "Manual")
+        self.assertEqual(entry.submenu, "manual")
+
+    def test_the_place_lists_every_topic_and_pages_it_in_place(self):
+        state = make_state()
+        state.path = ["System", "Manual"]
+        rows = [e for e in state.entries() if not e.back]
+        titles = [title for _key, title in manual.topics()]
+        self.assertEqual([e.label for e in rows], titles + ["Man pages"])
+        for row, (key, _title) in zip(rows, manual.topics()):
+            self.assertEqual(row.argv, (sys.executable, manual.PATH, key))
+            self.assertEqual(row.verb, "inplace")
+
+    def test_every_topic_renders_its_title_as_text(self):
+        for key, title in manual.topics():
+            text = manual.render(key)
+            self.assertIn(title, text)
+            self.assertTrue(text.endswith("\n"))
+
+    def test_the_recovery_ladder_walks_override_installed_then_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            override = Path(tmp) / "override.md"
+            installed = Path(tmp) / "installed" / "RECOVERY.md"
+            source = Path(tmp) / "pleb" / "docs" / "RECOVERY.md"
+            source.parent.mkdir(parents=True)
+            with mock.patch.object(manual, "PLEB_RECOVERY_DOC",
+                                   str(installed)), \
+                 mock.patch.object(manual.sources, "component_dir",
+                                   return_value=str(Path(tmp) / "pleb")), \
+                 mock.patch.dict(os.environ,
+                                 {"PLEB_RECOVERY_DOC_DST": str(override)}):
+                self.assertIsNone(manual.recovery_path())
+                source.write_text("# from source\n")
+                self.assertEqual(manual.recovery_path(), str(source))
+                installed.parent.mkdir()
+                installed.write_text("# installed\n")
+                self.assertEqual(manual.recovery_path(), str(installed))
+                override.write_text("# relocated\n")
+                self.assertEqual(manual.recovery_path(), str(override))
+
+    def test_the_recovery_entry_hints_which_way_the_launch_goes(self):
+        state = make_state()
+        state.path = ["System", "Manual"]
+        with mock.patch.object(manual, "recovery_path", return_value=None):
+            row = next(e for e in state.entries()
+                       if e.label == "Pleb Recovery Guide")
+            self.assertEqual(row.hint, "self-help steps")
+            self.assertIsNotNone(row.argv, "the fallback answers, "
+                                 "so the entry never disables")
+        with mock.patch.object(manual, "recovery_path",
+                               return_value="/doc/RECOVERY.md"):
+            row = next(e for e in state.entries()
+                       if e.label == "Pleb Recovery Guide")
+            self.assertEqual(row.hint, "installed guide")
+
+    def test_a_missing_guide_answers_with_self_help_not_a_refusal(self):
+        pages = []
+        with mock.patch.object(manual, "recovery_path", return_value=None), \
+             mock.patch.object(manual, "_page",
+                               side_effect=lambda text: pages.append(text)
+                               or 0):
+            self.assertEqual(manual.main(["recovery"]), 0)
+        self.assertIn("sudo /usr/local/sbin/plebian-os-install-deps",
+                      pages[0])
+        self.assertIn("libxxhash", pages[0])
+
+    def test_the_program_pages_standalone_the_way_the_desk_runs_it(self):
+        # The desk hands the manual an argv and the terminal, nothing else:
+        # the file must run outside any package context, and PAGER is the
+        # seam a test (or an operator) redirects.
+        with tempfile.TemporaryDirectory() as tmp:
+            guide = Path(tmp) / "RECOVERY.md"
+            guide.write_text("recover by rebooting\n")
+            env = dict(os.environ, PAGER="cat",
+                       PLEB_RECOVERY_DOC_DST=str(guide))
+            done = subprocess.run(
+                [sys.executable, manual.PATH, "recovery"], env=env,
+                capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("recover by rebooting", done.stdout)
+
+    def test_the_program_lists_its_topics_and_refuses_unknown_ones(self):
+        listed = subprocess.run(
+            [sys.executable, manual.PATH, "--list"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            [line.split("\t")[0] for line in listed.stdout.splitlines()],
+            [key for key, _title in manual.topics()])
+        unknown = subprocess.run(
+            [sys.executable, manual.PATH, "no-such-topic"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(unknown.returncode, 2)
+        self.assertIn("welcome", unknown.stderr)
+
+
+class ManPagesPlaceTests(unittest.TestCase):
+    """Manual ▸ Man pages: kilix-95's System Manual, as a filterable list."""
+
+    def test_the_place_lists_discovered_pages_and_enter_renders_one(self):
+        run_calls = []
+        state = make_state(runner=lambda argv: run_calls.append(argv) or 0)
+        pages = [{"name": "grep", "section": "1", "label": "grep (1)"}]
+        with mock.patch.object(manual, "man_pages", return_value=pages), \
+             mock.patch.object(desk, "_resolve_program", lambda name: name):
+            state.path = ["System", "Manual", "Man pages"]
+            rows = [e for e in state.entries() if not e.back]
+            self.assertEqual([e.label for e in rows], ["grep (1)"])
+            state.selected = 1                            # past ".."
+            desk.handle(10, state)
+        self.assertEqual(run_calls, [("man", "1", "grep")])
+
+    def test_discovery_parses_the_manpath_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            man1 = Path(tmp) / "man1"
+            man1.mkdir()
+            (man1 / "grep.1.gz").write_text("")
+            (man1 / "README").write_text("")            # not a page name
+            (man1 / "weird.1.tar").write_text("")       # unknown compression
+            man5 = Path(tmp) / "de" / "man5"            # localized tree
+            man5.mkdir(parents=True)
+            (man5 / "crontab.5").write_text("")
+            pages = manual.man_pages(roots=[tmp])
+        self.assertEqual([page["label"] for page in pages],
+                         ["crontab (5)", "grep (1)"])
+
+    def test_the_first_manpath_occurrence_wins(self):
+        with tempfile.TemporaryDirectory() as first, \
+                tempfile.TemporaryDirectory() as second:
+            for root in (first, second):
+                man1 = Path(root) / "man1"
+                man1.mkdir()
+                (man1 / "grep.1").write_text("")
+            pages = manual.man_pages(roots=[first, second])
+        self.assertEqual(len(pages), 1)
+
+    def test_the_scan_is_cached_per_visit_and_r_rescans(self):
+        asks = []
+        pages = [{"name": "grep", "section": "1", "label": "grep (1)"}]
+        with mock.patch.object(manual, "man_pages",
+                               side_effect=lambda: asks.append(1) or pages):
+            state = make_state()
+            state.path = ["System", "Manual", "Man pages"]
+            state.entries()
+            state.entries()
+            self.assertEqual(len(asks), 1)
+            desk.handle(ord("r"), state)
+            state.entries()
+        self.assertEqual(len(asks), 2, "r must rescan")
+
+    def test_an_empty_manpath_is_a_state_not_an_error(self):
+        with mock.patch.object(manual, "man_pages", return_value=[]):
+            state = make_state()
+            state.path = ["System", "Manual", "Man pages"]
+            rows = [e for e in state.entries() if not e.back]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].argv)
+        self.assertIn("manpath", rows[0].reason)
 
 
 class UpdateRestartTests(unittest.TestCase):

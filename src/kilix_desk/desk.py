@@ -36,7 +36,7 @@ from typing import Callable, Sequence
 
 from kilix_tui import keys as keymap, kitty_rc, privileged, shell
 
-from . import facts, registry, tango
+from . import facts, manual, registry, tango
 
 SECTIONS = ("Home", "Programs", "Machine", "System", "Session", "Power")
 QUIT_SENTINEL: tuple[str, ...] = ()
@@ -58,6 +58,8 @@ TIPS: dict[str, str] = {
     "Voice": "speech tools share the stack's models, settings and diagnostics",
     "Default desktop": "Enter chooses what every later session starts with",
     "Scripts": "the stack's own maintenance scripts; Enter runs one in place",
+    "Manual": "the stack's help book — Enter reads a topic in the pager",
+    "Man pages": "press / and type a command name — Enter opens its manual page",
     "Games": "Enter toggles a game on or off for the whole stack",
     "Games+play": "Enter plays; t turns a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
@@ -195,6 +197,7 @@ class State:
         self.default_desktop: str | None = None
         self.apps: dict[str, list[dict]] | None = None
         self.scripts: list[dict] | None = None
+        self.man_pages: list[dict] | None = None
         self.play_support: bool | None = None
         self.text_hits: dict = {}
 
@@ -272,6 +275,8 @@ class State:
             return self._screensaver_entries()
         if self.submenu == "scripts":
             return self._script_entries()
+        if self.submenu == "manual":
+            return self._manual_entries()
         if self.submenu == "applications":
             return self._application_entries()
         if self.submenu == "voice":
@@ -494,6 +499,44 @@ class State:
                                  "scripts directories")]
         return [Entry(str(row["label"]), tuple(row["argv"]))
                 for row in self.scripts]
+
+    def _manual_entries(self) -> list[Entry]:
+        """The stack's help book: topics at depth two, man pages below.
+
+        The book is `manual.TOPICS`, one text source however many surfaces
+        page it. The recovery guide resolves its document ladder when
+        launched, not when listed, so a guide installed after this desktop
+        started is still found; the hint says which way the launch will go —
+        the entry answers either way, because a recovery row that refuses is
+        useless at exactly the moment it is needed.
+        """
+        if len(self.path) == 3:
+            return self._man_page_entries()
+        guide = manual.recovery_path()
+        out: list[Entry] = []
+        for key, title in manual.topics():
+            hint = ""
+            if key == "recovery":
+                hint = "installed guide" if guide else "self-help steps"
+            out.append(Entry(title, (sys.executable, manual.PATH, key),
+                             hint=hint))
+        out.append(Entry("Man pages", None, submenu="man pages"))
+        return out
+
+    def _man_page_entries(self) -> list[Entry]:
+        """Every installed manual page, rendered by `man` in place.
+
+        The walk over the manpath is cached per visit like every other
+        list that costs more than a frame; `r` rescans. Thousands of rows
+        are what `/` exists for.
+        """
+        if self.man_pages is None:
+            self.man_pages = manual.man_pages()
+        if not self.man_pages:
+            return [Entry("no manual pages found", None,
+                          reason="nothing under the manpath directories")]
+        return [Entry(page["label"], ("man", page["section"], page["name"]))
+                for page in self.man_pages]
 
     def _screensaver_entries(self) -> list[Entry]:
         kilix = registry.kilix_command()
@@ -1017,6 +1060,7 @@ def handle(key: int, state: State) -> bool:
         state.default_desktop = None
         state.apps = None                # rescan the .desktop entries
         state.scripts = None             # relist the maintenance scripts
+        state.man_pages = None           # rescan the manpath
         state.play_support = None        # re-probe the launcher's verbs
         state.message = ""
         return True
