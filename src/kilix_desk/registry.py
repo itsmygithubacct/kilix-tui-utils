@@ -107,6 +107,10 @@ MACHINE = (
 
 SYSTEM = (
     Item("OS control", command="plebian-os", sibling="plebian_control"),
+    # `passwd` behind the held-output wrapper: the change itself is
+    # interactive, the result is worth reading, and Home's security alert
+    # points here when the login password is still the shipped default.
+    Item("Change password", command="passwd", verb="report"),
     Item("Audio settings", command="kilix-volume", sibling="volume"),
     Item("Chrome settings", command="kilix-settings", kilix=("settings",)),
     Item("Screen size", kilix=("screen-size", "show"), verb="report"),

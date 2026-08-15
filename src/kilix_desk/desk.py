@@ -161,6 +161,7 @@ class State:
         self.quiet = quiet or _quiet_run
         self.live = live or kitty_rc.available
         self.status = facts.status_rows()
+        self.alerts = facts.alerts()
         # `entries()` runs on every keystroke, so anything that costs a
         # subprocess or a filesystem walk is fetched once per visit rather
         # than per frame. `r` drops all of it.
@@ -482,6 +483,11 @@ def _put(surface, row: int, col: int, text: str, attr: int = 0) -> None:
 def _draw_home(surface, state: State, top: int,
                height: int, width: int) -> None:
     row = top
+    for line in state.alerts:
+        if row >= top + height - 1:
+            break
+        _put(surface, row, 2, f"! {line}"[: width - 3], tango.attr("alert"))
+        row += 1
     for label, value in state.status:
         if row >= top + height - 1:
             break
@@ -948,6 +954,7 @@ def handle(key: int, state: State) -> bool:
         return True
     if keymap.is_refresh(key):
         state.status = facts.status_rows()
+        state.alerts = facts.alerts()    # re-ask the security helper
         state.software = None            # re-ask the launcher for the list
         state.default_desktop = None
         state.apps = None                # rescan the .desktop entries

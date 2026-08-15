@@ -19,7 +19,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_desk import desk, graphics, gui, registry, tango  # noqa: E402
+from kilix_desk import desk, facts, graphics, gui, registry, tango  # noqa: E402
 from kilix_tui import app, keys as keymap, kitty_rc, privileged  # noqa: E402
 
 
@@ -274,6 +274,88 @@ class SoftwarePlaceTests(unittest.TestCase):
             rows = [e for e in self._state().entries() if not e.back]
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0].argv)
+
+
+class HomeAlertTests(unittest.TestCase):
+    """The default-password nag: confirmed or absent, never a guess."""
+
+    def test_uncertainty_never_nags(self):
+        # No helper (or no sudo) on this machine: not even a subprocess.
+        with mock.patch.object(facts.os, "access", return_value=False), \
+             mock.patch.object(facts.subprocess, "run",
+                               side_effect=AssertionError("must not run")):
+            self.assertFalse(facts.default_password())
+        # Helper present but `sudo -n` refuses or the password changed:
+        # still no nag.
+        with mock.patch.object(facts.shutil, "which",
+                               return_value="/usr/bin/sudo"), \
+             mock.patch.object(facts.os, "access", return_value=True), \
+             mock.patch.object(facts.subprocess, "run",
+                               return_value=mock.Mock(returncode=1)):
+            self.assertFalse(facts.default_password())
+
+    def test_the_check_is_the_bounded_helper_call(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((tuple(argv), kwargs.get("timeout")))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(facts.shutil, "which",
+                               return_value="/usr/bin/sudo"), \
+             mock.patch.object(facts.os, "access", return_value=True), \
+             mock.patch.object(facts.subprocess, "run", side_effect=run):
+            self.assertTrue(facts.default_password())
+        self.assertEqual(
+            calls, [(("sudo", "-n", facts.PASSWD_HELPER, "check"), 5)])
+
+    def test_no_alert_without_confirmation(self):
+        with mock.patch.object(facts, "default_password", return_value=False):
+            self.assertEqual(facts.alerts(), [])
+
+    def test_home_shows_the_alert_and_points_at_the_fix(self):
+        with mock.patch.object(facts, "default_password", return_value=True):
+            lines = facts.alerts()
+            state = make_state()
+        self.assertTrue(any("System" in line for line in lines))
+        state.section = desk.SECTIONS.index("Home")
+        text = app.render_to_text(desk.render, state)
+        self.assertIn("default password still set", text)
+        self.assertIn("Change password", text)
+
+    def test_refresh_reasks_the_alert(self):
+        with mock.patch.object(facts, "alerts", side_effect=[[], ["x"]]):
+            state = make_state()
+            self.assertEqual(state.alerts, [])
+            desk.handle(ord("r"), state)
+        self.assertEqual(state.alerts, ["x"])
+
+    def test_the_pixel_home_carries_the_alert(self):
+        with mock.patch.object(facts, "default_password", return_value=True):
+            state = make_state()
+        canvases: list[StubCanvas] = []
+
+        def factory(width, height):
+            canvas = StubCanvas(width, height)
+            canvases.append(canvas)
+            return canvas
+
+        renderer = graphics.DesktopRenderer(canvas_factory=factory)
+        renderer.render(state, 100, 30, (960, 560), clock="12:00")
+        drawn = " ".join(text for canvas in canvases for text in canvas.texts)
+        self.assertIn("default password still set", drawn)
+
+    def test_change_password_is_a_system_entry_with_held_output(self):
+        state = make_state(live=lambda: True)
+        state.section = desk.SECTIONS.index("System")
+        with mock.patch.object(registry.shutil, "which",
+                               lambda name: f"/usr/bin/{name}"), \
+             mock.patch.object(registry, "kilix_command", return_value=None):
+            entry = next(e for e in state.entries()
+                         if e.label == "Change password")
+        self.assertEqual(entry.verb, "report")
+        self.assertEqual(entry.argv[:2], ("sh", "-c"))
+        self.assertIn("/usr/bin/passwd", entry.argv[2])
 
 
 class SubmenuTests(unittest.TestCase):
