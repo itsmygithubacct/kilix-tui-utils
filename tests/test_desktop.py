@@ -1358,6 +1358,22 @@ class ResolutionTests(unittest.TestCase):
             plan = registry.resolve(item)
         self.assertEqual(plan.argv, ("/opt/kilix/kilix", "bonsai"))
 
+    def test_tmux_manager_falls_back_to_the_kilix_verb(self):
+        # `kilix tmux` installs-and-runs the manager — the same command the
+        # catalog's Tmux Sessions entry launches — so the row resolves on a
+        # machine that has never installed the binary.
+        item = next(i for i in registry.SESSION if i.label == "Tmux manager")
+        self.assertEqual(item.command, "tmux-tui")
+        with mock.patch.object(registry.shutil, "which", return_value=None), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            plan = registry.resolve(item)
+        self.assertEqual(plan.argv, ("/opt/kilix/kilix", "tmux"))
+        with mock.patch.object(registry.shutil, "which",
+                               return_value="/usr/bin/tmux-tui"):
+            self.assertEqual(registry.resolve(item).argv,
+                             ("/usr/bin/tmux-tui",))
+
     def test_web_browser_uses_the_real_browser_dispatch(self):
         item = next(
             item for item in registry.PROGRAMS if item.label == "Web browser"

@@ -178,9 +178,14 @@ SESSION = (
     Item("Session logs", command="kilix-session-log", sibling="session_log"),
     Item("PTY sessions", kilix=("pty",), kilix_only=True),
     Item("Mux terminal", kilix=("mux",), kilix_only=True),
-    Item("Tmux manager", command="tmux-tui"),
+    # `kilix tmux` installs-and-runs the manager — the same command the
+    # catalog's Tmux Sessions entry launches — so the row still resolves on
+    # a machine that has never installed the binary.
+    Item("Tmux manager", command="tmux-tui", kilix=("tmux",)),
     # The streaming tiers: serve holds a session open, attach drives it,
-    # view watches without a keyboard.
+    # view watches without a keyboard. Deliberately the host's own verbs,
+    # never a catalog app: they must work on a machine whose catalog has
+    # installed nothing.
     Item("Serve this session", kilix=("serve",), kilix_only=True),
     Item("Attach to a session", kilix=("attach",), kilix_only=True),
     Item("Watch a session", kilix=("view",), kilix_only=True),
