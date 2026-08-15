@@ -77,6 +77,10 @@ PROGRAMS = (
     # by category. The stack programs above stay a curated list; this place is
     # the uncurated rest of the computer.
     Item("Applications", submenu="applications"),
+    # The user's own desktop-folder launchers — the files a Create Launcher
+    # wizard writes — read from the same folders `kilix-launcher` reads, so
+    # a launcher made on any desktop is reachable from this one.
+    Item("Launchers", submenu="launchers"),
     Item("Music", command="kilix-music", sibling="music"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
@@ -293,6 +297,43 @@ def script_rows(dirs: list[str] | None = None) -> list[dict]:
             seen.add(name)
             out.append({"kind": "script", "label": name, "detail": "script",
                         "argv": [path], "verb": "inplace"})
+    return out
+
+
+def launcher_dirs() -> list[str]:
+    """The user's desktop-launcher folders: override first, then the roots
+    Kilix 95 and the host's bundled desktop actually write. One list for the
+    desk's Launchers place and the launcher catalog alike."""
+    override = os.environ.get("KILIX_DESKTOP_DIR")
+    if override:
+        return [override]
+    base = os.environ.get("GPU_TERMINAL_HOME") or os.path.expanduser(
+        "~/.local/gpu_terminal")
+    return [os.path.join(base, "kilix-95", "data", "desktop"),
+            os.path.join(base, "kilix", "data", "desktop")]
+
+
+def user_launchers() -> list[dict]:
+    """The user's own desktop-folder launchers, parsed like any `.desktop`.
+
+    The parser is the shared `kilix_tui.xdgapps` one, so a launcher a wizard
+    wrote renders here exactly as it renders in every other catalog. A file
+    present in more than one folder keeps its first (Kilix 95) reading, and a
+    machine with no folders is a state, not a fault.
+    """
+    from kilix_tui import xdgapps
+    out: list[dict] = []
+    seen: set[str] = set()
+    for directory in launcher_dirs():
+        try:
+            entries = xdgapps.entries_in(directory)
+        except Exception:
+            continue
+        for entry in entries:
+            if entry["id"] in seen:
+                continue
+            seen.add(entry["id"])
+            out.append(entry)
     return out
 
 

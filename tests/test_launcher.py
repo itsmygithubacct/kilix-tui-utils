@@ -67,6 +67,14 @@ class ScriptRowTests(unittest.TestCase):
         self.assertTrue(rows[0]["argv"][0].startswith(first))
 
 
+class LauncherFolderTests(unittest.TestCase):
+    def test_the_desk_shares_the_launcher_folder_source(self):
+        # One folder list and one reader for the launcher catalog and the
+        # desk's Launchers place: the two surfaces must never disagree about
+        # what the user's desktop folder holds.
+        self.assertIs(launcher.launcher_dirs, registry.launcher_dirs)
+
+
 class CatalogShapeTests(unittest.TestCase):
     def test_registry_submenus_stay_desk_places(self):
         submenu = mock.Mock(label="Games", submenu=True)

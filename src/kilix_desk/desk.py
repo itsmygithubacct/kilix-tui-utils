@@ -64,6 +64,7 @@ TIPS: dict[str, str] = {
     "Games+play": "Enter plays; t turns a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
     "Applications": "what this machine itself installs — the stack list is above",
+    "Launchers": "your own desktop-folder launchers, from any desktop's Create Launcher",
 }
 
 
@@ -158,6 +159,29 @@ def report_argv(argv: Sequence[str]) -> tuple[str, ...]:
             f"{quoted}; printf '\\n— press Enter to return —'; read -r _")
 
 
+def _freedesktop_entry(app: dict, kilix: Sequence[str] | None) -> Entry | None:
+    """One parsed `.desktop` entry under the desk's containment policy.
+
+    Terminal applications launch like any tool (a page inside Kilix, in place
+    elsewhere). GUI applications go through `kilix run`, the same containment
+    Kilix 95 uses — so without a Kilix checkout they are listed disabled with
+    the reason, not launched raw onto whatever display may or may not exist.
+    None means the entry does not parse to an argv at all.
+    """
+    try:
+        argv = tuple(shlex.split(app["exec"]))
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    if app.get("terminal"):
+        return Entry(app["name"], argv, verb="tab")
+    if kilix is None:
+        return Entry(app["name"], None,
+                     reason="needs a Kilix checkout to contain it")
+    return Entry(app["name"], (*kilix, "run", *argv), verb="tab")
+
+
 def visible_window(count: int, height: int, selected: int) -> int:
     """The first visible index, keeping the selection on screen."""
     if height <= 0 or count <= height:
@@ -196,6 +220,7 @@ class State:
         self.software: list[dict] | None = None
         self.default_desktop: str | None = None
         self.apps: dict[str, list[dict]] | None = None
+        self.launchers: list[dict] | None = None
         self.scripts: list[dict] | None = None
         self.man_pages: list[dict] | None = None
         self.play_support: bool | None = None
@@ -279,6 +304,8 @@ class State:
             return self._manual_entries()
         if self.submenu == "applications":
             return self._application_entries()
+        if self.submenu == "launchers":
+            return self._launcher_entries()
         if self.submenu == "voice":
             return self._registry_entries(registry.VOICE)
         name = self.path[0]
@@ -463,25 +490,32 @@ class State:
                     for bucket, rows in groups.items()]
         bucket = self.path[2]
         kilix = registry.kilix_command()
-        out: list[Entry] = []
-        for app in groups.get(bucket, ()):
-            try:
-                argv = tuple(shlex.split(app["exec"]))
-            except ValueError:
-                continue
-            if not argv:
-                continue
-            if app.get("terminal"):
-                out.append(Entry(app["name"], argv, verb="tab"))
-            elif kilix is None:
-                out.append(Entry(app["name"], None,
-                                 reason="needs a Kilix checkout to contain it"))
-            else:
-                out.append(Entry(app["name"], (*kilix, "run", *argv),
-                                 verb="tab"))
+        out = [entry for app in groups.get(bucket, ())
+               if (entry := _freedesktop_entry(app, kilix)) is not None]
         if not out:
             return [Entry("nothing launchable in this bucket", None,
                           reason="every entry here failed to parse")]
+        return out
+
+    def _launcher_entries(self) -> list[Entry]:
+        """The user's own desktop-folder launchers, launched like Applications.
+
+        The listing is `registry.user_launchers()`, shared with the launcher
+        catalog, so the two surfaces can never disagree about what the user's
+        desktop folder holds. Same containment policy as discovered apps:
+        terminal launchers run like any tool, GUI ones through `kilix run`.
+        """
+        if self.launchers is None:
+            self.launchers = registry.user_launchers()
+        if not self.launchers:
+            return [Entry("no launchers yet", None,
+                          reason="no .desktop files in the desktop folders")]
+        kilix = registry.kilix_command()
+        out = [entry for app in self.launchers
+               if (entry := _freedesktop_entry(app, kilix)) is not None]
+        if not out:
+            return [Entry("nothing launchable here", None,
+                          reason="every launcher failed to parse")]
         return out
 
     def _script_entries(self) -> list[Entry]:
@@ -1059,6 +1093,7 @@ def handle(key: int, state: State) -> bool:
         state.software = None            # re-ask the launcher for the list
         state.default_desktop = None
         state.apps = None                # rescan the .desktop entries
+        state.launchers = None           # reread the desktop folders
         state.scripts = None             # relist the maintenance scripts
         state.man_pages = None           # rescan the manpath
         state.play_support = None        # re-probe the launcher's verbs

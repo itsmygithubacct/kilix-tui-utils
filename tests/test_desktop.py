@@ -1048,6 +1048,102 @@ class ApplicationsPlaceTests(unittest.TestCase):
         self.assertEqual(len(asks), 2)
 
 
+class LaunchersPlaceTests(unittest.TestCase):
+    """Programs ▸ Launchers: the user's own desktop-folder `.desktop` files."""
+
+    LAUNCHERS = [
+        {"id": "mine.desktop", "name": "My Thing", "exec": "mything",
+         "terminal": True},
+        {"id": "site.desktop", "name": "My Site",
+         "exec": "firefox https://example.org", "terminal": False},
+    ]
+
+    def test_launchers_is_a_programs_place(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Programs")
+        entry = next(e for e in state.entries() if e.label == "Launchers")
+        self.assertEqual(entry.submenu, "launchers")
+
+    def test_terminal_launchers_run_directly_and_gui_ones_are_contained(self):
+        state = make_state()
+        with mock.patch.object(registry, "user_launchers",
+                               return_value=self.LAUNCHERS), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state.path = ["Programs", "Launchers"]
+            rows = {e.label: e for e in state.entries() if not e.back}
+        self.assertEqual(rows["My Thing"].argv, ("mything",))
+        self.assertEqual(rows["My Thing"].verb, "tab")
+        self.assertEqual(rows["My Site"].argv,
+                         ("/opt/kilix/kilix", "run", "firefox",
+                          "https://example.org"))
+
+    def test_gui_launchers_degrade_without_a_kilix_checkout(self):
+        state = make_state(runner=lambda argv: self.fail("must not run"))
+        with mock.patch.object(registry, "user_launchers",
+                               return_value=self.LAUNCHERS), \
+             mock.patch.object(registry, "kilix_command", return_value=None):
+            state.path = ["Programs", "Launchers"]
+            rows = {e.label: e for e in state.entries() if not e.back}
+        self.assertIsNone(rows["My Site"].argv)
+        self.assertIn("Kilix", rows["My Site"].reason)
+        self.assertEqual(rows["My Thing"].argv, ("mything",))
+
+    def test_an_empty_folder_is_a_state_not_an_error(self):
+        state = make_state()
+        with mock.patch.object(registry, "user_launchers", return_value=[]):
+            state.path = ["Programs", "Launchers"]
+            rows = [e for e in state.entries() if not e.back]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].argv)
+        self.assertIn("desktop folders", rows[0].reason)
+
+    def test_the_folders_are_read_once_per_visit_and_r_rereads(self):
+        asks = []
+        with mock.patch.object(
+                registry, "user_launchers",
+                side_effect=lambda: asks.append(1) or self.LAUNCHERS):
+            state = make_state()
+            state.path = ["Programs", "Launchers"]
+            state.entries()
+            state.entries()
+            self.assertEqual(len(asks), 1)
+            desk.handle(ord("r"), state)
+            state.entries()
+        self.assertEqual(len(asks), 2, "r must reread")
+
+    def test_user_launchers_read_the_folders_through_the_shared_parser(self):
+        with tempfile.TemporaryDirectory() as first, \
+                tempfile.TemporaryDirectory() as second:
+            (Path(first) / "thing.desktop").write_text(
+                "[Desktop Entry]\nType=Application\nName=Thing\n"
+                "Exec=thing\nTerminal=true\n")
+            (Path(second) / "thing.desktop").write_text(
+                "[Desktop Entry]\nType=Application\nName=Shadowed\n"
+                "Exec=shadowed\nTerminal=true\n")
+            (Path(second) / "other.desktop").write_text(
+                "[Desktop Entry]\nType=Application\nName=Other\n"
+                "Exec=other\nTerminal=true\n")
+            with mock.patch.object(registry, "launcher_dirs",
+                                   return_value=[first, second]):
+                rows = registry.user_launchers()
+        # The first (Kilix 95) folder wins a duplicated file name.
+        self.assertEqual([row["name"] for row in rows], ["Thing", "Other"])
+
+    def test_the_launcher_folders_are_the_desktop_data_roots(self):
+        with mock.patch.dict(os.environ,
+                             {"KILIX_DESKTOP_DIR": "/somewhere/desktop"}):
+            self.assertEqual(registry.launcher_dirs(),
+                             ["/somewhere/desktop"])
+        with mock.patch.dict(os.environ, {"GPU_TERMINAL_HOME": "/gt"},
+                             clear=False):
+            os.environ.pop("KILIX_DESKTOP_DIR", None)
+            self.assertEqual(
+                registry.launcher_dirs(),
+                [os.path.join("/gt", "kilix-95", "data", "desktop"),
+                 os.path.join("/gt", "kilix", "data", "desktop")])
+
+
 class TextMouseTests(unittest.TestCase):
     def test_render_records_the_hit_map(self):
         state = make_state()

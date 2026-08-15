@@ -110,7 +110,7 @@ applications and launches each through `kilix app run ID`. The row is generic:
 new catalog apps appear in TUI panes and in Kilix Land's shared Programs
 computer without another desktop-specific edit.
 
-Three more Programs surfaces follow the same discipline. **Run a command**
+Four more Programs surfaces follow the same discipline. **Run a command**
 (also `!` from anywhere) opens a one-line prompt on the summary row; what you
 type is split like a shell would split it but never given to one — argv only,
 into a Kilix page when remote control is live and in place otherwise, with
@@ -121,7 +121,11 @@ a byte-identical mirror of the host SDK's `kilix_sdk.xdgapps` kept by
 `tools/sync_xdgapps.py` and pinned by a parity test, so no desktop or
 catalog tool can disagree with this list), bucketed by
 category; terminal apps launch like any tool, graphical ones are contained in
-a `kilix run` page. And **Games** launches on Enter when the installed
+a `kilix run` page. **Launchers** lists the user's own desktop-folder
+`.desktop` files — the ones a Create Launcher wizard writes on any desktop —
+read from the same folders `kilix-launcher` reads
+(`kilix_desk.registry.launcher_dirs`), under the same containment. And
+**Games** launches on Enter when the installed
 launcher knows `kilix games play` — probed from its own usage line, cached per
 visit — while `t` keeps the availability toggle one key away; older launchers
 keep Enter as the toggle, so the list is never a dead end.
