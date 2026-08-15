@@ -156,6 +156,29 @@ class SafetyTests(unittest.TestCase):
                 self.assertNotIn(name, forbidden,
                                  f"file manager must not call {name}()")
 
+    def test_file_manager_records_the_read_only_parity_answer(self):
+        # F-FILEOPS/F-RECYCLE, decided: read-only is the answer, and the
+        # module says so where the next reader will look.
+        module = load("file")
+        for phrase in ("F-FILEOPS", "F-RECYCLE", "read-only",
+                       "Applications"):
+            self.assertIn(phrase, module.__doc__)
+
+    def test_file_manager_write_keys_answer_with_the_referral(self):
+        module = load("file")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = module.State(tmp)
+            for key in sorted(module.WRITE_KEYS):
+                state.message = ""
+                self.assertTrue(module.handle(key, state), key)
+                self.assertEqual(state.message, module.READ_ONLY_ANSWER, key)
+            # While the filter is typing those letters are text, not answers.
+            state.message = ""
+            module.handle(ord("/"), state)
+            module.handle(ord("d"), state)
+            self.assertEqual(state.message, "")
+            self.assertEqual(state.filter.text, "d")
+
     def test_weather_uses_no_ip_geolocation_and_no_api_key(self):
         source = (ROOT / "tools/weather/main.py").read_text()
         self.assertIn("api.open-meteo.com", source)
