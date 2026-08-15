@@ -1667,6 +1667,86 @@ class TangoTextTests(unittest.TestCase):
         self.assertIn("$ systemctl poweroff", text)
 
 
+class PaletteFlavorTests(unittest.TestCase):
+    """F-FLAVOR: selectable Tango accents, one shared setting, red reserved."""
+
+    def tearDown(self):
+        tango.apply("tango")
+
+    def test_a_flavor_swaps_only_the_accent_ramp(self):
+        furniture = (tango.WHITE, tango.RED, tango.RED_BRIGHT, tango.GREY,
+                     tango.CARD, tango.BG_TOP)
+        self.assertEqual(tango.apply("plum"), "plum")
+        self.assertEqual(
+            (tango.BLUE_DEEP, tango.BLUE, tango.BLUE_BRIGHT),
+            ((92, 53, 102), (117, 80, 123), (173, 127, 168)))
+        self.assertEqual((tango.WHITE, tango.RED, tango.RED_BRIGHT,
+                          tango.GREY, tango.CARD, tango.BG_TOP), furniture)
+        self.assertEqual(tango.apply("tango"), "tango")
+        self.assertEqual(tango.BLUE, (52, 101, 164))
+
+    def test_the_shared_setting_selects_the_flavor(self):
+        from kilix_tui import theme
+        chosen = {"KILIX_TUI_FLAVOR": "amber"}
+        with mock.patch.object(
+                theme, "setting",
+                side_effect=lambda key, default: chosen.get(key, default)):
+            self.assertEqual(tango.apply(), "amber")
+        self.assertEqual(tango.BLUE, (245, 121, 0))
+
+    def test_an_unknown_or_garbage_name_degrades_to_the_default(self):
+        from kilix_tui import theme
+        with mock.patch.object(theme, "setting",
+                               side_effect=lambda key, default: default):
+            self.assertEqual(tango.apply("mauve"), "tango")
+        with mock.patch.object(theme, "setting",
+                               side_effect=lambda key, default: "MAUVE"):
+            self.assertEqual(tango.apply(), "tango")
+        self.assertEqual(tango.BLUE, (52, 101, 164))
+
+    def test_every_flavor_names_a_real_curses_colour(self):
+        import curses
+        for name, spec in tango.FLAVORS.items():
+            self.assertTrue(hasattr(curses, str(spec["pair"])), name)
+            for ramp in ("deep", "mid", "bright"):
+                self.assertEqual(len(spec[ramp]), 3, name)
+
+    def test_the_palette_place_lists_flavors_and_marks_the_current(self):
+        state = make_state()
+        state.path = ["System", "Palette"]
+        rows = [entry for entry in state.entries() if not entry.back]
+        self.assertEqual([entry.flavor for entry in rows],
+                         list(tango.FLAVORS))
+        self.assertEqual(
+            [entry.hint for entry in rows if entry.flavor == "tango"],
+            ["current"])
+        self.assertIn("Palette", app.render_to_text(desk.render, state))
+
+    def test_enter_wears_a_flavor_and_names_the_persistent_knob(self):
+        state = make_state()
+        state.path = ["System", "Palette"]
+        labels = [entry.flavor for entry in state.entries()]
+        state.selected = labels.index("plum")
+        desk.handle(ord("\n"), state)
+        self.assertEqual(tango.FLAVOR, "plum")
+        self.assertIn("KILIX_TUI_FLAVOR=plum", state.message)
+        # The list now marks the worn flavor, not the shipped default.
+        rows = [entry for entry in state.entries() if not entry.back]
+        self.assertEqual(
+            [entry.hint for entry in rows if entry.flavor == "plum"],
+            ["current"])
+
+    def test_wearing_a_flavor_is_never_remembered_or_pinnable(self):
+        state = make_state()
+        state.path = ["System", "Palette"]
+        before = durable.load()
+        labels = [entry.flavor for entry in state.entries()]
+        state.selected = labels.index("amber")
+        desk.handle(ord("\n"), state)
+        desk.handle(ord("p"), state)
+        self.assertEqual(durable.load(), before)
+
+
 class StubCanvas:
     def __init__(self, width, height):
         self.width, self.height = width, height

@@ -138,6 +138,9 @@ SYSTEM = (
     Item("Change password", command="passwd", verb="report"),
     Item("Audio settings", command="kilix-volume", sibling="volume"),
     Item("Chrome settings", command="kilix-settings", kilix=("settings",)),
+    # The desk's own accent, tried on in place; the shared KILIX_TUI_FLAVOR
+    # setting is what makes a choice permanent (F-FLAVOR, in tango.py).
+    Item("Palette", submenu="palette"),
     Item("Screen size", kilix=("screen-size", "show"), verb="report"),
     Item("Stack status", kilix=("status",), verb="report"),
     Item("Voice status", kilix=("voice", "status"), verb="report"),

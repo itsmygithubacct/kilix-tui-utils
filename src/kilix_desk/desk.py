@@ -63,6 +63,8 @@ TIPS: dict[str, str] = {
     "Games": "Enter toggles a game on or off for the whole stack",
     "Games+play": "Enter plays; t turns a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
+    "Palette": "Enter wears a flavor now — KILIX_TUI_FLAVOR in settings.conf "
+               "keeps it",
     "Applications": "what this machine itself installs — the stack list is above",
     "Launchers": "your own desktop-folder launchers, from any desktop's Create Launcher",
 }
@@ -82,6 +84,7 @@ class Entry:
     prompt: bool = False             # Enter opens the run-a-command prompt
     alt_argv: tuple[str, ...] | None = None   # `t` runs this quietly
     restart: bool = False            # a clean run re-execs the desktop
+    flavor: str = ""                 # Enter wears this palette, in-process
 
 
 def entry_hint(entry: Entry) -> str:
@@ -299,6 +302,8 @@ class State:
             return self._game_entries()
         if self.submenu == "screensavers":
             return self._screensaver_entries()
+        if self.submenu == "palette":
+            return self._palette_entries()
         if self.submenu == "scripts":
             return self._script_entries()
         if self.submenu == "manual":
@@ -598,6 +603,20 @@ class State:
             return [Entry("screensavers need a Kilix checkout", None,
                           reason="no Kilix checkout reachable")]
         return [Entry(name, (*kilix, "screensaver", name)) for name in names]
+
+    def _palette_entries(self) -> list[Entry]:
+        """The Tango flavors, tried on in place (F-FLAVOR).
+
+        Wearing one is in-process — `tango.apply` re-aims the ramp both
+        renderers read — so the choice costs no subprocess and no restart.
+        Deliberately not here: writing `settings.conf`. The desk launches
+        and reads; the one shared config file is written by the host's own
+        settings surfaces, so the message names the key instead.
+        """
+        return [Entry(str(spec["label"]), None, flavor=name,
+                      hint=("current" if name == tango.FLAVOR
+                            else str(spec["note"])))
+                for name, spec in tango.FLAVORS.items()]
 
     def breadcrumb(self) -> str:
         if self.application_name:
@@ -899,6 +918,13 @@ def _open(state: State, entry: Entry) -> None:
         state.selected = 0
         state.message = ""
         state.filter = ""
+        return
+    if entry.flavor:
+        # In-process, quiet, and never a Home row: a palette is worn, not
+        # launched. Persistence stays with the one shared settings file.
+        applied = tango.apply(entry.flavor)
+        state.message = (f"wearing {applied} — KILIX_TUI_FLAVOR={applied} "
+                         "in settings.conf keeps it")
         return
     if entry.argv is None:
         state.message = entry.reason

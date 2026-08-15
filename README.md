@@ -139,6 +139,14 @@ records the decision to break the desk's read-only purity exactly this far
 and no further — confirmed actions never become one-Enter rows, and there is
 no last-place restore: Home stays the fixed landing.
 
+The desk's accent is a choice. System ▸ **Palette** tries on one of four
+Tango flavors — sky blue (the default), chameleon green, plum, amber — for
+the running session, and `KILIX_TUI_FLAVOR` in the shared `settings.conf`
+(the same file every `theme.setting` knob reads, with the environment as the
+fallback) makes one permanent. A flavor swaps only the structural/selection
+ramp in `src/kilix_desk/tango.py`, in both the text and pixel renderings;
+red stays reserved for power and refusal in every flavor.
+
 Six sections: Home (status, pinned and recent launches), Programs, Machine,
 System, Session, and Power — the last being the point: it closes the stack's
 no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions
