@@ -147,6 +147,15 @@ fallback) makes one permanent. A flavor swaps only the structural/selection
 ramp in `src/kilix_desk/tango.py`, in both the text and pixel renderings;
 red stays reserved for power and refusal in every flavor.
 
+Left alone, the desk saves the screen. When `kilix-tui` is the whole session
+(`KILIX_TUI_SESSION=1`), ten quiet minutes hand the terminal to
+`kilix screensaver` — the same launch the Screensavers place offers — and
+any key is the way back. `KILIX_TUI_SAVER_MINUTES` changes the span (`0`
+switches it off; off is also the default in a pane or over ssh, where taking
+the terminal would interrupt the surrounding session), and `KILIX_TUI_SAVER`
+names a favourite saver. An idle start is nobody's launch: it never becomes
+a Home recents row.
+
 Six sections: Home (status, pinned and recent launches), Programs, Machine,
 System, Session, and Power — the last being the point: it closes the stack's
 no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions

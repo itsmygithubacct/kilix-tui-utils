@@ -1747,6 +1747,89 @@ class PaletteFlavorTests(unittest.TestCase):
         self.assertEqual(durable.load(), before)
 
 
+class IdleSaverTests(unittest.TestCase):
+    """F-SAVER: an untouched session starts a screensaver on its own."""
+
+    def test_the_default_is_on_only_when_the_desktop_is_the_session(self):
+        from kilix_tui import theme
+        with mock.patch.object(theme, "setting",
+                               side_effect=lambda key, default: default):
+            with mock.patch.dict(os.environ, {"KILIX_TUI_SESSION": "1"}):
+                self.assertEqual(desk.idle_saver_seconds(), 600.0)
+            environment = {key: value for key, value in os.environ.items()
+                           if key != "KILIX_TUI_SESSION"}
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertIsNone(desk.idle_saver_seconds())
+
+    def test_the_shared_setting_overrides_the_default_both_ways(self):
+        from kilix_tui import theme
+        for configured, expected in (("2", 120.0), ("0", None),
+                                     ("soon", None)):
+            with mock.patch.object(
+                    theme, "setting",
+                    side_effect=lambda key, default, value=configured: value), \
+                 mock.patch.dict(os.environ, {"KILIX_TUI_SESSION": "1"}):
+                self.assertEqual(desk.idle_saver_seconds(), expected,
+                                 configured)
+
+    def test_the_saver_is_the_same_launch_the_place_offers(self):
+        from kilix_tui import theme
+        with mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]), \
+             mock.patch.object(registry, "screensavers",
+                               return_value=["maze", "pipes"]), \
+             mock.patch.object(theme, "setting",
+                               side_effect=lambda key, default: default):
+            self.assertEqual(desk.saver_argv(),
+                             ("/opt/kilix/kilix", "screensaver", "maze"))
+
+    def test_a_named_favourite_wins_and_an_unknown_one_degrades(self):
+        from kilix_tui import theme
+        for wanted, name in (("pipes", "pipes"), ("nonsense", "maze")):
+            with mock.patch.object(registry, "kilix_command",
+                                   return_value=["kilix"]), \
+                 mock.patch.object(registry, "screensavers",
+                                   return_value=["maze", "pipes"]), \
+                 mock.patch.object(
+                     theme, "setting",
+                     side_effect=lambda key, default, value=wanted: value):
+                self.assertEqual(desk.saver_argv(),
+                                 ("kilix", "screensaver", name), wanted)
+
+    def test_no_checkout_or_no_savers_means_no_launch_and_no_error(self):
+        with mock.patch.object(registry, "kilix_command", return_value=None):
+            self.assertIsNone(desk.saver_argv())
+        with mock.patch.object(registry, "kilix_command",
+                               return_value=["kilix"]), \
+             mock.patch.object(registry, "screensavers", return_value=[]):
+            self.assertIsNone(desk.saver_argv())
+        ran = []
+        state = make_state(runner=lambda argv: ran.append(argv) or 0)
+        with mock.patch.object(desk, "saver_argv", return_value=None):
+            desk.start_screensaver(state)
+        self.assertEqual(ran, [])
+
+    def test_the_idle_start_runs_attached_and_is_never_remembered(self):
+        ran = []
+        state = make_state(runner=lambda argv: ran.append(argv) or 0)
+        before = durable.load()
+        argv = ("kilix", "screensaver", "maze")
+        with mock.patch.object(desk, "saver_argv", return_value=argv):
+            desk.start_screensaver(state)
+        self.assertEqual(ran, [argv])
+        self.assertEqual(durable.load(), before)
+
+    def test_the_desktop_wires_the_saver_into_the_shared_loop(self):
+        module = load_entry()
+        with mock.patch.object(module.app, "run", return_value=0) as run, \
+             mock.patch.object(module.desk, "idle_saver_seconds",
+                               return_value=123.0):
+            self.assertEqual(module.main([]), 0)
+        self.assertEqual(run.call_args.kwargs.get("idle_after"), 123.0)
+        self.assertIs(run.call_args.kwargs.get("on_idle"),
+                      desk.start_screensaver)
+
+
 class StubCanvas:
     def __init__(self, width, height):
         self.width, self.height = width, height

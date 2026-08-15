@@ -185,7 +185,12 @@ def main(argv: list[str] | None = None) -> int:
                       file=sys.stderr)
                 return 1
             # The floor: fall through to the text session.
-    return app.run(desk.render, state, handle=desk.handle, mouse=True)
+    # The idle screensaver rides the shared loop (F-SAVER): after the
+    # configured quiet spell the desk hands the terminal to
+    # `kilix screensaver`, and any key is the way back.
+    return app.run(desk.render, state, handle=desk.handle, mouse=True,
+                   idle_after=desk.idle_saver_seconds(),
+                   on_idle=desk.start_screensaver)
 
 
 if __name__ == "__main__":

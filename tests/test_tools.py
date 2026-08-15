@@ -631,6 +631,62 @@ class SharedShellTests(unittest.TestCase):
             )
         self.assertEqual(updates, [state])
 
+    def test_the_idle_watch_is_due_only_after_the_quiet_span(self):
+        now = [0.0]
+        watch = app.IdleWatch(600, clock=lambda: now[0])
+        self.assertFalse(watch.due())
+        now[0] = 599.0
+        self.assertFalse(watch.due())
+        now[0] = 600.0
+        self.assertTrue(watch.due())
+        watch.touch()                    # a key: the clock starts over
+        self.assertFalse(watch.due())
+        now[0] = 1200.0
+        self.assertTrue(watch.due())
+
+    def test_no_span_means_the_watch_never_fires(self):
+        for after in (None, 0, -5):
+            watch = app.IdleWatch(after, clock=lambda: 1e9)
+            self.assertFalse(watch.due(), after)
+
+    def test_an_idle_loop_fires_the_action_and_keeps_running(self):
+        fired = []
+        timeouts = []
+        state = object()
+
+        class Screen:
+            keys = iter((-1, ord("q")))
+
+            def keypad(self, _enabled):
+                pass
+
+            def timeout(self, milliseconds):
+                timeouts.append(milliseconds)
+
+            def erase(self):
+                pass
+
+            def refresh(self):
+                pass
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch.object(
+            app.curses, "wrapper", side_effect=lambda loop: loop(Screen())
+        ), mock.patch.object(app.curses, "curs_set"):
+            self.assertEqual(
+                app.run(
+                    lambda _surface, _state: None,
+                    state,
+                    idle_after=1e-9,
+                    on_idle=fired.append,
+                ),
+                0,
+            )
+        self.assertEqual(fired, [state])     # once, then the q quits as ever
+        self.assertEqual(timeouts, [1000])   # the loop wakes to check idleness
+
     def test_every_tool_title_that_draws_a_frame_has_a_tip(self):
         titles = set()
         for path in sorted(glob.glob(os.path.join(ROOT, "tools", "*",

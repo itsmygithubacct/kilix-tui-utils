@@ -1176,3 +1176,57 @@ def handle(key: int, state: State) -> bool:
 def self_next_section(state: State) -> int:
     """Tab cycles sections from wherever you are."""
     return (state.section + 1) % len(SECTIONS)
+
+
+# ── the idle screensaver (F-SAVER) ───────────────────────────────────────────
+
+
+def idle_saver_seconds() -> float | None:
+    """How long the desk may sit untouched before the screensaver starts.
+
+    `KILIX_TUI_SAVER_MINUTES` in the shared settings file (or environment)
+    decides, and `0` switches it off. Unset, the default depends on who owns
+    the terminal: ten minutes when the desktop *is* the session — the console
+    that would otherwise burn its menu in — and off in a pane or over ssh,
+    where taking the terminal after an idle spell would interrupt whatever
+    surrounds it. A value that does not parse is off, never a crash.
+    """
+    from kilix_tui import theme
+    fallback = "10" if os.environ.get("KILIX_TUI_SESSION") == "1" else "0"
+    try:
+        minutes = float(str(theme.setting("KILIX_TUI_SAVER_MINUTES",
+                                          fallback)).strip())
+    except ValueError:
+        minutes = 0.0
+    return minutes * 60 if minutes > 0 else None
+
+
+def saver_argv() -> tuple[str, ...] | None:
+    """The launch the idle timer runs, or None when there is nothing to run.
+
+    The same `kilix screensaver <name>` the Screensavers place offers:
+    `KILIX_TUI_SAVER` picks a favourite by name, anything else means the
+    first the checkout ships. Any key stops the saver — that is its own
+    contract — so returning from it is the user coming back.
+    """
+    kilix = registry.kilix_command()
+    names = registry.screensavers()
+    if kilix is None or not names:
+        return None
+    from kilix_tui import theme
+    wanted = str(theme.setting("KILIX_TUI_SAVER", "")).strip()
+    name = wanted if wanted in names else names[0]
+    return (*kilix, "screensaver", name)
+
+
+def start_screensaver(state: State) -> None:
+    """The idle action: hand the terminal to a screensaver until a key.
+
+    Deliberately not `_launch`: an idle start is nobody's launch, so it is
+    never remembered on Home, and it always runs attached — a screensaver
+    opened in a background page would save nothing. Without a checkout it
+    quietly does nothing; an idle desk needs no error either.
+    """
+    argv = saver_argv()
+    if argv is not None:
+        state.runner(argv)
