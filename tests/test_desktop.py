@@ -495,6 +495,7 @@ class SubmenuTests(unittest.TestCase):
         games = [("kilix-pong", "Kilix Pong", True),
                  ("doom", "Doom", False)]
         with mock.patch.object(registry, "games", return_value=games), \
+             mock.patch.object(registry, "installable", return_value=None), \
              mock.patch.object(registry, "games_play_supported",
                                return_value=False), \
              mock.patch.object(registry, "kilix_command",
@@ -527,6 +528,7 @@ class SubmenuTests(unittest.TestCase):
                            quiet=lambda argv: quiet_calls.append(argv) or 0)
         games = [("kilix-pong", "Kilix Pong", True)]
         with mock.patch.object(registry, "games", return_value=games), \
+             mock.patch.object(registry, "installable", return_value=None), \
              mock.patch.object(registry, "games_play_supported",
                                return_value=True), \
              mock.patch.object(registry, "kilix_command",
@@ -550,6 +552,7 @@ class SubmenuTests(unittest.TestCase):
         probes = []
         with mock.patch.object(registry, "games",
                                return_value=[("doom", "Doom", True)]), \
+             mock.patch.object(registry, "installable", return_value=None), \
              mock.patch.object(registry, "games_play_supported",
                                side_effect=lambda k: probes.append(k) or True), \
              mock.patch.object(registry, "kilix_command",
@@ -563,10 +566,114 @@ class SubmenuTests(unittest.TestCase):
     def test_submenus_degrade_without_a_kilix_checkout(self):
         state = make_state()
         state.submenu = "games"
-        with mock.patch.object(registry, "games", return_value=None):
+        with mock.patch.object(registry, "kilix_command", return_value=None), \
+             mock.patch.object(registry, "games", return_value=None):
             entries = [entry for entry in state.entries() if not entry.back]
         self.assertEqual(len(entries), 1)
         self.assertIsNone(entries[0].argv)
+
+    def test_games_degrade_with_a_launcher_but_no_list_at_all(self):
+        # A launcher that answers neither `install --json` nor the SDK
+        # toggle table: one reasoned row, never a crash.
+        state = make_state()
+        state.submenu = "games"
+        with mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]), \
+             mock.patch.object(registry, "installable", return_value=None), \
+             mock.patch.object(registry, "games", return_value=None):
+            entries = [entry for entry in state.entries() if not entry.back]
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].argv)
+        self.assertTrue(entries[0].reason)
+
+
+class GamesFromCatalogTests(unittest.TestCase):
+    """The Games place lists the host catalog, not the SDK toggle table.
+
+    A game added to the catalog is listed and playable with no desktop
+    change; the toggle table survives only as the on/off hint and the `t`
+    flip, so an older catalog loses nothing either.
+    """
+
+    CATALOG = [
+        {"id": "kilix-land", "label": "Kilix Land", "kind": "game",
+         "installed": False},
+        {"id": "doom", "label": "Doom", "kind": "game", "installed": True},
+        {"id": "kilix-file", "label": "File Manager", "kind": "app",
+         "installed": True},
+    ]
+    KILIX = ["/opt/kilix/kilix"]
+
+    def _entries(self, *, toggles, play=True, state=None):
+        state = state or make_state()
+        state.submenu = "games"
+        with mock.patch.object(registry, "installable",
+                               return_value=self.CATALOG), \
+             mock.patch.object(registry, "games", return_value=toggles), \
+             mock.patch.object(registry, "games_play_supported",
+                               return_value=play), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=self.KILIX):
+            return [e for e in state.entries() if not e.back]
+
+    def test_a_catalog_game_is_listed_without_an_sdk_toggle(self):
+        rows = self._entries(toggles=[("doom", "Doom", True)])
+        self.assertEqual([e.label for e in rows], ["Doom", "Kilix Land"])
+        land = rows[1]
+        self.assertEqual(
+            land.argv,
+            ("/opt/kilix/kilix", "games", "play", "kilix-land"))
+        self.assertEqual(land.hint, "installs on first play")
+        self.assertIsNone(land.alt_argv)         # no toggle table row to flip
+
+    def test_the_toggle_table_still_supplies_the_hint_and_the_flip(self):
+        rows = self._entries(toggles=[("doom", "Doom", True)])
+        doom = rows[0]
+        self.assertEqual(doom.hint, "on")
+        self.assertEqual(
+            doom.alt_argv,
+            ("/opt/kilix/kilix", "games", "disable", "doom"))
+
+    def test_toggle_only_games_stay_listed_after_the_catalog_rows(self):
+        rows = self._entries(
+            toggles=[("chess-bash", "Chess Bash", False)])
+        self.assertEqual([e.label for e in rows],
+                         ["Doom", "Kilix Land", "Chess Bash"])
+        self.assertEqual(rows[2].hint, "off")
+
+    def test_no_sdk_still_lists_the_catalog_games(self):
+        rows = self._entries(toggles=None)
+        self.assertEqual([e.label for e in rows], ["Doom", "Kilix Land"])
+        self.assertEqual([e.hint for e in rows],
+                         ["installed", "installs on first play"])
+
+    def test_a_catalog_game_on_an_old_launcher_installs_not_dead_ends(self):
+        rows = self._entries(toggles=None, play=False)
+        land = next(e for e in rows if e.label == "Kilix Land")
+        self.assertEqual(land.argv,
+                         ("/opt/kilix/kilix", "install", "kilix-land"))
+        self.assertEqual(land.hint, "install")
+
+    def test_games_and_software_read_the_one_cached_list(self):
+        """The one-list discipline as the catalog grows: no second ask."""
+        state = make_state()
+        with mock.patch.object(registry, "installable",
+                               return_value=self.CATALOG) as ask, \
+             mock.patch.object(registry, "games", return_value=None), \
+             mock.patch.object(registry, "games_play_supported",
+                               return_value=True), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=self.KILIX):
+            state.submenu = "games"
+            state.entries()
+            state.path = ["Programs", "Software"]
+            state.entries()
+            state.path = ["Programs", "Catalog apps"]
+            state.entries()
+            self.assertEqual(ask.call_count, 1)
+            desk.handle(ord("r"), state)
+            state.entries()
+            self.assertEqual(ask.call_count, 2, "r must re-ask")
 
 
 class SystemMenuTests(unittest.TestCase):

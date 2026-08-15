@@ -469,28 +469,68 @@ class State:
         ]
 
     def _game_entries(self) -> list[Entry]:
-        rows = registry.games()
+        """Every stack game: the catalog's list, with the SDK's on/off state.
+
+        The rows come from the same cached `kilix install --json` answer the
+        Software place reads — one list — so a game added to the catalog is
+        listed and playable here with no desktop change. The SDK toggle table
+        supplies only the on/off hint (and the `t` flip), never the listing
+        gate; games only that table knows stay listed too, so an older
+        catalog loses nothing.
+        """
         kilix = registry.kilix_command()
-        if rows is None or kilix is None:
+        if kilix is None:
+            return [Entry("games need a Kilix checkout", None,
+                          reason="no kilix launcher reachable")]
+        toggles = registry.games()
+        if self.software is None:
+            self.software = registry.installable()
+        catalog = [row for row in (self.software or [])
+                   if row.get("kind") == "game" and row.get("id")]
+        if toggles is None and not catalog:
             return [Entry("games need a Kilix checkout", None,
                           reason="no kilix_sdk reachable")]
         if self.play_support is None:
             self.play_support = registry.games_play_supported(kilix)
-        out = []
-        for game_id, label, enabled in rows:
-            action = "disable" if enabled else "enable"
-            flip = (*kilix, "games", action, game_id)
+        toggle_state = {game_id: enabled
+                        for game_id, _label, enabled in (toggles or ())}
+        rows: list[tuple[str, str, dict | None]] = [
+            (str(row["id"]), str(row.get("label") or row["id"]), row)
+            for row in sorted(
+                catalog, key=lambda r: str(r.get("label", "")).casefold())]
+        seen = {game_id for game_id, _label, _row in rows}
+        rows.extend((game_id, label, None)
+                    for game_id, label, _enabled in (toggles or ())
+                    if game_id not in seen)
+        out: list[Entry] = []
+        for game_id, label, row in rows:
+            enabled = toggle_state.get(game_id)
+            if enabled is None:
+                # Catalog-only: no toggle to flip, so the hint carries the
+                # install state the way the Software place words it.
+                hint = ("installed" if row and row.get("installed")
+                        else "installs on first play")
+                flip = None
+            else:
+                hint = "on" if enabled else "off"
+                flip = (*kilix, "games",
+                        "disable" if enabled else "enable", game_id)
             if self.play_support:
                 # Enter plays — the natural reading of a games list — and `t`
-                # keeps the availability toggle one key away.
+                # keeps the availability toggle one key away where one exists.
                 out.append(Entry(label, (*kilix, "games", "play", game_id),
-                                 verb="tab", hint="on" if enabled else "off",
-                                 alt_argv=flip))
-            else:
+                                 verb="tab", hint=hint, alt_argv=flip))
+            elif flip is not None:
                 # Older launchers know no `play`: Enter stays the toggle so
                 # the list is never a dead end.
-                out.append(Entry(label, flip, toggle=True,
-                                 hint="on" if enabled else "off"))
+                out.append(Entry(label, flip, toggle=True, hint=hint))
+            else:
+                # No `play` and no toggle either: Enter installs the game to
+                # its pin — the one thing an old launcher can still do here.
+                out.append(Entry(label, (*kilix, "install", game_id),
+                                 hint=("installed" if row
+                                       and row.get("installed")
+                                       else "install")))
         return out
 
     def _application_entries(self) -> list[Entry]:
