@@ -117,7 +117,13 @@ MACHINE = (
     Item("Disk", command="kilix-disk", sibling="disk"),
     Item("System facts", command="kilix-system", sibling="system"),
     Item("Volume", command="kilix-volume", sibling="volume"),
-    Item("Network", command="nmtui"),
+    # The canonical network place: links and saved connections, up and down.
+    Item("Network", command="kilix-network", sibling="network"),
+    # NetworkManager's own full-screen editor, kept for the surface the
+    # canonical tool deliberately leaves there — creating connections and
+    # entering secrets. An accepted external exception, presence-gated like
+    # every outside command.
+    Item("Connection editor", command="nmtui"),
     Item("Packages", command="kilix-package", sibling="package"),
 )
 

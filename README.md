@@ -17,6 +17,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-disk` | Filesystem usage and an interruptible directory scan |
 | `kilix-system` | Static machine facts (`--print` for plain output) |
 | `kilix-volume` | Output volume and sink selection |
+| `kilix-network` | Links and saved NetworkManager connections — Enter brings one up, `d` (confirmed) takes one down; read-only without nmcli |
 | `kilix-file` | File manager — navigate and open, never delete or move |
 | `kilix-system-center` | Focused machine center over CPU, memory, thermal, disk, network, audio, camera, package, and VM tools |
 | `kilix-settings-center` | Shared Kilix settings, display, audio, voice, and default-desktop center |
@@ -210,6 +211,16 @@ Text/curses is the default for every utility, including the time-series
 monitors, so the suite has one visual and navigation language over SSH, in
 `tmux`, and inside Kilix. Memory, Temperatures, and the desktop retain optional
 framebuffer renderings behind `--graphics`.
+
+**The network boundary, decided.** Machine ▸ Network lands on `kilix-network`:
+the canonical shell over what every link is doing and the saved NetworkManager
+connections — up on Enter, down only after a confirmation, because the link
+being cut is often the one carrying the keystroke. Creating connections and
+entering secrets deliberately stay in `nmtui`, kept one row below as the
+presence-gated **Connection editor**: a password prompt belongs to
+NetworkManager's own agent, and a reimplementation of it here would be a
+second thing to get wrong. Without NetworkManager the tool degrades to a
+read-only `/sys/class/net` view rather than an error.
 
 ## Going to a page or a pane
 

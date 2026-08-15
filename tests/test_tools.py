@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402, I001
 
 TOOLS = [
-    "calculator", "cpu", "disk", "system", "volume",
+    "calculator", "cpu", "disk", "system", "volume", "network",
     "file", "launcher", "package", "session_log", "weather", "music",
     "plebian_control", "rollout_resume", "switcher", "cameras",
     "character_map", "find_files", "notepad",

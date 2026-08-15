@@ -1325,6 +1325,31 @@ class ResolutionTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertTrue(plan.argv[1].endswith("tools/temps/main.py"))
 
+    def test_network_prefers_the_canonical_tool_over_nmtui(self):
+        # The decided boundary: the Network row lands on kilix-network, from
+        # the installed command or this checkout, never straight on nmtui.
+        item = next(i for i in registry.MACHINE if i.label == "Network")
+        self.assertEqual(item.command, "kilix-network")
+        with mock.patch.object(registry.shutil, "which", return_value=None):
+            plan = registry.resolve(item)
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan.argv[1].endswith("tools/network/main.py"))
+
+    def test_nmtui_remains_the_presence_gated_connection_editor(self):
+        # The accepted external exception: creating connections and entering
+        # secrets stay in NetworkManager's own editor, offered only where it
+        # exists and never resolved from a source checkout.
+        item = next(i for i in registry.MACHINE
+                    if i.label == "Connection editor")
+        self.assertEqual(item.command, "nmtui")
+        self.assertIsNone(item.sibling)
+        with mock.patch.object(registry.shutil, "which", return_value=None):
+            self.assertIsNone(registry.resolve(item))
+        with mock.patch.object(registry.shutil, "which",
+                               return_value="/usr/bin/nmtui"):
+            self.assertEqual(registry.resolve(item).argv,
+                             ("/usr/bin/nmtui",))
+
     def test_kilix_subcommand_is_the_last_resort(self):
         item = registry.Item("x", command="kilix-bonsai", kilix=("bonsai",))
         with mock.patch.object(registry.shutil, "which", return_value=None), \
