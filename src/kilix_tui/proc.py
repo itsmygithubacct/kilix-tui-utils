@@ -172,6 +172,48 @@ def thermal_zones() -> list[tuple[str, float]]:
     return zones
 
 
+def batteries() -> list[tuple[str, int, str]]:
+    """Return (name, capacity_percent, status) for every battery.
+
+    Read from /sys/class/power_supply; supplies that are not batteries (AC
+    adapters, USB-C sources) are skipped. Capacity is -1 when the kernel does
+    not say, status is lowercased ("charging", "discharging", "full", …).
+    Machines without a battery return [] for the price of one listing.
+    """
+    base = "/sys/class/power_supply"
+    cells: list[tuple[str, int, str]] = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return cells
+    for name in names:
+        if _read(f"{base}/{name}/type").strip() != "Battery":
+            continue
+        try:
+            capacity = max(0, min(100, int(_read(f"{base}/{name}/capacity"))))
+        except ValueError:
+            capacity = -1
+        status = _read(f"{base}/{name}/status").strip().lower()
+        cells.append((name, capacity, status))
+    return cells
+
+
+def network_links() -> list[tuple[str, str]]:
+    """Return (interface, operstate) for every non-loopback interface."""
+    base = "/sys/class/net"
+    links: list[tuple[str, str]] = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return links
+    for name in names:
+        if name == "lo":
+            continue
+        state = _read(f"{base}/{name}/operstate").strip() or "unknown"
+        links.append((name, state))
+    return links
+
+
 def mounts() -> list[tuple[str, str, str]]:
     """Return (device, mountpoint, fstype) for real filesystems only."""
     skip = {

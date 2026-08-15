@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kilix_desk import desk, facts, graphics, gui, manual, registry, tango  # noqa: E402
-from kilix_tui import app, keys as keymap, kitty_rc, privileged  # noqa: E402
+from kilix_tui import app, keys as keymap, kitty_rc, privileged, proc  # noqa: E402
 
 
 def load_entry():
@@ -357,6 +357,126 @@ class HomeAlertTests(unittest.TestCase):
         self.assertEqual(entry.verb, "report")
         self.assertEqual(entry.argv[:2], ("sh", "-c"))
         self.assertIn("/usr/bin/passwd", entry.argv[2])
+
+
+class TrayFactTests(unittest.TestCase):
+    """Battery, network and volume on Home: shown when true, absent over a
+    guess — and never asked per frame."""
+
+    def test_batteries_skip_supplies_that_are_not_batteries(self):
+        tree = {
+            "/sys/class/power_supply/AC/type": "Mains\n",
+            "/sys/class/power_supply/BAT0/type": "Battery\n",
+            "/sys/class/power_supply/BAT0/capacity": "87\n",
+            "/sys/class/power_supply/BAT0/status": "Discharging\n",
+        }
+        with mock.patch.object(
+                proc, "_read",
+                side_effect=lambda path, default="": tree.get(path, default)), \
+             mock.patch.object(proc.os, "listdir",
+                               return_value=["AC", "BAT0"]):
+            self.assertEqual(proc.batteries(), [("BAT0", 87, "discharging")])
+
+    def test_a_machine_without_batteries_answers_an_empty_list(self):
+        with mock.patch.object(proc.os, "listdir", side_effect=OSError):
+            self.assertEqual(proc.batteries(), [])
+        with mock.patch.object(facts.proc, "batteries", return_value=[]):
+            self.assertIsNone(facts.battery())
+
+    def test_an_unreadable_capacity_is_marked_not_invented(self):
+        tree = {"/sys/class/power_supply/BAT0/type": "Battery\n"}
+        with mock.patch.object(
+                proc, "_read",
+                side_effect=lambda path, default="": tree.get(path, default)), \
+             mock.patch.object(proc.os, "listdir", return_value=["BAT0"]):
+            self.assertEqual(proc.batteries(), [("BAT0", -1, "")])
+        with mock.patch.object(facts.proc, "batteries",
+                               return_value=[("BAT0", -1, "")]):
+            self.assertEqual(facts.battery(), ("battery", "?"))
+
+    def test_network_links_skip_loopback_and_name_what_is_up(self):
+        tree = {
+            "/sys/class/net/eth0/operstate": "down\n",
+            "/sys/class/net/wlan0/operstate": "up\n",
+        }
+        with mock.patch.object(
+                proc, "_read",
+                side_effect=lambda path, default="": tree.get(path, default)), \
+             mock.patch.object(proc.os, "listdir",
+                               return_value=["eth0", "lo", "wlan0"]):
+            self.assertEqual(proc.network_links(),
+                             [("eth0", "down"), ("wlan0", "up")])
+        with mock.patch.object(facts.proc, "network_links",
+                               return_value=[("eth0", "down"),
+                                             ("wlan0", "up")]):
+            self.assertEqual(facts.network(), ("network", "wlan0 up"))
+        with mock.patch.object(facts.proc, "network_links",
+                               return_value=[("eth0", "down")]):
+            self.assertEqual(facts.network(),
+                             ("network", "all 1 interfaces down"))
+        with mock.patch.object(facts.proc, "network_links", return_value=[]):
+            self.assertEqual(facts.network(), ("network", "no interfaces"))
+
+    PACTL_SINKS = (
+        "Sink #53\n"
+        "\tName: alsa_output.usb\n"
+        "\tMute: no\n"
+        "\tVolume: front-left: 39321 /  60% / -13.31 dB\n"
+        "\tBase Volume: 65536 / 100% / 0.00 dB\n"
+        "Sink #54\n"
+        "\tName: hdmi\n"
+        "\tMute: yes\n"
+        "\tVolume: front-left: 65536 / 100% / 0.00 dB\n"
+    )
+
+    def _pactl(self, default="alsa_output.usb"):
+        def run(argv, **kwargs):
+            stdout = (self.PACTL_SINKS if argv[1] == "list"
+                      else f"{default}\n")
+            return mock.Mock(returncode=0, stdout=stdout)
+        return run
+
+    def test_volume_reports_the_default_sink(self):
+        with mock.patch.object(facts.shutil, "which",
+                               return_value="/usr/bin/pactl"), \
+             mock.patch.object(facts.subprocess, "run",
+                               side_effect=self._pactl()):
+            self.assertEqual(facts.volume(), "60%")
+        with mock.patch.object(facts.shutil, "which",
+                               return_value="/usr/bin/pactl"), \
+             mock.patch.object(facts.subprocess, "run",
+                               side_effect=self._pactl(default="hdmi")):
+            self.assertEqual(facts.volume(), "muted (100%)")
+
+    def test_no_pactl_means_no_row_and_no_subprocess(self):
+        with mock.patch.object(facts.shutil, "which", return_value=None), \
+             mock.patch.object(facts.subprocess, "run",
+                               side_effect=AssertionError("must not run")):
+            self.assertIsNone(facts.volume())
+
+    def test_home_carries_the_tray_rows_and_uncertainty_is_absence(self):
+        with mock.patch.object(facts, "battery",
+                               return_value=("battery", "87% discharging")), \
+             mock.patch.object(facts, "network",
+                               return_value=("network", "wlan0 up")), \
+             mock.patch.object(facts, "volume", return_value="60%"):
+            rows = facts.status_rows()
+            state = make_state()
+        self.assertIn(("battery", "87% discharging"), rows)
+        self.assertIn(("network", "wlan0 up"), rows)
+        self.assertIn(("volume", "60%"), rows)
+        state.section = desk.SECTIONS.index("Home")
+        text = app.render_to_text(desk.render, state)
+        self.assertIn("battery", text)
+        self.assertIn("87% discharging", text)
+        with mock.patch.object(facts, "battery", return_value=None), \
+             mock.patch.object(facts, "volume", return_value=None), \
+             mock.patch.object(facts, "network",
+                               return_value=("network", "no interfaces")):
+            labels = [label for label, _value in facts.status_rows()]
+        self.assertNotIn("battery", labels)
+        self.assertNotIn("volume", labels)
+        self.assertIn("network", labels)
 
 
 class SubmenuTests(unittest.TestCase):
