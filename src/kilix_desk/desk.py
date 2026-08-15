@@ -30,6 +30,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -77,6 +78,7 @@ class Entry:
     back: bool = False               # the ".." row
     prompt: bool = False             # Enter opens the run-a-command prompt
     alt_argv: tuple[str, ...] | None = None   # `t` runs this quietly
+    restart: bool = False            # a clean run re-execs the desktop
 
 
 def entry_hint(entry: Entry) -> str:
@@ -121,6 +123,26 @@ def _quiet_run(argv: Sequence[str]) -> int:
         return 126
 
 
+def _restart_desktop() -> None:
+    """Replace this process with a fresh desktop.
+
+    The point of "Update and restart desktop" is that the menu you come back
+    to is drawn by the code the update just installed; a child process would
+    leave the old desktop underneath it. curses is shut down first so the
+    fresh process inherits a sane terminal. Reached again only when the exec
+    itself failed — the caller words that failure.
+    """
+    try:
+        import curses
+        curses.endwin()
+    except Exception:
+        pass
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    except OSError:
+        pass
+
+
 def report_argv(argv: Sequence[str]) -> tuple[str, ...]:
     """Wrap a command that prints and exits so its output can be read.
 
@@ -146,7 +168,8 @@ class State:
                  application_name: str = "",
                  runner: Callable[[Sequence[str]], int] | None = None,
                  quiet: Callable[[Sequence[str]], int] | None = None,
-                 live: Callable[[], bool] | None = None) -> None:
+                 live: Callable[[], bool] | None = None,
+                 restart: Callable[[], None] | None = None) -> None:
         self.root_path = tuple(root_path)
         self.application_name = application_name
         self.path: list[str] = list(self.root_path)
@@ -156,11 +179,13 @@ class State:
         self.help_open = False
         self.message = ""
         self.confirm: tuple[str, tuple[str, ...]] | None = None
+        self.confirm_restart = False     # the pending confirm re-execs on success
         self.running_prompt = False      # the `!` run-a-command line is open
         self.command = ""                # what has been typed into it
         self.runner = runner or _attached_run
         self.quiet = quiet or _quiet_run
         self.live = live or kitty_rc.available
+        self.restart = restart or _restart_desktop
         self.status = facts.status_rows()
         self.alerts = facts.alerts()
         # `entries()` runs on every keystroke, so anything that costs a
@@ -291,7 +316,7 @@ class State:
             argv = (report_argv(plan.argv) if verb == "report"
                     else plan.argv)
             out.append(Entry(item.label, argv, verb=verb,
-                             confirm=item.confirm))
+                             confirm=item.confirm, restart=item.restart))
         return out
 
     def _section_entries(self) -> list[Entry]:
@@ -778,6 +803,7 @@ def _open(state: State, entry: Entry) -> None:
         return
     if entry.confirm:
         state.confirm = (entry.label, entry.argv)
+        state.confirm_restart = entry.restart
         return
     _launch(state, entry)
 
@@ -901,11 +927,19 @@ def handle(key: int, state: State) -> bool:
         return True
     if state.confirm is not None:
         label, argv = state.confirm
+        restart = state.confirm_restart
         state.confirm = None
+        state.confirm_restart = False
         if key in (ord("y"), ord("Y")):
             if argv == QUIT_SENTINEL:
                 return False
             code = state.runner(argv)
+            if code == 0 and restart:
+                # Replaced on success; still here means the exec failed
+                # (or a test stubbed it), so say what remains to be done.
+                state.restart()
+                state.message = f"{label}: restart the desktop to finish"
+                return True
             state.message = (f"{label} exited {code}" if code
                              else f"{label}: done")
         else:

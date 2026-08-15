@@ -42,6 +42,7 @@ class Item:
     submenu: str = ""                # opens a drill-down list instead
     confirm: bool = False            # asks before running
     helper: str = ""                 # a root helper run via sudo; hidden when absent
+    restart: bool = False            # a clean run re-execs the desktop
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,12 @@ SYSTEM = (
     Item("Voice status", kilix=("voice", "status"), verb="report"),
     Item("Voice doctor", kilix=("voice", "doctor"), verb="report"),
     Item("Update the stack", kilix=("update",), confirm=True),
+    # The same update, then a fresh desktop process on top of it — the only
+    # way the menu you come back to is drawn by the code the update just
+    # installed. Power stays the frozen three privileged argvs; this row is
+    # maintenance, so it lives here.
+    Item("Update and restart desktop", kilix=("update",), confirm=True,
+         restart=True),
     Item("Reinstall dependencies", helper=DEPS_HELPER, verb="report",
          confirm=True),
     Item("Scripts", submenu="scripts"),

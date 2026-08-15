@@ -510,6 +510,77 @@ class SystemMenuTests(unittest.TestCase):
         self.assertEqual(len(asks), 2, "r must relist")
 
 
+class UpdateRestartTests(unittest.TestCase):
+    """`Update and restart desktop`: one confirmation, then a fresh process."""
+
+    def _state(self, runner, restarts):
+        state = make_state(runner=runner,
+                           restart=lambda: restarts.append(True))
+        state.section = desk.SECTIONS.index("System")
+        return state
+
+    def _select(self, state, label):
+        state.selected = next(
+            index for index, entry in enumerate(state.entries())
+            if entry.label == label)
+
+    def test_update_then_reexec_after_one_confirmation(self):
+        calls, restarts = [], []
+        with mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state = self._state(lambda argv: calls.append(tuple(argv)) or 0,
+                                restarts)
+            self._select(state, "Update and restart desktop")
+            desk.handle(10, state)                            # asks first
+            self.assertEqual(calls, [])
+            self.assertEqual(state.confirm[1], ("/opt/kilix/kilix", "update"))
+            desk.handle(ord("y"), state)
+        self.assertEqual(calls, [("/opt/kilix/kilix", "update")])
+        self.assertEqual(restarts, [True])
+
+    def test_a_failed_update_never_restarts(self):
+        restarts = []
+        with mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state = self._state(lambda argv: 3, restarts)
+            self._select(state, "Update and restart desktop")
+            desk.handle(10, state)
+            desk.handle(ord("y"), state)
+        self.assertEqual(restarts, [])
+        self.assertIn("exited 3", state.message)
+
+    def test_cancelling_clears_the_restart_intent(self):
+        calls, restarts = [], []
+        with mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            state = self._state(lambda argv: calls.append(tuple(argv)) or 0,
+                                restarts)
+            self._select(state, "Update and restart desktop")
+            desk.handle(10, state)
+            desk.handle(ord("n"), state)                      # cancel
+            self.assertEqual(restarts, [])
+            # A later plain update must not inherit the intent.
+            self._select(state, "Update the stack")
+            desk.handle(10, state)
+            desk.handle(ord("y"), state)
+        self.assertEqual(calls, [("/opt/kilix/kilix", "update")])
+        self.assertEqual(restarts, [])
+
+    def test_power_keeps_the_frozen_three_actions(self):
+        # The new row is maintenance and lives in System; the privileged
+        # contract `kilix power` mirrors is untouched.
+        labels = [label for label, _argv, _c in privileged.power_actions()]
+        self.assertEqual(len(labels), 3)
+        self.assertNotIn("Update and restart desktop", labels)
+
+    def test_the_default_restart_replaces_this_process(self):
+        with mock.patch.object(desk.os, "execv") as execv:
+            desk._restart_desktop()
+        (program, argv), _kwargs = execv.call_args
+        self.assertEqual(program, sys.executable)
+        self.assertEqual(argv[0], sys.executable)
+
+
 class RunCommandTests(unittest.TestCase):
     def test_bang_opens_the_prompt_and_enter_runs_the_argv(self):
         calls = []
