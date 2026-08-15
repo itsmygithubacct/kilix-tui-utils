@@ -612,6 +612,33 @@ class ManualPlaceTests(unittest.TestCase):
         self.assertIn("welcome", unknown.stderr)
 
 
+class VoiceOrientationTests(unittest.TestCase):
+    """The Voice place says where speak and dictate actually live."""
+
+    def test_the_voice_place_carries_the_orientation_entry(self):
+        state = make_state()
+        state.path = ["Programs", "Voice"]
+        row = next(e for e in state.entries()
+                   if e.label == "Where speak and dictate live")
+        self.assertEqual(row.argv, (sys.executable, manual.PATH, "voice"))
+        self.assertEqual(row.verb, "inplace")
+
+    def test_the_wording_names_the_host_chrome_boundary(self):
+        # The point of the topic, pinned: the widgets belong to Kilix's
+        # page strip, and the desktop entries are settings and diagnostics.
+        text = manual.render("voice")
+        self.assertIn("page strip", text)
+        self.assertIn("host chrome", text)
+        self.assertIn("click-to-talk", text)
+
+    def test_voice_studio_shows_the_same_entry(self):
+        module = load_entry()
+        state, action, value = module._focused_state(["--app", "voice"])
+        module._apply_action(state, "voice", action, value)
+        self.assertIn("Where speak and dictate live",
+                      [e.label for e in state.entries()])
+
+
 class ManPagesPlaceTests(unittest.TestCase):
     """Manual ▸ Man pages: kilix-95's System Manual, as a filterable list."""
 

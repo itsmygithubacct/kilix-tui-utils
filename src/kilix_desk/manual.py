@@ -155,6 +155,28 @@ TOPICS: tuple[tuple[str, str, tuple], ...] = (
         ("l", "GNU Bash manual",
          "https://www.gnu.org/software/bash/manual/bash.html"),
     )),
+    # Kilix 95's Voice Help, reworded for a desktop that *is* terminal text:
+    # the boundary worth naming is that the speech widgets are host chrome,
+    # so the entries here can only ever be settings and diagnostics.
+    ("voice", "Where speak and dictate live", (
+        ("h", "Where speak and dictate live"),
+        ("p", "Read aloud and Dictation are the speaking-head and "
+              "microphone buttons in the page strip at the top of Kilix — "
+              "host chrome, not entries in this desktop."),
+        ("p", "They work on terminal panes: click the speaking head to "
+              "read the pane you are looking at, or the microphone to "
+              "dictate into it, and click the same button again to stop. "
+              "This desktop is terminal text, so they work right here."),
+        ("p", "The Read aloud and Dictation entries in the Voice place "
+              "open each tool's settings and diagnostics — device, model, "
+              "level meter. Neither opens a microphone: capture is "
+              "click-to-talk and only ever starts from an explicit "
+              "press."),
+        ("p", "On an installed release, if the voice runtime is missing, "
+              "those entries install Kilix's exact pinned runtime before "
+              "opening. Voice status reports the runtime's state; Voice "
+              "doctor diagnoses it."),
+    )),
     ("recovery", "Pleb Recovery Guide", (
         ("h", "Pleb Recovery Guide"),
         ("p", "The installed recovery guide was not found. pleb install "

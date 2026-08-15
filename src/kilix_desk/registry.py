@@ -97,6 +97,9 @@ VOICE = (
     Item("Voice settings", command="kilix-settings", kilix=("settings",)),
     Item("Voice status", kilix=("voice", "status"), verb="report"),
     Item("Voice doctor", kilix=("voice", "doctor"), verb="report"),
+    # Orientation, not a tool: the speech widgets are host chrome, and a
+    # place full of settings and diagnostics needs one entry saying so.
+    Item("Where speak and dictate live", topic="voice"),
 )
 
 MACHINE = (
