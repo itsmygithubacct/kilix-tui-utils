@@ -351,15 +351,51 @@ def user_launchers() -> list[dict]:
     return out
 
 
+def _catalog_file(path: str) -> list[dict] | None:
+    """One catalog file read as the launcher's rows (`KILIX_TUI_CATALOG`).
+
+    Either shape answers: a list is a saved `kilix install --json` reply,
+    kept as it is; a kilix-content document (`{"content": [...]}`) is shaped
+    the way the launcher shapes it. Installed state is a fact only the
+    launcher can check, so a raw catalog honestly answers False. A file that
+    does not read or parse is None — the same degradation as no launcher.
+    """
+    import json
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    rows = data.get("content") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return [{"id": str(row.get("id", "")),
+             "label": str(row.get("label") or row.get("id", "")),
+             "kind": str(row.get("kind", "")),
+             "description": str(row.get("description", "")),
+             "installed": False}
+            for row in rows if isinstance(row, dict)]
+
+
 def installable() -> list[dict] | None:
     """Everything `kilix install` offers, as it reports it.
 
     The desktop asks the launcher rather than reading the catalog itself. There
     is one list in this system and one thing that knows how to install from it;
     a second reader here would be a second catalogue to keep true.
+
+    `KILIX_TUI_CATALOG` substitutes the whole answer with a file — for tests
+    and for development against a catalog that is not installed yet. It
+    replaces the one list rather than adding a second: every place still
+    reads this function, whichever way it was answered.
     """
     import json
     import subprocess
+    override = os.environ.get("KILIX_TUI_CATALOG")
+    if override:
+        return _catalog_file(override)
     launcher = kilix_command()
     if launcher is None:
         return None

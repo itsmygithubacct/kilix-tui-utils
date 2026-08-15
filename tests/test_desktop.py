@@ -676,6 +676,172 @@ class GamesFromCatalogTests(unittest.TestCase):
             self.assertEqual(ask.call_count, 2, "r must re-ask")
 
 
+class CatalogOverrideTests(unittest.TestCase):
+    """`KILIX_TUI_CATALOG` substitutes the one list; it never adds one."""
+
+    def _write(self, payload):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False)
+        self.addCleanup(os.unlink, handle.name)
+        handle.write(payload)
+        handle.close()
+        return handle.name
+
+    def test_a_catalog_document_reads_as_the_launchers_rows(self):
+        path = self._write(
+            '{"content": [{"id": "doom", "label": "Doom", "kind": "game",'
+            ' "description": "d"}]}')
+        with mock.patch.dict(os.environ, {"KILIX_TUI_CATALOG": path}), \
+             mock.patch("subprocess.run",
+                        side_effect=AssertionError("no launcher call")):
+            rows = registry.installable()
+        self.assertEqual(rows, [{"id": "doom", "label": "Doom",
+                                 "kind": "game", "description": "d",
+                                 "installed": False}])
+
+    def test_a_saved_json_answer_passes_through_unchanged(self):
+        path = self._write('[{"id": "x", "kind": "app", "installed": true}]')
+        with mock.patch.dict(os.environ, {"KILIX_TUI_CATALOG": path}):
+            rows = registry.installable()
+        self.assertEqual(rows, [{"id": "x", "kind": "app",
+                                 "installed": True}])
+
+    def test_an_unreadable_override_degrades_like_no_launcher(self):
+        with mock.patch.dict(os.environ,
+                             {"KILIX_TUI_CATALOG": "/nonexistent.json"}):
+            self.assertIsNone(registry.installable())
+        path = self._write("not json")
+        with mock.patch.dict(os.environ, {"KILIX_TUI_CATALOG": path}):
+            self.assertIsNone(registry.installable())
+
+
+def real_catalog_path():
+    """The kilix-content catalog checked out near this one, if any.
+
+    Discovered, never hardcoded: this checkout's own parent first (flat
+    layouts keep the two side by side), then the same workspace search the
+    runtime uses (`sources.candidates`) under both accepted layouts. A
+    machine without a kilix-content checkout skips the audit rather than
+    failing it — the audit is about the catalog, not about having one.
+    """
+    from kilix_desk import sources
+    bases = [str(ROOT.parent), *sources.candidates()]
+    for base in bases:
+        for tail in ("kilix-content",
+                     os.path.join("kilix-modules", "kilix-content")):
+            path = os.path.join(base, tail, "src", "kilix_content",
+                                "catalog", "plebian.json")
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+@unittest.skipUnless(real_catalog_path(), "no kilix-content checkout nearby")
+class CatalogAuditTests(unittest.TestCase):
+    """Every row of the real catalog reaches a place and resolves to an argv.
+
+    The catalog is read through the runtime's own override
+    (`KILIX_TUI_CATALOG`), so what is audited is exactly what the desktop
+    would list. A future kind or entry that falls through fails here
+    instead of quietly vanishing from every menu.
+    """
+
+    KILIX = ["/opt/kilix/kilix"]
+    LAUNCH_PLACES = {"app": ["Programs", "Catalog apps"],
+                     "game": ["Programs", "Games"]}
+
+    def setUp(self):
+        patcher = mock.patch.dict(
+            os.environ, {"KILIX_TUI_CATALOG": real_catalog_path()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.rows = registry.installable()
+
+    def _entries(self, path, kilix=True):
+        state = make_state()
+        state.path = list(path)
+        with mock.patch.object(registry, "kilix_command",
+                               return_value=self.KILIX if kilix else None), \
+             mock.patch.object(registry, "games", return_value=None), \
+             mock.patch.object(registry, "games_play_supported",
+                               return_value=True):
+            return [e for e in state.entries() if not e.back]
+
+    def test_the_catalog_reads_and_names_the_expected_entries(self):
+        self.assertIsInstance(self.rows, list)
+        self.assertTrue(self.rows)
+        ids = {row["id"] for row in self.rows}
+        for expected in ("dosbox", "kilix-land", "kilix-tmux-manager"):
+            self.assertIn(expected, ids)
+
+    def test_every_row_is_installable_from_the_software_place(self):
+        argvs = {e.label: e.argv for e in self._entries(
+            ["Programs", "Software"])}
+        for row in self.rows:
+            self.assertIn(row["label"], argvs)
+            self.assertEqual(
+                argvs[row["label"]],
+                ("/opt/kilix/kilix", "install", row["id"]),
+                f"{row['id']} must install through the one command")
+
+    def test_every_kind_has_a_decided_launch_place(self):
+        unexpected = ({row["kind"] for row in self.rows}
+                      - set(self.LAUNCH_PLACES))
+        self.assertFalse(
+            unexpected,
+            f"new catalog kind(s) {sorted(unexpected)} need a place decision")
+
+    def test_every_app_and_game_launch_resolves_in_its_place(self):
+        expect = {
+            "app": lambda i: ("/opt/kilix/kilix", "app", "run", i),
+            "game": lambda i: ("/opt/kilix/kilix", "games", "play", i),
+        }
+        for kind, place in self.LAUNCH_PLACES.items():
+            argvs = {e.label: e.argv for e in self._entries(place)}
+            for row in self.rows:
+                if row["kind"] != kind:
+                    continue
+                self.assertIn(row["label"], argvs,
+                              f"{row['id']} vanished from {place[-1]}")
+                self.assertEqual(argvs[row["label"]],
+                                 expect[kind](row["id"]))
+
+    def test_kilix_land_renders_in_both_places_with_its_state(self):
+        games = {e.label: e for e in self._entries(["Programs", "Games"])}
+        self.assertEqual(games["Kilix Land"].hint, "installs on first play")
+        software = {e.label: e for e in self._entries(
+            ["Programs", "Software"])}
+        self.assertEqual(software["Kilix Land"].hint, "game")
+
+    def test_every_place_degrades_without_a_launcher_never_crashes(self):
+        for place in (["Programs", "Software"],
+                      ["Programs", "Catalog apps"],
+                      ["Programs", "Games"]):
+            with mock.patch.object(registry, "installable",
+                                   return_value=None):
+                rows = self._entries(place, kilix=False)
+            self.assertEqual(len(rows), 1, place)
+            self.assertIsNone(rows[0].argv)
+            self.assertTrue(rows[0].reason)
+
+    def test_a_future_catalog_app_surfaces_with_no_desktop_change(self):
+        # The multiplexer contract: when a new app row lands in the catalog,
+        # it appears here and resolves through the host with zero edits.
+        rows = self.rows + [{"id": "kilix-multiplexer",
+                             "label": "Multiplexer", "kind": "app",
+                             "installed": False}]
+        state = make_state()
+        state.path = ["Programs", "Catalog apps"]
+        with mock.patch.object(registry, "installable", return_value=rows), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=self.KILIX):
+            entries = {e.label: e for e in state.entries() if not e.back}
+        self.assertIn("Multiplexer", entries)
+        self.assertEqual(
+            entries["Multiplexer"].argv,
+            ("/opt/kilix/kilix", "app", "run", "kilix-multiplexer"))
+
+
 class SystemMenuTests(unittest.TestCase):
     """The reference desktop's maintenance rows, grown into the System place."""
 

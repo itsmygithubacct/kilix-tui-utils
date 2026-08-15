@@ -126,10 +126,24 @@ a `kilix run` page. **Launchers** lists the user's own desktop-folder
 `.desktop` files — the ones a Create Launcher wizard writes on any desktop —
 read from the same folders `kilix-launcher` reads
 (`kilix_desk.registry.launcher_dirs`), under the same containment. And
-**Games** launches on Enter when the installed
+**Games** lists the games from that same host response — a game added to the
+catalog is listed and playable here with no desktop release — with the SDK's
+availability toggles as the on/off hint. Enter launches when the installed
 launcher knows `kilix games play` — probed from its own usage line, cached per
 visit — while `t` keeps the availability toggle one key away; older launchers
-keep Enter as the toggle, so the list is never a dead end.
+keep Enter as the toggle (or the install, for a game the toggle table does not
+know), so the list is never a dead end.
+
+That is the contract as the catalog grows: **there is no second list.** Every
+place that offers installable content reads the one cached
+`kilix install --json` answer (or the shared Programs registry), fetched once
+per visit and re-asked on `r`, so a new catalog entry needs a kilix-content
+publish and the kilix pin that ships it — never a desktop release.
+`KILIX_TUI_CATALOG` can point that one answer at a catalog file, for tests and
+for development against a catalog that is not installed yet; it substitutes
+the list, it never adds one. A test audits the real catalog through that
+override: every row must be installable from Software, and every app and game
+must resolve to its `kilix app run` / `kilix games play` launch.
 
 Home also carries the desk's one piece of durable state: rows pinned with
 `p` from any plain entry, and the last few launches, kept in one small JSON
