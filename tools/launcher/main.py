@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.join(
 
 from kilix_desk import registry                              # noqa: E402
 from kilix_desk.desk import report_argv                      # noqa: E402
+from kilix_desk.registry import script_dirs, script_rows     # noqa: E402
 from kilix_tui import app, keys as keymap, shell, xdgapps    # noqa: E402
 
 RUN_ROW = "Run a command…"
@@ -50,35 +51,8 @@ def launcher_dirs() -> list[str]:
             os.path.join(base, "kilix", "data", "desktop")]
 
 
-def script_dirs() -> list[str]:
-    """The stack's scripts/ directories, gated on presence like the
-    reference desktop's System menu."""
-    dirs = [os.path.expanduser(os.path.join("~", "pleb", "scripts"))]
-    kilix_home = os.environ.get("KILIX_HOME", "")
-    if kilix_home:
-        dirs.append(os.path.join(kilix_home, "scripts"))
-    return dirs
-
-
-def script_rows(dirs: list[str] | None = None) -> list[dict]:
-    """Executable *.sh under the pleb/kilix scripts directories — the same
-    files the reference desktop's System ▸ Scripts submenu offers."""
-    out: list[dict] = []
-    seen: set[str] = set()
-    for base in (script_dirs() if dirs is None else dirs):
-        if not os.path.isdir(base):
-            continue
-        for name in sorted(os.listdir(base)):
-            if not name.endswith(".sh") or name in seen:
-                continue
-            path = os.path.join(base, name)
-            if not os.path.isfile(path) or not os.access(path, os.X_OK):
-                continue
-            seen.add(name)
-            out.append({"kind": "script", "label": name, "detail": "script",
-                        "argv": [path], "verb": "inplace"})
-    return out
-
+# The scripts listing lives in `kilix_desk.registry` (shared with the desk's
+# System ▸ Scripts place); `script_dirs`/`script_rows` are imported above.
 
 # ── the laptop rows ─────────────────────────────────────────────────────────
 

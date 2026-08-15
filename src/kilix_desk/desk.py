@@ -56,6 +56,7 @@ TIPS: dict[str, str] = {
     "Catalog apps": "every application comes from the host's one content catalog",
     "Voice": "speech tools share the stack's models, settings and diagnostics",
     "Default desktop": "Enter chooses what every later session starts with",
+    "Scripts": "the stack's own maintenance scripts; Enter runs one in place",
     "Games": "Enter toggles a game on or off for the whole stack",
     "Games+play": "Enter plays; t turns a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
@@ -168,6 +169,7 @@ class State:
         self.software: list[dict] | None = None
         self.default_desktop: str | None = None
         self.apps: dict[str, list[dict]] | None = None
+        self.scripts: list[dict] | None = None
         self.play_support: bool | None = None
         self.text_hits: dict = {}
 
@@ -243,6 +245,8 @@ class State:
             return self._game_entries()
         if self.submenu == "screensavers":
             return self._screensaver_entries()
+        if self.submenu == "scripts":
+            return self._script_entries()
         if self.submenu == "applications":
             return self._application_entries()
         if self.submenu == "voice":
@@ -276,6 +280,10 @@ class State:
                 continue
             plan = registry.resolve(item)
             if plan is None:
+                if item.helper:
+                    # Presence-gated like the reference desktop's System
+                    # menu: no OS helper, no row.
+                    continue
                 out.append(Entry(item.label, None,
                                  reason=registry.disabled_reason(item)))
                 continue
@@ -445,6 +453,22 @@ class State:
             return [Entry("nothing launchable in this bucket", None,
                           reason="every entry here failed to parse")]
         return out
+
+    def _script_entries(self) -> list[Entry]:
+        """The stack's executable maintenance scripts, run in place.
+
+        The listing is `registry.script_rows()`, shared with the launcher
+        catalog, so the two surfaces can never disagree about what a script
+        is: executable `*.sh` under the stack's own scripts directories.
+        """
+        if self.scripts is None:
+            self.scripts = registry.script_rows()
+        if not self.scripts:
+            return [Entry("no scripts installed", None,
+                          reason="no executable *.sh under the stack's "
+                                 "scripts directories")]
+        return [Entry(str(row["label"]), tuple(row["argv"]))
+                for row in self.scripts]
 
     def _screensaver_entries(self) -> list[Entry]:
         kilix = registry.kilix_command()
@@ -958,6 +982,7 @@ def handle(key: int, state: State) -> bool:
         state.software = None            # re-ask the launcher for the list
         state.default_desktop = None
         state.apps = None                # rescan the .desktop entries
+        state.scripts = None             # relist the maintenance scripts
         state.play_support = None        # re-probe the launcher's verbs
         state.message = ""
         return True

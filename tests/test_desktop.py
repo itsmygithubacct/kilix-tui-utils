@@ -441,6 +441,75 @@ class SubmenuTests(unittest.TestCase):
         self.assertIsNone(entries[0].argv)
 
 
+class SystemMenuTests(unittest.TestCase):
+    """The reference desktop's maintenance rows, grown into the System place."""
+
+    def _system_entries(self, **kwargs):
+        state = make_state(**kwargs)
+        state.section = desk.SECTIONS.index("System")
+        return state, state.entries()
+
+    def test_reinstall_dependencies_is_hidden_without_the_helper(self):
+        with mock.patch.object(registry, "helper_ready", return_value=False):
+            _state, rows = self._system_entries()
+        self.assertNotIn("Reinstall dependencies", [e.label for e in rows])
+
+    def test_reinstall_dependencies_confirms_and_holds_its_output(self):
+        with mock.patch.object(registry, "helper_ready", return_value=True):
+            _state, rows = self._system_entries(live=lambda: True)
+            entry = next(e for e in rows
+                         if e.label == "Reinstall dependencies")
+        self.assertTrue(entry.confirm)
+        self.assertEqual(entry.verb, "report")
+        self.assertEqual(entry.argv[:2], ("sh", "-c"))
+        self.assertIn("sudo /usr/local/sbin/plebian-os-install-deps",
+                      entry.argv[2])
+
+    def test_scripts_is_a_system_place(self):
+        _state, rows = self._system_entries()
+        entry = next(e for e in rows if e.label == "Scripts")
+        self.assertEqual(entry.submenu, "scripts")
+
+    def test_the_scripts_place_lists_only_executable_shell_scripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "go.sh"
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+            (Path(tmp) / "plain.sh").write_text("")     # not executable
+            with mock.patch.object(registry, "script_dirs",
+                                   return_value=[tmp]):
+                state = make_state()
+                state.path = ["System", "Scripts"]
+                rows = [e for e in state.entries() if not e.back]
+        self.assertEqual([e.label for e in rows], ["go.sh"])
+        self.assertEqual(rows[0].argv, (str(exe),))
+        self.assertEqual(rows[0].verb, "inplace")
+
+    def test_the_scripts_place_degrades_to_an_explanation(self):
+        with mock.patch.object(registry, "script_rows", return_value=[]):
+            state = make_state()
+            state.path = ["System", "Scripts"]
+            rows = [e for e in state.entries() if not e.back]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].argv)
+        self.assertIn("scripts", rows[0].reason)
+
+    def test_the_scripts_listing_is_asked_once_per_visit(self):
+        asks = []
+        rows = [{"kind": "script", "label": "go.sh", "detail": "script",
+                 "argv": ["/stack/scripts/go.sh"], "verb": "inplace"}]
+        with mock.patch.object(registry, "script_rows",
+                               side_effect=lambda: asks.append(1) or rows):
+            state = make_state()
+            state.path = ["System", "Scripts"]
+            state.entries()
+            state.entries()
+            self.assertEqual(len(asks), 1)
+            desk.handle(ord("r"), state)
+            state.entries()
+        self.assertEqual(len(asks), 2, "r must relist")
+
+
 class RunCommandTests(unittest.TestCase):
     def test_bang_opens_the_prompt_and_enter_runs_the_argv(self):
         calls = []
@@ -688,12 +757,12 @@ class ResolutionTests(unittest.TestCase):
 
     def test_source_checkout_never_wins_for_non_sibling_tools(self):
         # The Start-menu rule: a working tree is not the pinned closure. Only
-        # `command` and `kilix` branches exist for outside tools — assert the
-        # registry offers no path-based resolution for them.
+        # `command`, `kilix` and OS-helper branches exist for outside tools —
+        # assert the registry offers no path-based resolution for them.
         for section in registry.SECTIONS.values():
             for item in section:
                 if item.sibling is None and not item.submenu:
-                    self.assertTrue(item.command or item.kilix)
+                    self.assertTrue(item.command or item.kilix or item.helper)
 
 
 class VerbTests(unittest.TestCase):

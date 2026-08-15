@@ -23,6 +23,12 @@ from kilix_desk import sources
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# The Plebian-OS dependency reinstaller, deployed by the OS itself. Helper
+# entries are presence-gated like the reference desktop's System menu: a
+# machine without the helper hides the row rather than offering a command
+# that can only fail.
+DEPS_HELPER = "/usr/local/sbin/plebian-os-install-deps"
+
 
 @dataclass(frozen=True)
 class Item:
@@ -35,6 +41,7 @@ class Item:
     kilix_only: bool = False         # hidden outside a Kilix session
     submenu: str = ""                # opens a drill-down list instead
     confirm: bool = False            # asks before running
+    helper: str = ""                 # a root helper run via sudo; hidden when absent
 
 
 @dataclass(frozen=True)
@@ -118,6 +125,9 @@ SYSTEM = (
     Item("Voice status", kilix=("voice", "status"), verb="report"),
     Item("Voice doctor", kilix=("voice", "doctor"), verb="report"),
     Item("Update the stack", kilix=("update",), confirm=True),
+    Item("Reinstall dependencies", helper=DEPS_HELPER, verb="report",
+         confirm=True),
+    Item("Scripts", submenu="scripts"),
     Item("Screen sharing", kilix=("share",), verb="tab", kilix_only=True),
     # `kilix desktop <name>` opens its own page and returns at once, so these
     # run in place: launching them in a page of ours would leave a dead tab
@@ -232,6 +242,46 @@ def screensavers() -> list[str]:
     return names
 
 
+def helper_ready(path: str) -> bool:
+    """Whether a root helper is installed where the OS deploys it.
+
+    `sudo` must exist too: the helpers are root-only by design, and a row
+    that cannot possibly run is noise, not an offer.
+    """
+    return bool(shutil.which("sudo")) and os.access(path, os.X_OK)
+
+
+def script_dirs() -> list[str]:
+    """The stack's scripts/ directories, gated on presence like the
+    reference desktop's System menu."""
+    dirs = [os.path.expanduser(os.path.join("~", "pleb", "scripts"))]
+    kilix_home = os.environ.get("KILIX_HOME", "")
+    if kilix_home:
+        dirs.append(os.path.join(kilix_home, "scripts"))
+    return dirs
+
+
+def script_rows(dirs: list[str] | None = None) -> list[dict]:
+    """Executable *.sh under the pleb/kilix scripts directories — the same
+    files the reference desktop's System ▸ Scripts submenu offers. One
+    source for the desk's Scripts place and the launcher catalog alike."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for base in (script_dirs() if dirs is None else dirs):
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            if not name.endswith(".sh") or name in seen:
+                continue
+            path = os.path.join(base, name)
+            if not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            seen.add(name)
+            out.append({"kind": "script", "label": name, "detail": "script",
+                        "argv": [path], "verb": "inplace"})
+    return out
+
+
 def installable() -> list[dict] | None:
     """Everything `kilix install` offers, as it reports it.
 
@@ -305,6 +355,8 @@ def resolve(item: Item) -> Plan | None:
         launcher = kilix_command()
         if launcher:
             return Plan((*launcher, *item.kilix), item.verb)
+    if item.helper and helper_ready(item.helper):
+        return Plan(("sudo", item.helper), item.verb)
     return None
 
 

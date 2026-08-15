@@ -20,8 +20,16 @@ sys.path.insert(0, str(ROOT / "tools" / "launcher"))
 
 import main as launcher  # noqa: E402
 
+from kilix_desk import registry  # noqa: E402
+
 
 class ScriptRowTests(unittest.TestCase):
+    def test_the_desk_shares_this_scripts_source(self):
+        # One listing for the launcher catalog and the desk's Scripts place:
+        # the two surfaces must never disagree about what a script is.
+        self.assertIs(launcher.script_rows, registry.script_rows)
+        self.assertIs(launcher.script_dirs, registry.script_dirs)
+
     def test_only_executable_shell_scripts_are_listed(self):
         with tempfile.TemporaryDirectory() as tmp:
             exe = Path(tmp) / "go.sh"
