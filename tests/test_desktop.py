@@ -20,8 +20,15 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_desk import desk, facts, graphics, gui, manual, registry, tango  # noqa: E402
+from kilix_desk import desk, durable, facts, graphics, gui, manual, registry, tango  # noqa: E402
 from kilix_tui import app, keys as keymap, kitty_rc, privileged, proc  # noqa: E402
+
+# The desk records launches in its one durable file; point that file into a
+# scratch directory for this whole process so no test — the launch tests
+# included — ever touches the user's real state (`durable.state_path`
+# honors KILIX_TUI_STATE).
+_SCRATCH_STATE = tempfile.TemporaryDirectory()
+os.environ["KILIX_TUI_STATE"] = os.path.join(_SCRATCH_STATE.name, "desk.json")
 
 
 def load_entry():
@@ -1046,6 +1053,130 @@ class ApplicationsPlaceTests(unittest.TestCase):
             desk.handle(ord("r"), state)
             state.entries()
         self.assertEqual(len(asks), 2)
+
+
+class DurableStateTests(unittest.TestCase):
+    """The one durable record: recents and pinned Home rows (durable.py)."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        patcher = mock.patch.dict(os.environ, {
+            "KILIX_TUI_STATE": os.path.join(scratch.name, "desk.json")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _home(self):
+        state = make_state()
+        state.path = ["Home"]
+        return state, [e for e in state.entries() if not e.back]
+
+    def test_a_resolved_launch_is_remembered_and_offered_on_home(self):
+        state = make_state()
+        with mock.patch.object(desk, "_resolve_program", lambda name: name):
+            desk._launch(state, desk.Entry("Music", ("kilix-music",)))
+        _state, rows = self._home()
+        self.assertEqual([(e.label, e.argv) for e in rows],
+                         [("Music", ("kilix-music",))])
+        self.assertEqual(rows[0].hint, "recent")
+        self.assertEqual(rows[0].verb, "tab")
+
+    def test_an_unresolvable_launch_is_not_remembered(self):
+        state = make_state(runner=lambda argv: self.fail("must not run"))
+        with mock.patch.object(desk.shutil, "which", lambda name: None):
+            desk._launch(state, desk.Entry("Ghost", ("no-such-tool-qq",)))
+        self.assertEqual(durable.recents(), [])
+
+    def test_recents_are_capped_deduped_and_most_recent_first(self):
+        for index in range(10):
+            durable.remember_launch(f"tool{index}", (f"tool{index}",))
+        durable.remember_launch("tool3", ("tool3",))
+        names = [row["label"] for row in durable.recents()]
+        self.assertEqual(len(names), durable.MAX_RECENTS)
+        self.assertEqual(names[0], "tool3")
+        self.assertEqual(len(set(names)), len(names))
+
+    def test_p_pins_the_selected_entry_and_p_on_home_unpins_it(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Machine")
+        with mock.patch.object(registry.shutil, "which",
+                               lambda name: f"/usr/bin/{name}"):
+            entries = state.entries()
+            state.selected = next(index for index, e in enumerate(entries)
+                                  if e.label == "Network")
+            desk.handle(ord("p"), state)
+        self.assertIn("pinned", state.message)
+        _state, rows = self._home()
+        self.assertEqual(rows[0].label, "Network")
+        self.assertEqual(rows[0].hint, "pinned")
+        home, _rows = self._home()
+        home.selected = 1                                  # past ".."
+        desk.handle(ord("p"), home)
+        self.assertIn("unpinned", home.message)
+        self.assertEqual(durable.pinned(), [])
+
+    def test_pinned_rows_shadow_their_recent_twin(self):
+        durable.remember_launch("Music", ("kilix-music",))
+        durable.toggle_pin("Music", ("kilix-music",))
+        _state, rows = self._home()
+        self.assertEqual([e.label for e in rows], ["Music"])
+        self.assertEqual(rows[0].hint, "pinned")
+
+    def test_home_renders_the_rows_and_r_rereads_them(self):
+        durable.toggle_pin("Music", ("kilix-music",))
+        state = make_state()
+        state.path = ["Home"]
+        text = app.render_to_text(desk.render, state)
+        self.assertIn("Music", text)
+        self.assertIn("pinned", text)
+        durable.toggle_pin("Weather", ("kilix-weather",))
+        self.assertNotIn("Weather", [e.label for e in state.entries()],
+                         "the record is read once per visit")
+        desk.handle(ord("r"), state)
+        self.assertIn("Weather", [e.label for e in state.entries()])
+
+    def test_confirmed_actions_never_become_home_rows(self):
+        state = make_state()
+        state.section = desk.SECTIONS.index("Power")
+        state.selected = next(index for index, e
+                              in enumerate(state.entries())
+                              if e.label == "Reboot")
+        desk.handle(ord("p"), state)          # must refuse the pin
+        self.assertNotIn("pinned", state.message)
+        desk.handle(10, state)                # ask…
+        desk.handle(ord("y"), state)          # …and run via the stub runner
+        self.assertEqual(durable.recents(), [])
+        self.assertEqual(durable.pinned(), [])
+
+    def test_the_record_survives_corruption_and_writes_only_on_change(self):
+        with open(durable.state_path(), "w", encoding="utf-8") as handle:
+            handle.write("{ not json")
+        self.assertEqual(durable.load(), {"recents": [], "pinned": []})
+        durable.remember_launch("Music", ("kilix-music",))
+        self.assertEqual([row["label"] for row in durable.recents()],
+                         ["Music"])
+        with mock.patch.object(durable.os, "replace",
+                               side_effect=AssertionError("must not write")):
+            durable.save(durable.load())                   # unchanged: no I/O
+            durable.remember_launch("Music", ("kilix-music",))
+
+    def test_malformed_rows_are_dropped_not_rendered(self):
+        durable.save({"recents": [
+            {"label": "Good", "argv": ["good"]},
+            {"label": "", "argv": ["bad"]},
+            {"label": "NoArgv", "argv": []},
+            "not a row",
+        ], "pinned": []})
+        self.assertEqual([row["label"] for row in durable.recents()],
+                         ["Good"])
+
+    def test_the_file_lives_under_xdg_state_home_by_default(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/xdg/state"},
+                             clear=False):
+            os.environ.pop("KILIX_TUI_STATE", None)
+            self.assertEqual(
+                durable.state_path(),
+                os.path.join("/xdg/state", "kilix-tui", "desk.json"))
 
 
 class LaunchersPlaceTests(unittest.TestCase):

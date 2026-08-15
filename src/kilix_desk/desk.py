@@ -36,7 +36,7 @@ from typing import Callable, Sequence
 
 from kilix_tui import keys as keymap, kitty_rc, privileged, shell
 
-from . import facts, manual, registry, tango
+from . import durable, facts, manual, registry, tango
 
 SECTIONS = ("Home", "Programs", "Machine", "System", "Session", "Power")
 QUIT_SENTINEL: tuple[str, ...] = ()
@@ -47,7 +47,7 @@ BACK_LABEL = ".."
 # something the screen does not already show.
 TIPS: dict[str, str] = {
     "": "Enter walks in, ← walks back — the trail above always says where you are",
-    "Home": "r refreshes these numbers without leaving",
+    "Home": "p on any entry pins it here · r refreshes these numbers",
     "Programs": "press / and type to filter — 'chess' finds Chess Bash",
     "Machine": "these open live dashboards; q returns you here",
     "System": "settings, desktops and updates for the whole stack",
@@ -223,6 +223,7 @@ class State:
         self.launchers: list[dict] | None = None
         self.scripts: list[dict] | None = None
         self.man_pages: list[dict] | None = None
+        self.home_rows: list[dict] | None = None
         self.play_support: bool | None = None
         self.text_hits: dict = {}
 
@@ -310,7 +311,7 @@ class State:
             return self._registry_entries(registry.VOICE)
         name = self.path[0]
         if name == "Home":
-            return []
+            return self._home_entries()
         if name == "Power":
             return [Entry(label, tuple(argv), confirm=True)
                     for label, argv, _needs in privileged.power_actions()]
@@ -350,6 +351,24 @@ class State:
             out.append(Entry(item.label, argv, verb=verb,
                              confirm=item.confirm, restart=item.restart))
         return out
+
+    def _home_entries(self) -> list[Entry]:
+        """Pinned rows first, then recent launches: the one durable list.
+
+        These are the desk's only persisted state (`durable.py` records the
+        decision). Each row re-runs through the normal launch policy — the
+        argv stored is the one the entry offered, re-resolved at launch time,
+        so a recents row survives a reinstall the same way the entry does.
+        The facts render below; `p` on a row here unpins or re-pins it.
+        """
+        if self.home_rows is None:
+            pins = [dict(row, pinned=True) for row in durable.pinned()]
+            names = {row["label"] for row in pins}
+            self.home_rows = pins + [row for row in durable.recents()
+                                     if row["label"] not in names]
+        return [Entry(row["label"], tuple(row["argv"]), verb="tab",
+                      hint="pinned" if row.get("pinned") else "recent")
+                for row in self.home_rows if row.get("argv")]
 
     def _section_entries(self) -> list[Entry]:
         """The root: the six sections, as things the one cursor can open."""
@@ -731,8 +750,12 @@ def render(surface, state: State) -> None:
         # Home is a place like any other, so the way out of it has to be on
         # screen. Drawing only the status rows left the cursor sitting on a
         # ".." the user could not see: Enter went back, and nothing said so.
-        _draw_entries(surface, state, body.top, 1, width)
-        _draw_home(surface, state, body.top + 2, max(0, body.height - 2), width)
+        # The list is ".." plus the pinned and recent rows; the facts keep
+        # whatever height remains below it.
+        rows = min(len(state.entries()), max(1, body.height - 2))
+        _draw_entries(surface, state, body.top, rows, width)
+        _draw_home(surface, state, body.top + rows + 1,
+                   max(0, body.height - rows - 1), width)
     else:
         _draw_entries(surface, state, body.top, body.height, width)
 
@@ -843,6 +866,13 @@ def _launch(state: State, entry: Entry) -> None:
                          "(not on PATH or in ~/.local/bin)")
         return
     argv[0] = program
+    # The one durable record (durable.py): a launch that resolved is worth
+    # offering again on Home. The argv remembered is the entry's own, not the
+    # resolved one, so the row keeps re-resolving as tools come and go.
+    # Confirmed actions and quiet toggles never reach this path, so nothing
+    # dangerous can become a one-Enter recents row.
+    durable.remember_launch(entry.label, entry.argv)
+    state.home_rows = None
     if entry.verb == "tab" and state.live():
         try:
             kitty_rc.launch_tab(argv, title=entry.label)
@@ -1048,6 +1078,20 @@ def handle(key: int, state: State) -> bool:
                                  if not code
                                  else f"{entry.label}: failed ({code})")
                 return True
+    if key in (ord("p"), ord("P")):
+        # Pin the selected entry to Home, or unpin it when it already is.
+        # Only plain launches qualify: a row that confirms or toggles must
+        # never become a one-Enter Home row.
+        entries = state.entries()
+        if state.selected < len(entries):
+            entry = entries[state.selected]
+            if (entry.argv is not None and not entry.confirm
+                    and not entry.toggle):
+                pinned = durable.toggle_pin(entry.label, entry.argv)
+                state.home_rows = None
+                state.message = (f"{entry.label}: pinned to Home" if pinned
+                                 else f"{entry.label}: unpinned")
+                return True
     if key == keymap.ESCAPE:
         # Esc walks out one level at a time, then asks before leaving.
         if state.filter or len(state.path) > len(state.root_path):
@@ -1096,6 +1140,7 @@ def handle(key: int, state: State) -> bool:
         state.launchers = None           # reread the desktop folders
         state.scripts = None             # relist the maintenance scripts
         state.man_pages = None           # rescan the manpath
+        state.home_rows = None           # reread the durable record
         state.play_support = None        # re-probe the launcher's verbs
         state.message = ""
         return True

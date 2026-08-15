@@ -130,7 +130,15 @@ launcher knows `kilix games play` — probed from its own usage line, cached per
 visit — while `t` keeps the availability toggle one key away; older launchers
 keep Enter as the toggle, so the list is never a dead end.
 
-Six sections: Home (status), Programs, Machine,
+Home also carries the desk's one piece of durable state: rows pinned with
+`p` from any plain entry, and the last few launches, kept in one small JSON
+record (`$XDG_STATE_HOME/kilix-tui/desk.json`; `KILIX_TUI_STATE` relocates
+it) written atomically and only on change. `src/kilix_desk/durable.py`
+records the decision to break the desk's read-only purity exactly this far
+and no further — confirmed actions never become one-Enter rows, and there is
+no last-place restore: Home stays the fixed landing.
+
+Six sections: Home (status, pinned and recent launches), Programs, Machine,
 System, Session, and Power — the last being the point: it closes the stack's
 no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions
 shared verbatim with `plebian-os` (`src/kilix_tui/privileged.py` is the one list
