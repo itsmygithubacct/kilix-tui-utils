@@ -996,11 +996,15 @@ def _back(state: State) -> None:
         leaving = state.path[-1]
         state.path = state.path[:-1]
         state.message = ""
-        # Land the cursor on the place just left, so walking out and back in
-        # returns to where you were rather than to the top of the list.
-        siblings = [entry.label for entry in state.entries()]
-        state.selected = (siblings.index(leaving)
-                          if leaving in siblings else 0)
+        # Land the cursor on the row just walked through, so walking out and
+        # back in returns to where you were rather than to the top of the
+        # list. The row is found by where it leads before what it says: the
+        # Software place is entered through 'Install software', and matching
+        # labels alone stranded the cursor on ".." for every row named
+        # differently from its place.
+        state.selected = next(
+            (index for index, entry in enumerate(state.entries())
+             if leaving in (entry.submenu.capitalize(), entry.label)), 0)
 
 
 def _enter_section(state: State, section: int) -> None:

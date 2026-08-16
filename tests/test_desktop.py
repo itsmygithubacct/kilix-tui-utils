@@ -137,6 +137,34 @@ class NavigationTests(unittest.TestCase):
         desk.handle(260, state)                               # back to root
         self.assertEqual(state.entries()[state.selected].label, "System")
 
+    def test_walking_out_restores_the_originating_row_whatever_its_label(self):
+        # The rule must hold when the row and the place it opens are named
+        # differently: Software is entered through 'Install software' and
+        # the catalog through 'Kilix applications'. Left must land back on
+        # those rows exactly as it lands on 'Games' — a cursor dropped on
+        # ".." instead turns the next Enter into an unintended open.
+        rows = [{"id": "doom", "label": "Doom", "kind": "game",
+                 "installed": False}]
+        with mock.patch.object(registry, "installable", return_value=rows), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]), \
+             mock.patch.object(registry, "games", return_value=[]), \
+             mock.patch.object(registry, "games_play_supported",
+                               return_value=False):
+            for label in ("Games", "Install software",
+                          "Kilix applications", "Voice Studio"):
+                state = make_state()
+                state.section = desk.SECTIONS.index("Programs")
+                state.selected = next(
+                    index for index, entry in enumerate(state.entries())
+                    if entry.label == label)
+                desk.handle(261, state)                   # right: walk in
+                self.assertEqual(len(state.path), 2, label)
+                desk.handle(260, state)                   # left: walk out
+                self.assertEqual(state.path, ["Programs"], label)
+                self.assertEqual(state.entries()[state.selected].label,
+                                 label)
+
     def test_the_back_row_is_reachable_by_cursor(self):
         # ncdu's "/.." — going back must be in the list, not only on a key.
         state = make_state()
