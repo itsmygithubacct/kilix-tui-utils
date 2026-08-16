@@ -1421,6 +1421,22 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(durable.recents(), [])
         self.assertEqual(durable.pinned(), [])
 
+    def test_typed_commands_run_but_never_become_home_rows(self):
+        # The `!` prompt shares the launch verbs, not the durable record: a
+        # command typed once went through nobody's list, so it must not be
+        # offered again on Home (nor become pinnable there).
+        calls = []
+        state = make_state(runner=lambda argv: calls.append(tuple(argv)) or 0)
+        with mock.patch.object(desk, "_resolve_program", lambda name: name):
+            desk.handle(ord("!"), state)
+            for ch in "sudo reboot":
+                desk.handle(ord(ch), state)
+            desk.handle(10, state)
+        self.assertEqual(calls, [("sudo", "reboot")])
+        self.assertEqual(durable.recents(), [])
+        _state, rows = self._home()
+        self.assertEqual(rows, [])
+
     def test_the_record_survives_corruption_and_writes_only_on_change(self):
         with open(durable.state_path(), "w", encoding="utf-8") as handle:
             handle.write("{ not json")

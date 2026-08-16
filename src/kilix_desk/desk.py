@@ -871,7 +871,10 @@ def _run_command(state: State) -> None:
     if not argv:
         state.message = ""
         return
-    _launch(state, Entry(text, argv, verb="tab"))
+    # Never remembered: a typed command went through nobody's list, so
+    # offering it again on Home would make a one-Enter row out of whatever
+    # was typed once — exactly what the recents record promises not to hold.
+    _launch(state, Entry(text, argv, verb="tab"), remember=False)
 
 
 def _run_key(key: int, state: State) -> bool:
@@ -910,7 +913,7 @@ def _resolve_program(name: str) -> str | None:
     return local if os.access(local, os.X_OK) else None
 
 
-def _launch(state: State, entry: Entry) -> None:
+def _launch(state: State, entry: Entry, *, remember: bool = True) -> None:
     """The verbs shared by list entries and the run prompt."""
     # Resolved here, not by the terminal: kitty spawns a page's child from
     # its own environment, whose PATH may lack ~/.local/bin — the child then
@@ -928,10 +931,12 @@ def _launch(state: State, entry: Entry) -> None:
     # The one durable record (durable.py): a launch that resolved is worth
     # offering again on Home. The argv remembered is the entry's own, not the
     # resolved one, so the row keeps re-resolving as tools come and go.
-    # Confirmed actions and quiet toggles never reach this path, so nothing
-    # dangerous can become a one-Enter recents row.
-    durable.remember_launch(entry.label, entry.argv)
-    state.home_rows = None
+    # Confirmed actions and quiet toggles never reach this path, and the run
+    # prompt opts out, so nothing dangerous can become a one-Enter recents
+    # row.
+    if remember:
+        durable.remember_launch(entry.label, entry.argv)
+        state.home_rows = None
     if entry.verb == "tab" and state.live():
         try:
             kitty_rc.launch_tab(argv, title=entry.label)

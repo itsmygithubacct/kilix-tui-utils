@@ -18,9 +18,9 @@ The mechanics follow the stack's durable-state pattern without importing it
 (kilix-tui stays SDK-free): a validated record, an atomic replace, and
 write-on-change only — reading the desktop costs no writes, a record that
 did not change costs no I/O, and a filesystem that refuses is a desktop that
-merely forgets, never one that crashes. Confirmed actions (power, updates)
-and quiet toggles are never recorded: a recents row must be safe to re-run
-on one Enter.
+merely forgets, never one that crashes. Confirmed actions (power, updates),
+quiet toggles and commands typed into the run prompt are never recorded: a
+recents row must be safe to re-run on one Enter.
 
 The file lives under `$XDG_STATE_HOME/kilix-tui/desk.json` (state, not
 config: losing it loses convenience, no behavior). `KILIX_TUI_STATE` points
