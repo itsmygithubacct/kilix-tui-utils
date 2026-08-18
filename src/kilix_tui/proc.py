@@ -198,6 +198,30 @@ def disk_usage(path: str) -> tuple[int, int, int]:
         return 0, 0, 0
 
 
+def network_io() -> dict[str, int]:
+    """Return aggregate counters from /proc/net/dev."""
+    counters = {
+        "bytes_sent": 0, "bytes_recv": 0,
+        "packets_sent": 0, "packets_recv": 0,
+        "errin": 0, "errout": 0,
+    }
+    for line in _read("/proc/net/dev").splitlines()[2:]:
+        _interface, separator, values = line.partition(":")
+        fields = values.split()
+        if not separator or len(fields) < 11:
+            continue
+        try:
+            counters["bytes_recv"] += int(fields[0])
+            counters["packets_recv"] += int(fields[1])
+            counters["errin"] += int(fields[2])
+            counters["bytes_sent"] += int(fields[8])
+            counters["packets_sent"] += int(fields[9])
+            counters["errout"] += int(fields[10])
+        except ValueError:
+            continue
+    return counters
+
+
 def processes(limit: int = 10, key: str = "rss") -> list[dict[str, object]]:
     """Return the heaviest processes by `rss` or `cpu_time`."""
     found: list[dict[str, object]] = []
@@ -223,8 +247,9 @@ def processes(limit: int = 10, key: str = "rss") -> list[dict[str, object]]:
             rss = int(rest[21]) * os.sysconf("SC_PAGE_SIZE")
         except (IndexError, ValueError, OSError):
             continue
+        status = rest[0] if rest else "?"
         found.append({"pid": int(entry), "name": name, "rss": rss,
-                      "cpu_time": cpu_time})
+                      "cpu_time": cpu_time, "status": status})
     found.sort(key=lambda item: item[key], reverse=True)  # type: ignore[arg-type]
     return found[:limit]
 
