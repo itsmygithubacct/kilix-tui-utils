@@ -60,6 +60,37 @@ standalone or when the shared sampler is unavailable, so TUI, IceWM, Land, and
 remote-shell launches have the same data model without a hard service
 dependency.
 
+### Machine-readable system health
+
+`kilix-system` keeps its interactive facts view and its line-oriented
+`--print` output. For automation, `--json` emits one combined health snapshot:
+
+```sh
+kilix-system --json
+kilix-system --json --top 5
+```
+
+`--top N` accepts 1 through 50 and limits the process records; it is meaningful
+only with `--json`. The report has `schema_version: 1` and contains:
+
+- `cpu`: aggregate and per-core utilization measured over a short sample,
+  logical-core count, and the 1/5/15-minute load averages;
+- `memory`: RAM availability and use plus swap totals and percentages, in
+  bytes;
+- `disks`: device, mount point, filesystem type, byte totals, and use for each
+  readable real filesystem;
+- `network`: aggregate byte, packet, and error counters from `/proc/net/dev`;
+- `top_processes`: processes ranked by cumulative CPU time, including PID,
+  name, resident bytes, memory percentage, CPU time, and kernel state; and
+- numeric and UTC ISO-8601 timestamps describing when the snapshot was taken.
+
+Network values are counters since the kernel initialized each interface, not
+transfer rates. Process `cpu_time` is likewise cumulative rather than an
+instantaneous CPU percentage. The command reads Linux `/proc` directly and
+uses only the Python standard library; unreadable or unavailable sources
+degrade to empty or zero values instead of adding a monitoring-service or
+`psutil` dependency.
+
 ## Watch the episode
 
 https://github.com/user-attachments/assets/be594a53-03b3-466f-8d8e-f1687c92ca0e
