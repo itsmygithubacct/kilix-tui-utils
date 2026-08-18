@@ -192,8 +192,10 @@ package provides the full application suite.
 The pixel interfaces use workspace checkouts under
 `<source-root>/kilix-modules` (`../../kilix-modules` from this repository), or
 normally installed copies of `kitty-frame-presenter`, `soft-raster-py`, and
-`soft-raster` libraries. Their text fallbacks remain available when the graphical
-dependencies are absent.
+`soft-raster` libraries. The Python binding is maintained under
+[`soft-raster/python`](https://github.com/itsmygithubacct/soft-raster/tree/main/python),
+not in the archived standalone `soft-raster-py` repository. Their text
+fallbacks remain available when the graphical dependencies are absent.
 
 ## Design
 
