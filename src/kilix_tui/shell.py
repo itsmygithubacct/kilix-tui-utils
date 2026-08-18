@@ -38,6 +38,7 @@ TIPS: dict[str, str] = {
     "Switcher": "shows what each pane is running before you jump to it",
     "System": "--print gives the same facts as plain text for scripts",
     "Volume": "this sets the sink Kilix itself uses, not just this pane",
+    "Volume settings": "mute applies immediately; Enter opens every output",
     "Weather": "forecast comes from Open-Meteo; r refetches it",
     "Cameras": "views come from kilix-rtsp; n writes a new stream profile",
     "Character Map": "Enter copies through OSC 52, so it also works over SSH",

@@ -16,7 +16,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-memory` | Live RAM, swap, pressure, paging, and process-memory [dashboard](tools/memory/README.md) |
 | `kilix-disk` | Filesystem usage and an interruptible directory scan |
 | `kilix-system` | Static machine facts (`--print`) and a combined CPU, memory, disk, network, and process health report (`--json`) |
-| `kilix-volume` | Output volume and sink selection |
+| `kilix-volume` | Clickable output mixer, plus `--compact` slider and `--settings` mute card |
 | `kilix-file` | File manager — navigate and open, never delete or move |
 | `kilix-system-center` | Focused machine center over CPU, memory, thermal, disk, network, audio, camera, package, and VM tools |
 | `kilix-settings-center` | Shared Kilix settings, display, audio, voice, and default-desktop center |

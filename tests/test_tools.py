@@ -110,6 +110,34 @@ class ToolContractTests(unittest.TestCase):
                     state.entry = ""
                 self.assertFalse(module.handle(ord("q"), state))
 
+    def test_volume_supports_compact_settings_and_mouse_slider(self):
+        module = load("volume")
+        state = object.__new__(module.State)
+        state.control = "pactl"
+        state.mode = "compact"
+        state.selected = 0
+        state.sinks = [{
+            "index": "1", "name": "sink", "description": "Speakers",
+            "volume": 50, "muted": False, "default": True,
+        }]
+        state.hits = {}
+        frame = app.render_to_text(module.render, state)
+        self.assertIn("Quick adjustment", frame)
+        self.assertIn("[ ] Mute", frame)
+        row, left, width, _index = state.hits["slider"]
+        with mock.patch.object(module.curses, "getmouse", return_value=(
+                0, left + width - 1, row, 0,
+                getattr(module.curses, "BUTTON1_CLICKED", 4))), \
+                mock.patch.object(module, "set_volume") as set_level, \
+                mock.patch.object(state, "refresh"):
+            module.mouse(state)
+        set_level.assert_called_once_with("sink", 100)
+
+        state.mode = "settings"
+        frame = app.render_to_text(module.render, state)
+        self.assertIn("Volume settings", frame)
+        self.assertIn("Open full volume control", frame)
+
 
 class SafetyTests(unittest.TestCase):
     """Properties that make a tool safe to put one keystroke from a menu."""
