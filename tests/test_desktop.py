@@ -236,6 +236,21 @@ class SoftwarePlaceTests(unittest.TestCase):
         self.assertEqual(claude.hint, "installed")
         self.assertIsNotNone(claude.argv)
 
+    def test_soundbank_rows_show_download_and_disk_size(self):
+        rows = [
+            *self.ROWS,
+            {"id": "techno-vcsl", "label": "Kilix Techno: VCSL",
+             "kind": "soundbank", "installed": False,
+             "size": "5.8 MiB down / 3.2 MiB disk"},
+        ]
+        with mock.patch.object(registry, "installable", return_value=rows), \
+             mock.patch.object(registry, "kilix_command",
+                               return_value=["/opt/kilix/kilix"]):
+            entries = self._state().entries()
+            vcsl = next(e for e in entries if e.label == "Kilix Techno: VCSL")
+        self.assertEqual(vcsl.hint,
+                         "soundbank · 5.8 MiB down / 3.2 MiB disk")
+
     def test_catalog_app_place_launches_every_app_through_the_host(self):
         state = make_state()
         state.path = ["Programs", "Catalog apps"]
