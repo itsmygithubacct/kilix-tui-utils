@@ -8,6 +8,8 @@ import re
 import sys
 from typing import Any
 
+import contract_bridge
+
 
 PROVIDER_ID = "kilix-tui"
 CONTRACT_VERSION = 1
@@ -54,9 +56,13 @@ def _description() -> dict[str, Any]:
             "launcher": True,
             "mouse": True,
             "reduced_motion": True,
-            "settings": _unavailable(
-                "not-implemented",
-                "Protocol configuration writes are not available in this adapter.",
+            "settings": (
+                True
+                if contract_bridge.available()
+                else _unavailable(
+                    "missing-dependency",
+                    "The staged desktop-contract command is unavailable.",
+                )
             ),
         },
         "config_schema": "kilix.desktop.config.provider.v1",
@@ -158,8 +164,20 @@ def _fail(message: str, status: int) -> None:
     raise SystemExit(status)
 
 
+def _delegate(*arguments: str) -> None:
+    try:
+        contract_bridge.exec_storage(*arguments)
+    except (contract_bridge.BridgeUnavailable, contract_bridge.BridgeError) as error:
+        _fail(str(error), EXIT_UNAVAILABLE)
+
+
 def dispatch(argv: list[str]) -> list[str] | None:
     """Handle protocol commands or translate launch/screenshot argv."""
+    if contract_bridge.required() and not contract_bridge.available():
+        _fail(
+            "cannot determine the authoritative persistence store",
+            EXIT_UNAVAILABLE,
+        )
     if argv == ["--version"]:
         print(f"kilix-tui {_version()}")
         raise SystemExit(0)
@@ -173,6 +191,8 @@ def dispatch(argv: list[str]) -> list[str] | None:
         _emit(_check())
         raise SystemExit(0)
     if argv == ["provider", "config", "schema", "--json"]:
+        if contract_bridge.available():
+            _delegate("schema", PROVIDER_ID)
         _emit(_config_schema())
         raise SystemExit(0)
     if argv == ["provider", "config", "get", "--json"] or (
@@ -181,10 +201,15 @@ def dispatch(argv: list[str]) -> list[str] | None:
         and argv[4] == "--json"
         and bool(argv[3])
     ):
+        if contract_bridge.available():
+            arguments = ["get", PROVIDER_ID]
+            if len(argv) == 5:
+                arguments.append(argv[3])
+            _delegate(*arguments)
         _emit(_config_values())
         raise SystemExit(0)
     if len(argv) == 5 and argv[:3] == ["provider", "config", "set"]:
-        _fail("protocol configuration writes are unavailable", EXIT_UNAVAILABLE)
+        _delegate("set", PROVIDER_ID, argv[3], argv[4])
 
     if argv[:2] == ["provider", "launch"]:
         if len(argv) == 2:
@@ -215,7 +240,10 @@ def dispatch(argv: list[str]) -> list[str] | None:
             or (len(argv) == 5 and argv[4] != "--dry-run")
         ):
             _fail("usage: provider migrate --from VERSION [--dry-run]", EXIT_USAGE)
-        _fail("protocol persistence migration is unavailable", EXIT_UNAVAILABLE)
+        arguments = ["migrate", PROVIDER_ID, "--from", argv[3]]
+        if len(argv) == 5:
+            arguments.append("--dry-run")
+        _delegate(*arguments)
 
     _fail("unknown provider protocol command", EXIT_USAGE)
     raise AssertionError("unreachable")

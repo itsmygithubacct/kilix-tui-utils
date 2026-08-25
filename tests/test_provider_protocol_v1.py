@@ -16,12 +16,14 @@ ENTRY = ROOT / "kilix-tui" / "main.py"
 
 
 class ProviderProtocolV1Tests(unittest.TestCase):
-    def run_provider(self, *arguments: str):
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    def run_provider(self, *arguments: str, env: dict[str, str] | None = None):
+        selected = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        if env:
+            selected.update(env)
         return subprocess.run(
             [sys.executable, str(ENTRY), *arguments],
             cwd=ROOT,
-            env=env,
+            env=selected,
             capture_output=True,
             text=True,
             timeout=10,
@@ -95,6 +97,26 @@ class ProviderProtocolV1Tests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 3)
         self.assertEqual(result.stdout, "")
+
+    def test_missing_authority_resolver_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            marker = state / "kilix/desktops/migration-v1.json"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("{}\n", encoding="utf-8")
+            result = self.run_provider(
+                "provider",
+                "describe",
+                "--json",
+                env={
+                    "KILIX_DESKTOP_CONTRACT_COMMAND": "",
+                    "KILIX_DESKTOP_SDK_PREFIX": "",
+                    "XDG_STATE_HOME": str(state),
+                },
+            )
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("authoritative persistence store", result.stderr)
 
 
 if __name__ == "__main__":
