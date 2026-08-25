@@ -342,12 +342,16 @@ class State:
             installed = bool(row.get("installed"))
             identifier = str(row.get("id", ""))
             label = str(row.get("label", identifier))
+            hint_parts = ["installed" if installed else
+                          str(row.get("kind", ""))]
+            if row.get("size"):
+                hint_parts.append(str(row["size"]))
             # Installed entries stay listed and stay selectable: re-running an
             # install is how a pinned thing is brought back to its pin.
             out.append(Entry(
                 f"{label}",
                 (*kilix, "install", identifier),
-                hint="installed" if installed else str(row.get("kind", "")),
+                hint=" · ".join(part for part in hint_parts if part),
             ))
         return out
 
