@@ -13,6 +13,15 @@ import sys
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
+# Answer protocol metadata before importing the desktop packages. Launch and
+# screenshot keep using the existing foreground and rendering paths.
+if __name__ == "__main__":
+    import provider_protocol as _provider_protocol
+    _provider_argv = _provider_protocol.dispatch(sys.argv[1:])
+    if _provider_argv is not None:
+        sys.argv[1:] = _provider_argv
+    del _provider_argv, _provider_protocol
+
 from kilix_desk import desk  # noqa: E402
 from kilix_tui import app  # noqa: E402
 
