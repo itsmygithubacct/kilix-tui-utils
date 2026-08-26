@@ -132,7 +132,7 @@ SYSTEM = (
 SESSION = (
     Item("New terminal", kilix=("new-tab",), kilix_only=True),
     Item("New pane", kilix=("new-pane",), kilix_only=True),
-    Item("Switcher", command="kilix-switch", sibling="switcher",
+    Item("Pane center", command="kilix-panes", sibling="switcher",
          kilix_only=True),
     Item("Session logs", command="kilix-session-log", sibling="session_log"),
     Item("PTY sessions", kilix=("pty",), kilix_only=True),

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -34,6 +35,27 @@ class Unavailable(RuntimeError):
 # ── the shape a switcher actually wants ──────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class Process:
+    """One process kitty reports in a pane's foreground process group."""
+
+    pid: int = 0
+    argv: tuple[str, ...] = ()
+    cwd: str = ""
+
+    @property
+    def name(self) -> str:
+        if not self.argv:
+            return ""
+        executable = self.argv[0]
+        # Some platform processes arrive as one opaque command-line string
+        # rather than an argv array. A label should still be the executable,
+        # not hundreds of renderer flags.
+        if len(self.argv) == 1 and any(char.isspace() for char in executable):
+            executable = executable.split(None, 1)[0]
+        return os.path.basename(executable) or executable
+
+
 @dataclass
 class Pane:
     """One kitty window — a pane, in the vocabulary Kilix presents to users."""
@@ -47,6 +69,13 @@ class Pane:
     page_id: int = 0
     page_title: str = ""
     os_window_id: int = 0
+    child_pid: int = 0
+    processes: tuple[Process, ...] = ()
+    broker_session: str = ""
+
+    @property
+    def pids(self) -> tuple[int, ...]:
+        return tuple(process.pid for process in self.processes if process.pid > 0)
 
     @property
     def label(self) -> str:
@@ -190,7 +219,7 @@ def available() -> bool:
     return shutil.which(_kitten()) is not None
 
 
-def _run(args: list[str]) -> str:
+def _run(args: list[str], *, input_text: str | None = None) -> str:
     if not available():
         raise Unavailable(
             "not running inside a Kilix terminal "
@@ -205,6 +234,7 @@ def _run(args: list[str]) -> str:
         done = subprocess.run(
             command, check=False, timeout=TIMEOUT,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            input=input_text,
         )
     except subprocess.TimeoutExpired as exc:
         raise Unavailable(f"the terminal did not answer in {TIMEOUT:g}s") from exc
@@ -224,6 +254,30 @@ def _process_name(window: dict[str, Any]) -> str:
     return ""
 
 
+def _processes(window: dict[str, Any]) -> tuple[Process, ...]:
+    answer = []
+    for record in window.get("foreground_processes") or []:
+        if not isinstance(record, dict):
+            continue
+        raw_argv = record.get("cmdline") or []
+        if isinstance(raw_argv, str):
+            argv = (raw_argv,)
+        elif isinstance(raw_argv, (list, tuple)):
+            argv = tuple(str(value) for value in raw_argv)
+        else:
+            argv = ()
+        try:
+            pid = int(record.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        answer.append(Process(
+            pid=pid,
+            argv=argv,
+            cwd=_text(record.get("cwd")),
+        ))
+    return tuple(answer)
+
+
 def _process_argv(window: dict[str, Any]) -> tuple[str, ...]:
     for process in reversed(window.get("foreground_processes") or []):
         cmdline = process.get("cmdline") or []
@@ -238,6 +292,19 @@ def _text(value: Any) -> str:
     if isinstance(value, dict):
         return str(value.get("path") or value.get("cwd") or "")
     return str(value)
+
+
+def _environment(window: dict[str, Any]) -> dict[str, str]:
+    raw = window.get("env") or {}
+    if isinstance(raw, dict):
+        return {str(key): str(value) for key, value in raw.items()}
+    answer: dict[str, str] = {}
+    if isinstance(raw, list):
+        for item in raw:
+            key, separator, value = str(item).partition("=")
+            if separator:
+                answer[key] = value
+    return answer
 
 
 def _parse(state: list[dict[str, Any]]) -> Tree:
@@ -263,11 +330,15 @@ def _parse(state: list[dict[str, Any]]) -> Tree:
                 os_window_id=os_id,
             )
             for window in windows:
+                processes = _processes(window)
+                environment = _environment(window)
                 page.panes.append(Pane(
                     id=int(window.get("id") or 0),
                     title=_text(window.get("title")),
-                    process=_process_name(window),
-                    argv=_process_argv(window),
+                    process=(processes[-1].name if processes
+                             else _process_name(window)),
+                    argv=(processes[-1].argv if processes
+                          else _process_argv(window)),
                     cwd=_text(window.get("cwd")),
                     is_focused=(
                         bool(window.get("is_focused") or window.get("is_active"))
@@ -276,6 +347,10 @@ def _parse(state: list[dict[str, Any]]) -> Tree:
                     page_id=page.id,
                     page_title=page.title,
                     os_window_id=os_id,
+                    child_pid=int(window.get("pid") or 0),
+                    processes=processes,
+                    broker_session=environment.get(
+                        "KITTY_PTY_BROKER_SESSION", ""),
                 ))
             if not page.title and page.panes:
                 page.title = page.panes[0].label
@@ -318,21 +393,73 @@ def focus_pane(pane_id: int) -> None:
     _run(["focus-window", "--match", f"id:{pane_id}"])
 
 
-def pane_text(pane_id: int, *, lines: int = 0) -> str:
+def pane_text(
+    pane_id: int,
+    *,
+    lines: int = 0,
+    scrollback: bool = False,
+) -> str:
     """The visible text of a pane, newest last.
 
     This is the one genuinely sensitive call here — it reads what is on another
     pane's screen — and it is inside the scoped credential precisely because
-    `kilix watch` already needed it. Kept to `--extent screen` so it can never
-    pull scrollback a user has forgotten is there.
+    `kilix watch` already needed it. The interactive preview stays on the
+    visible screen. A caller must explicitly ask for ``scrollback=True``; that
+    is used by the pane dump command whose whole purpose is to export history.
     """
-    out = _run(["get-text", "--match", f"id:{pane_id}", "--extent", "screen"])
+    args = ["get-text", "--match", f"id:{pane_id}"]
+    if scrollback:
+        args.extend(["--extent", "all"])
+    else:
+        args.extend(["--extent", "screen"])
+    out = _run(args)
     if lines > 0:
         rows = out.splitlines()
         while rows and not rows[-1].strip():
             rows.pop()
         return "\n".join(rows[-lines:])
     return out
+
+
+_BROKER_SESSION = re.compile(r"[0-9a-f]{16,64}\Z")
+
+
+def valid_broker_session(value: str) -> bool:
+    return _BROKER_SESSION.fullmatch(value) is not None
+
+
+def _bounded_text(value: str, limit: int = 1024):
+    """Yield UTF-8-safe chunks accepted by Kilix's send-text policy."""
+    chunk: list[str] = []
+    size = 0
+    for character in value:
+        encoded = character.encode("utf-8")
+        if chunk and size + len(encoded) > limit:
+            yield "".join(chunk)
+            chunk, size = [], 0
+        chunk.append(character)
+        size += len(encoded)
+    if chunk:
+        yield "".join(chunk)
+
+
+def send_text(pane: Pane, value: str) -> int:
+    """Queue text for exactly one broker-owned pane; return UTF-8 byte count.
+
+    The pane ID is intentionally not the authority. Kilix's remote-control
+    checker accepts input only when it is matched through the unguessable PTY
+    broker session marker, and caps each request at 1024 decoded bytes. Long
+    messages are split on UTF-8 character boundaries to preserve both rules.
+    """
+    session = pane.broker_session
+    if not valid_broker_session(session):
+        raise Unavailable("the selected pane has no valid PTY broker session")
+    for chunk in _bounded_text(value):
+        _run([
+            "send-text", "--match",
+            f"env:KITTY_PTY_BROKER_SESSION={session}", "--stdin",
+        ], input_text=chunk)
+    return len(value.encode("utf-8"))
 
 
 # ── the acting half, which needs the wider scope ─────────────────────────────

@@ -27,6 +27,7 @@ TOOLS=(
     "rollout_resume:kilix-rollout-resume"
     "session_log:kilix-session-log"
     "switcher:kilix-switch"
+    "switcher:kilix-panes"
     "weather:kilix-weather"
     "cameras:kilix-cameras"
     "music:kilix-music"

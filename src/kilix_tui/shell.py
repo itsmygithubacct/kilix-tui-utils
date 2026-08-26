@@ -36,6 +36,7 @@ TIPS: dict[str, str] = {
     "Rollout Resume": "resumes Claude, Codex and Kimi sessions — and installs them",
     "Session Logs": "live and archived transcripts read the same; archives decompress on the fly",
     "Switcher": "shows what each pane is running before you jump to it",
+    "Pane Center": "coding-session state and pane text update without leaving this view",
     "System": "--print gives the same facts as plain text for scripts",
     "Volume": "this sets the sink Kilix itself uses, not just this pane",
     "Volume settings": "mute applies immediately; Enter opens every output",

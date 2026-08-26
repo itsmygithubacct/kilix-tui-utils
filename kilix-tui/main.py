@@ -55,7 +55,7 @@ FOCUSED_APPS: dict[str, tuple[str, tuple[str, ...], dict[str, str]]] = {
         ("Session",),
         {
             "overview": "",
-            "panes": "Switcher",
+            "panes": "Pane center",
             "pty": "PTY sessions",
             "logs": "Session logs",
             "remote-sessions": "Attach to a session",

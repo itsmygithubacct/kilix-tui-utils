@@ -21,13 +21,13 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-system-center` | Focused machine center over CPU, memory, thermal, disk, network, audio, camera, package, and VM tools |
 | `kilix-settings-center` | Shared Kilix settings, display, audio, voice, and default-desktop center |
 | `kilix-software-center` | Catalog browser and confirmed installer using `kilix install` |
-| `kilix-session-center` | Panes, PTYs, switcher, logs, and remote-session tools in one place |
+| `kilix-session-center` | Pane Center, PTYs, logs, and remote-session tools in one place |
 | `kilix-voice-studio` | Speech commands, settings, models, status, and diagnostics |
 | `kilix-launcher` | Launcher catalog: stack programs, discovered XDG apps, your `.desktop` launchers, stack scripts, a run-a-command row, and the laptop session profiles (running ones marked, Enter opens or closes them through `kilix laptop`); `kilix launcher` opens it |
 | `kilix-package` | Installed packages, read-only |
 | `kilix-rollout-resume` | Recover Claude Code, Codex, and Kimi Code sessions; install and update those agents |
 | `kilix-session-log` | Pane transcripts across the live and archived tiers |
-| `kilix-switch` | Go to any page or pane, with a live look at what each one is showing |
+| `kilix-panes` / `kilix-switch` | Pane Center TUI plus pane/session/broker CLI, live text, idle detection, and bounded messaging |
 | `kilix-weather` | Forecast from Open-Meteo |
 | `kilix-cameras` | Camera views and stream profiles for kilix-rtsp — view a camera, mosaic a group, `n` writes a profile to `cameras.conf` |
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
@@ -220,6 +220,9 @@ next tool gets it free.
   control. It is a convenience, never a privilege: Kilix scopes the credential
   it hands each pane at the terminal, so a tool asking for anything outside
   that set is refused even though it holds the credential.
+- `pane_center.py` — joins that live page tree with one PTY-broker snapshot and
+  the coding-agent conversation owned by each reported process. It reads only
+  `/proc` descriptors for live pane PIDs rather than walking saved history.
 - `shell.py` — the one four-row frame used by the desktop, managers, and every
   installed text utility.
 - `openers.py` — argv-only document dispatch shared by Files and Find Files.
@@ -232,19 +235,49 @@ monitors, so the suite has one visual and navigation language over SSH, in
 `tmux`, and inside Kilix. Memory, Temperatures, and the desktop retain optional
 framebuffer renderings behind `--graphics`.
 
-## Going to a page or a pane
+## Pane Center
 
-`kilix-switch` replaces the terminal's two built-in choosers, which were the
+`kilix-panes` (also installed as the compatible `kilix-switch`) replaces the
+terminal's two built-in choosers, which were the
 same thing twice: a numbered list of titles, one for pages and one for panes. A
 title is a poor handle on a pane — several are `bash` and several more are
 whatever directory they started in — so the list told you least exactly when you
 had enough windows to need it.
 
-It shows one tree of pages and their panes, with the process and working
-directory that actually identify a pane, a filter (`/`) across all of it, and a
-live view of what the highlighted pane is currently showing. `Tab` cycles the
-scope between everything, this page, and everywhere else; Kilix binds `F12` to
+It shows one tree of pages and their panes, with activity, coding-agent type,
+process, working directory, PTY-broker health, current task, and a live view of
+what the highlighted pane is showing. `/` filters across all of those fields;
+`s` writes a message to the highlighted pane and submits it; `Tab` cycles the
+scope between everything, this page, and everywhere else. Kilix binds `F12` to
 open on everything and its tmux-style leader `q` to open on this page.
+
+Activity is evidence-based. A live Codex process is `working` when its newest
+turn boundary is `task_started`, and `idle` only when the same process still
+owns the rollout and the newest boundary is `task_complete`. Claude's validated
+live registry supplies `idle`, `waiting`, or active state. A recognized agent
+without an explicit signal stays `agent`; it is never optimistically called
+idle. Shells, SSH sessions, and other foreground programs are labelled
+separately.
+
+The same snapshot is a scriptable `kilix panes` interface:
+
+```sh
+kilix panes list                         # compact table
+kilix panes --json                       # stable kilix.panes/v1 record
+kilix panes dump 338 --lines 60          # last 60 lines, including scrollback
+kilix panes dump 338 -n 20 --screen      # visible screen only
+kilix panes wait 338 --for idle --timeout 300
+kilix panes send 338 --enter 'continue with the next item'
+printf 'status please' | kilix panes send 338 --enter
+```
+
+Targets may be a pane ID, a unique title/substring, a broker-session prefix, or
+a coding-session ID prefix. Ambiguity is rejected with the matching pane IDs.
+`send` refuses the caller's own pane unless `--allow-self` is explicit, targets
+the exact per-pane broker marker, and splits UTF-8 input into the authorizer's
+1024-byte chunks. `--enter` emits carriage return, which submits both a shell
+line and the current Codex prompt. An accepted send remains fire-and-forget;
+read the pane back with `dump` when delivery must be proved.
 
 "This page" means the page the tool is *running* on, resolved from its own
 `KITTY_WINDOW_ID`, not whichever page the terminal currently considers active —
