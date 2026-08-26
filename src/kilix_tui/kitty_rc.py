@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -225,16 +226,26 @@ def _run(args: list[str], *, input_text: str | None = None) -> str:
             "not running inside a Kilix terminal "
             "(needs KITTY_LISTEN_ON and KILIX_RC_PASSWORD_FILE)"
         )
-    command = [
-        _kitten(), "@",
-        "--password-file", os.environ["KILIX_RC_PASSWORD_FILE"],
-        *args,
-    ]
+    # Credential delivery: prefer the environment variable the launcher itself
+    # uses. Passing --password-file works in some contexts and silently HANGS in
+    # others (the terminal returns no decision at all rather than a refusal), so
+    # a tool that only ever used the file form would report "the terminal did not
+    # answer" for every verb while the terminal was in fact reachable. Read the
+    # file into the variable when only the file is available.
+    environment = dict(os.environ)
+    if not environment.get("KILIX_RC_PASSWORD"):
+        password_file = environment.get("KILIX_RC_PASSWORD_FILE", "")
+        try:
+            with open(password_file, encoding="utf-8") as handle:
+                environment["KILIX_RC_PASSWORD"] = handle.read().strip()
+        except OSError as exc:
+            raise Unavailable(f"cannot read {password_file}: {exc}") from exc
+    command = [_kitten(), "@", *args]
     try:
         done = subprocess.run(
             command, check=False, timeout=TIMEOUT,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            input=input_text,
+            input=input_text, env=environment,
         )
     except subprocess.TimeoutExpired as exc:
         raise Unavailable(f"the terminal did not answer in {TIMEOUT:g}s") from exc
@@ -505,3 +516,69 @@ def launch_tab(
         args.append("--keep-focus")
     out = _run([*args, "--", *argv]).strip()
     return int(out) if out.isdigit() else 0
+
+def launch_pane(
+    argv: list[str] | tuple[str, ...],
+    *,
+    page_id: int,
+    title: str = "",
+    cwd: str | None = None,
+    keep_focus: bool = True,
+) -> int:
+    """Open `argv` as a new pane inside an existing page; return its pane id.
+
+    Same discipline as `launch_tab`: fixed argv, never a shell string. The page
+    is addressed by id rather than by "the active tab" so a caller building a
+    multi-pane surface cannot lose a pane to a focus change made by something
+    else while it works.
+    """
+    # `launch --match` selects the TAB to place the new window in — not a
+    # window, despite --match meaning "window" in most other RC verbs.
+    args = ["launch", "--type=window", "--match", f"id:{page_id}"]
+    if title:
+        args += ["--window-title", title]
+    if cwd:
+        args.append(f"--cwd={cwd}")
+    if keep_focus:
+        args.append("--keep-focus")
+    out = _run([*args, "--", *argv]).strip()
+    return int(out) if out.isdigit() else 0
+
+
+def pane_by_id(pane_id: int) -> Pane | None:
+    """Re-read the live tree and return one pane, or None if it is gone."""
+    for page in tree().pages:
+        for pane in page.panes:
+            if pane.id == pane_id:
+                return pane
+    return None
+
+
+def await_broker_session(
+    pane_id: int,
+    *,
+    timeout: float = 20.0,
+    interval: float = 0.25,
+) -> Pane:
+    """Wait until a freshly created pane reports a usable broker session.
+
+    A new pane exists before its PTY broker marker does: the marker is written
+    by the pane's own startup, so `launch` returning an id does NOT mean the
+    pane can yet be addressed. `send_text` matches on that marker and refuses
+    without it, so anything wanting to type into a new pane must wait for it
+    rather than assume creation implies readiness.
+
+    Raises `Unavailable` on timeout, naming the pane, because a silent return
+    of an unaddressable pane would surface later as a confusing send failure.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        pane = pane_by_id(pane_id)
+        if pane is not None and valid_broker_session(pane.broker_session):
+            return pane
+        if time.monotonic() >= deadline:
+            raise Unavailable(
+                f"pane {pane_id} did not report a PTY broker session "
+                f"within {timeout:g}s; it cannot be sent text"
+            )
+        time.sleep(interval)

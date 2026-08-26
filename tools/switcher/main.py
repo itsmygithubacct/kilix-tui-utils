@@ -22,6 +22,7 @@ pane it runs in was already permitted to do, and nothing more.
 from __future__ import annotations
 
 import argparse
+import shlex
 import json
 import os
 import shutil
@@ -66,7 +67,7 @@ class State:
     cursor: int = 0
     offset: int = 0
     filter: str = ""
-    mode: str = "browse"           # browse | filter | rename | send | confirm
+    mode: str = "browse"           # browse | filter | rename | send | confirm | new
     entry: str = ""                # rename or message buffer
     message: str = ""
     collapsed: set[int] = field(default_factory=set)
@@ -358,11 +359,13 @@ def footer(state: State) -> str:
         return f"rename: {state.entry}▏ · Enter apply · Esc cancel"
     if state.mode == "send":
         return f"message: {state.entry}▏ · Enter send · Esc cancel"
+    if state.mode == "new":
+        return f"new page: {state.entry}▏ · Enter create · Esc cancel"
     if state.mode == "confirm":
         return "close this? · y confirm · any other key cancels"
     return (
         "Enter go · s message · / filter · Tab scope · p preview · "
-        "F2 rename · x close · r reload · q quit"
+        "n new · F2 rename · x close · r reload · q quit"
     )
 
 
@@ -490,6 +493,33 @@ def _handle_send(key: int, state: State) -> bool:
     return True
 
 
+def _handle_new(key: int, state: State) -> bool:
+    """Type a page title; Enter creates one shell pane in a new page.
+
+    Deliberately the narrow case. The TUI creates a single pane in a single new
+    page; a four-pane office with per-pane directories carries more arguments
+    than a one-line prompt can hold honestly, and belongs in `kilix panes new`.
+    Offering a half-configured multi-pane build here would invite exactly the
+    silent padding `_split_list` refuses on the command line.
+    """
+    if key == 27:
+        state.mode, state.entry = "browse", ""
+    elif key in (ord("\n"), ord("\r")):
+        title = state.entry.strip()
+        if title and state.live:
+            try:
+                kitty_rc.launch_tab(["/bin/sh"], title=title, keep_focus=True)
+                state.refresh()
+            except kitty_rc.Unavailable as error:
+                state.message = f"create refused: {error}"
+        state.mode, state.entry = "browse", ""
+    elif key in (263, 127, 8):
+        state.entry = state.entry[:-1]
+    elif 32 <= key < 127:
+        state.entry += chr(key)
+    return True
+
+
 def _handle_confirm(key: int, state: State) -> bool:
     if key in (ord("y"), ord("Y")):
         row = state.current()
@@ -515,6 +545,8 @@ def handle(key: int, state: State) -> bool:
         return _handle_send(key, state)
     if state.mode == "confirm":
         return _handle_confirm(key, state)
+    if state.mode == "new":
+        return _handle_new(key, state)
 
     if keymap.is_quit(key):
         return False
@@ -552,6 +584,10 @@ def handle(key: int, state: State) -> bool:
         row = state.current()
         state.entry = row.page.title if row else ""
         state.mode = "rename"
+        return True
+    if key == ord("n"):
+        state.entry = ""
+        state.mode = "new"
         return True
     if key == ord("x"):
         state.mode = "confirm"
@@ -656,6 +692,38 @@ def _cli_parser() -> argparse.ArgumentParser:
     waiting.add_argument("--timeout", type=_seconds, default=300.0)
     waiting.add_argument("--interval", type=_seconds, default=1.0)
     waiting.add_argument("--json", action="store_true")
+
+    creating = commands.add_parser(
+        "new", help="create a page of panes running one command")
+    creating.add_argument("--name", required=True, help="page (tab) title")
+    creating.add_argument("--panes", type=_positive, default=1,
+                          help="how many panes to create (default 1)")
+    creating.add_argument("--pane-name", default="",
+                          help="comma-separated pane titles, one per pane")
+    creating.add_argument("--pane-dir", default="",
+                          help="comma-separated working directories, one per pane")
+    # dest is deliberately not "command": the subparsers already own that dest,
+    # so a --command option would overwrite the subcommand name and the dispatch
+    # would silently fall through to a no-op returning success.
+    creating.add_argument("--command", dest="run", default="",
+                          help="command for every pane; split here into a fixed "
+                               "argv and never handed to a shell")
+    creating.add_argument("--initial-prompt", default="",
+                          help="text typed into each pane once it is addressable")
+    creating.add_argument("--enter", action="store_true",
+                          help="submit the initial prompt with a newline")
+    creating.add_argument("--focus", action="store_true",
+                          help="focus the new page instead of staying put")
+    creating.add_argument("--ready-timeout", type=_seconds, default=20.0,
+                          help="per-pane wait for a usable broker session")
+    creating.add_argument("--json", action="store_true")
+
+    closing = commands.add_parser(
+        "close", help="close one pane, or a whole page with --page")
+    closing.add_argument("target", help="pane ID, title, or session-ID prefix")
+    closing.add_argument("--page", action="store_true",
+                         help="close the page containing the resolved pane")
+    closing.add_argument("--json", action="store_true")
 
     tui = commands.add_parser("tui", help="open the interactive pane center")
     tui.add_argument("--scope", choices=SCOPES, default="all")
@@ -847,6 +915,10 @@ def cli(argv: list[str]) -> int:
             return _cmd_focus(ns)
         if ns.command == "wait":
             return _cmd_wait(ns)
+        if ns.command == "new":
+            return _cmd_new(ns)
+        if ns.command == "close":
+            return _cmd_close(ns)
     except (kitty_rc.Unavailable, ValueError) as error:
         print(f"kilix panes: {error}", file=sys.stderr)
         return 1
@@ -877,9 +949,122 @@ def _tui(argv: list[str]) -> int:
     )
 
 
+def _split_list(value: str, count: int, label: str) -> list[str]:
+    """Split a comma-separated option into exactly `count` entries.
+
+    Refuses a mismatch rather than padding or truncating: a caller that names
+    three directories for four panes has a different surface in mind than the
+    one it asked for, and silently inventing the fourth would build the wrong
+    thing successfully.
+    """
+    if not value:
+        return [""] * count
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != count:
+        raise ValueError(
+            f"--{label} lists {len(parts)} entries for {count} panes; "
+            f"give one per pane or omit it"
+        )
+    return parts
+
+
+def _cmd_new(ns: argparse.Namespace) -> int:
+    """Create a page of panes, optionally typing an opening prompt into each."""
+    names = _split_list(ns.pane_name, ns.panes, "pane-name")
+    dirs = _split_list(ns.pane_dir, ns.panes, "pane-dir")
+    # Parsed here into a fixed argv; a shell never sees this string. Same rule
+    # as kitty_rc.launch_tab, which takes argv precisely so a title or a
+    # directory containing a space or a semicolon cannot become a command.
+    argv = shlex.split(ns.run) if ns.run else []
+
+    for index, directory in enumerate(dirs):
+        if directory and not os.path.isdir(os.path.expanduser(directory)):
+            raise ValueError(
+                f"--pane-dir entry {index + 1} is not a directory: {directory}"
+            )
+    dirs = [os.path.expanduser(d) if d else "" for d in dirs]
+
+    created: list[dict[str, object]] = []
+    first = kitty_rc.launch_tab(
+        argv or ["/bin/sh"], title=ns.name,
+        cwd=dirs[0] or None, keep_focus=not ns.focus,
+    )
+    created.append({"pane_id": first, "name": names[0], "cwd": dirs[0]})
+
+    page_id = 0
+    if pane := kitty_rc.pane_by_id(first):
+        page_id = pane.page_id
+    if ns.panes > 1 and not page_id:
+        raise kitty_rc.Unavailable(
+            f"created pane {first} but its page id was not reported; "
+            f"cannot place the remaining {ns.panes - 1} panes"
+        )
+
+    for index in range(1, ns.panes):
+        pane_id = kitty_rc.launch_pane(
+            argv or ["/bin/sh"], page_id=page_id,
+            title=names[index], cwd=dirs[index] or None, keep_focus=True,
+        )
+        created.append(
+            {"pane_id": pane_id, "name": names[index], "cwd": dirs[index]}
+        )
+
+    prompted, unreachable = [], []
+    if ns.initial_prompt:
+        text = ns.initial_prompt + ("\r" if ns.enter else "")
+        for entry in created:
+            pane_id = int(entry["pane_id"] or 0)
+            if not pane_id:
+                unreachable.append({"pane_id": pane_id, "why": "no id reported"})
+                continue
+            try:
+                pane = kitty_rc.await_broker_session(
+                    pane_id, timeout=ns.ready_timeout)
+                kitty_rc.send_text(pane, text)
+                prompted.append(pane_id)
+            except kitty_rc.Unavailable as error:
+                # Reported, never retried around: a pane that cannot be
+                # addressed is a fact about the pane, and pretending the prompt
+                # landed would be worse than saying it did not.
+                unreachable.append({"pane_id": pane_id, "why": str(error)})
+
+    if ns.json:
+        _json({
+            "page": {"id": page_id, "title": ns.name},
+            "panes": created,
+            "prompted": prompted,
+            "unreachable": unreachable,
+        })
+    else:
+        print(f"{page_id} {' '.join(str(e['pane_id']) for e in created)}")
+        for item in unreachable:
+            print(f"kilix panes: pane {item['pane_id']}: {item['why']}",
+                  file=sys.stderr)
+    return 1 if unreachable else 0
+
+
+def _cmd_close(ns: argparse.Namespace) -> int:
+    item = _live().resolve(ns.target)
+    if ns.page:
+        page_id = item.pane.page_id
+        kitty_rc.close_page(page_id)
+        if ns.json:
+            _json({"closed": "page", "page_id": page_id})
+        else:
+            print(page_id)
+        return 0
+    kitty_rc.close_pane(item.pane.id)
+    if ns.json:
+        _json({"closed": "pane", "pane_id": item.pane.id})
+    else:
+        print(item.pane.id)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    cli_commands = {"list", "ls", "dump", "send", "tell", "focus", "wait"}
+    cli_commands = {"list", "ls", "dump", "send", "tell", "focus", "wait",
+                    "new", "close"}
     if (argv and argv[0] in cli_commands) or (
         argv and argv[0] in ("--json", "-j", "--lines", "-n", "--help", "-h")
     ):

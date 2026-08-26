@@ -269,6 +269,15 @@ kilix panes dump 338 -n 20 --screen      # visible screen only
 kilix panes wait 338 --for idle --timeout 300
 kilix panes send 338 --enter 'continue with the next item'
 printf 'status please' | kilix panes send 338 --enter
+
+kilix panes new --name codex-office --panes 4 \
+  --pane-name administrator,assistant,engineer,worker \
+  --pane-dir ~/office/administrator,~/office/assistant,~/office/engineer,~/office/worker \
+  --command 'codex --yolo' \
+  --initial-prompt 'familiarize yourself with your role' --enter
+
+kilix panes close 338                    # one pane
+kilix panes close 338 --page             # the whole page it sits in
 ```
 
 Targets may be a pane ID, a unique title/substring, a broker-session prefix, or
@@ -288,6 +297,27 @@ Renaming and closing are here because a chooser that can see everything and
 change nothing sends you somewhere else to finish the job. Closing always asks
 first, and both go through the terminal's remote control, which refuses them
 outright unless Kilix's scoped credential has been widened to allow them.
+
+### Creating panes
+
+`new` builds a page and fills it, which is the one verb here that makes something
+rather than reading it. Three refusals are deliberate:
+
+- **A per-pane list must match the pane count exactly.** Four panes and three
+  directories is an error, not a cue to invent the fourth — padding would build a
+  different surface than the one asked for, and would succeed while doing it.
+- **`--command` is split into a fixed argv here and never handed to a shell.** A
+  title, a path or a command containing `;` stays one inert argument. This is the
+  same rule `launch_tab` already followed for the desktop launchers.
+- **A created pane is not yet an addressable one.** The PTY broker marker that
+  `send-text` matches on is written by the pane's own startup, so `--initial-prompt`
+  waits for it per pane (`--ready-timeout`) and reports the panes it could not
+  reach instead of assuming the text landed. Unreachable panes make the command
+  exit non-zero with the ids named.
+
+The TUI offers only the narrow case — `n`, type a title, Enter creates one shell
+pane in a new page. A four-pane office with per-pane directories carries more
+arguments than a one-line prompt can hold honestly, so it stays a scripted act.
 
 ## Recovering coding sessions
 
