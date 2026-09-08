@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -327,11 +330,38 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn(
             '"kilix-virtualbox-manager:kilix-virtualbox-manager"', source)
 
-    def test_legacy_launcher_now_opens_the_manager(self):
-        source = (Path.home() / "kilix_launch_vpn.sh").read_text()
-        self.assertIn("kilix-virtualbox-manager", source)
-        self.assertNotIn(".virtualbox_vpn", source)
-        self.assertNotIn('exec "$kilix" run', source)
+    def test_installed_manager_launcher_survives_checkout_rename(self):
+        # Exercise the shipped installer and application, independently of
+        # any personal launcher outside this checkout.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            stage = base / "staged ' manager"
+            stage.mkdir()
+            shutil.copy2(ROOT / "install.sh", stage / "install.sh")
+            shutil.copytree(ROOT / "src", stage / "src")
+            shutil.copytree(MANAGER, stage / MANAGER.name)
+            environment = dict(
+                os.environ,
+                HOME=str(base / "home"),
+                KILIX_TUI_UTILS_PREFIX=str(stage / ".runtime"),
+                KILIX_TUI_UTILS_RELOCATABLE="1",
+                KILIX_TUI_UTILS_SYNC_MENU="0",
+            )
+            installed = subprocess.run(
+                ["bash", str(stage / "install.sh")], env=environment,
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            selected = base / "selected ' manager"
+            stage.rename(selected)
+            launcher = selected / ".runtime/bin/kilix-virtualbox-manager"
+            launched = subprocess.run(
+                [str(launcher), "--help"], cwd=base, env=environment,
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(launched.returncode, 0, launched.stderr)
+            self.assertIn("usage: kilix-virtualbox-manager", launched.stdout)
+            self.assertIn("--vm NAME_OR_UUID", launched.stdout)
 
     def test_manager_never_uses_a_shell_command_string(self):
         source = (MANAGER / "kilix_virtualbox_manager/backend.py").read_text()
