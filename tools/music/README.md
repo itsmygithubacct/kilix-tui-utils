@@ -19,6 +19,9 @@ a file or folder to the ordinary playlist. Space toggles playback, `v` stops,
 EnCodec files seek to the preceding verified epoch boundary.
 The footer and `?` show the controls for the current view. Paths containing
 spaces remain one argument; no shell interprets source paths.
+If a state poll is pending when Enter is pressed, the entry stays visible with
+a prompt to press Enter again when ready. Source paths use UTF-8 on the wire
+within the 4,095-byte path and 8,192-byte request bounds.
 
 EnCodec sources show bitrate, mono/stereo profile, selected inference threads,
 model readiness and buffering state reported by Amp. Live sources show elapsed

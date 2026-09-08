@@ -66,6 +66,44 @@ if os.path.exists(path) and os.stat(path).st_ino == identity:
 
 
 class LivePresentationTests(unittest.TestCase):
+    def test_enter_preserves_each_source_entry_during_a_real_state_poll(self):
+        for kind in ("add", "file", "encodec-unix"):
+            with self.subTest(kind=kind):
+                entered, release = threading.Event(), threading.Event()
+                def respond(request, client):
+                    if request["cmd"] == "state" and not release.is_set():
+                        entered.set()
+                        release.wait(3)
+                    reply = (dict(LIVE) if request["cmd"] == "state" else
+                             {"protocol": 2, "ok": True, "max_protocol": 2,
+                              "encodec": True, "live_sources": True, "items": []})
+                    client.sendall(json.dumps(reply).encode() + b"\n")
+                with Peer(respond) as peer:
+                    state = music.State()
+                    state.backend = music.Backend(peer.path)
+                    state.prompt_kind, state.prompt = kind, "/private/selected source"
+                    try:
+                        state.tick()
+                        self.assertTrue(entered.wait(2))
+                        music.handle(10, state)
+                        self.assertEqual(state.prompt, "/private/selected source")
+                        self.assertIn("press Enter", state.message)
+                        self.assertEqual([r["cmd"] for r in peer.requests], ["ping", "state"])
+                        release.set()
+                        state._worker.join(2)
+                        self.assertFalse(state.busy())
+                        handle(10, state)
+                        self.assertIsNone(state.prompt)
+                        submitted = [r for r in peer.requests if r["cmd"] in ("add", "open")]
+                        self.assertEqual(len(submitted), 1)
+                        self.assertEqual(submitted[0]["path"], "/private/selected source")
+                        self.assertEqual(submitted[0]["cmd"], "add" if kind == "add" else "open")
+                        if kind != "add":
+                            self.assertEqual(submitted[0]["source_type"], kind)
+                    finally:
+                        release.set()
+                        state.close()
+
     def test_live_has_elapsed_and_recovery_without_fabricated_end_or_seek(self):
         state = player(status=LIVE)
         for changes, label in (({}, "playing"), ({"degraded": True}, "recovering"),

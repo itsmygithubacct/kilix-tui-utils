@@ -147,6 +147,27 @@ class ReplyTests(unittest.TestCase):
 
 
 class ExchangeTests(unittest.TestCase):
+    def test_bounded_utf8_source_uses_utf8_wire_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp, Peer() as peer:
+            directory = Path(tmp)
+            for _ in range(23):
+                directory /= "\U0001f3b5" * 40
+                directory.mkdir()
+            path = str(directory / "actual.wav")
+            import wave
+            with wave.open(path, "wb") as audio:
+                audio.setparams((1, 2, 24000, 24, "NONE", "not compressed"))
+                audio.writeframes(b"\0" * 48)
+            self.assertLess(len(path.encode("utf-8")), 4096)
+            self.assertGreater(len(json.dumps({"path": path}).encode()), 8192)
+            control = MusicControl(peer.path)
+            try:
+                self.assertTrue(control.command("open", source_type="file", path=path).get("ok"), control.error)
+                self.assertEqual([r["cmd"] for r in peer.requests], ["ping", "open"])
+                self.assertEqual(peer.requests[-1]["path"], path)
+            finally:
+                control.close()
+
     def test_fragments_are_read_until_newline(self):
         def respond(request, client):
             body = encoded(PING if request["cmd"] == "ping" else LIVE) + b"\n"

@@ -683,6 +683,10 @@ def _typed(key: int, state: State) -> bool:
     if key == 27:                                   # Esc
         state.prompt = None
     elif key in (ord("\n"), ord("\r")):
+        if state.busy() or state._closing.is_set():
+            state.message = "player busy; press Enter again when ready"
+            return True
+        state.message = ""
         entry, state.prompt = state.prompt or "", None
         if state.prompt_kind == "add":
             state.add_path(entry)

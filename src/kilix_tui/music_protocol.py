@@ -198,7 +198,8 @@ class MusicControl:
     def _exchange(self, name, version, fields=None, *, expected=None, timeout=CONTROL_TIMEOUT, closing=False):
         if not _finite(timeout) or not 0 < timeout <= CONTROL_TIMEOUT:
             raise ValueError("invalid control deadline")
-        payload = json.dumps({**(fields or {}), "cmd": name, "protocol": version}, allow_nan=False).encode() + b"\n"
+        payload = json.dumps({**(fields or {}), "cmd": name, "protocol": version},
+                             allow_nan=False, ensure_ascii=False).encode("utf-8") + b"\n"
         if len(payload) > 8192:
             raise ValueError("control request is too large")
         deadline = time.monotonic() + timeout
