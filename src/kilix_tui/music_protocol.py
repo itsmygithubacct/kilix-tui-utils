@@ -77,6 +77,17 @@ def _finite(value):
         return False
 
 
+def _control_deadline(timeout, existing):
+    if not _finite(timeout) or not 0 < timeout <= CONTROL_TIMEOUT:
+        raise ValueError("invalid control deadline")
+    maximum = time.monotonic() + timeout
+    if existing is None:
+        return maximum
+    if not _finite(existing) or existing > maximum:
+        raise ValueError("invalid inherited control deadline")
+    return existing
+
+
 def validate_reply(data: bytes) -> dict:
     if len(data) > MAX_REPLY:
         raise ValueError("control reply is too large")
@@ -163,13 +174,28 @@ class MusicControl:
 
     def close(self):
         """Interrupt only this client's in-flight requests; never stop its peer."""
-        self._closed.set()
+        self._close_control()
+
+    def _close_control(self):
+        """Revoke publication, retaining a private identity for owned teardown."""
         with self._connection_lock:
+            identity, version = self.identity, self.version
+            self._closed.set()
+            self.identity = None
+            self.version = None
+            self.capabilities = {}
             for client in self._connections:
                 try:
                     client.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+            return identity, version
+
+    def _check_active(self, deadline, *, closing=False):
+        if self._closed.is_set() and not closing:
+            raise ValueError("control client is closed")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("control reply deadline expired")
 
     @contextmanager
     def _connection(self, closing):
@@ -195,17 +221,18 @@ class MusicControl:
             self.error = str(failure)
             return False
 
-    def _exchange(self, name, version, fields=None, *, expected=None, timeout=CONTROL_TIMEOUT, closing=False):
-        if not _finite(timeout) or not 0 < timeout <= CONTROL_TIMEOUT:
-            raise ValueError("invalid control deadline")
+    def _exchange(self, name, version, fields=None, *, expected=None, timeout=CONTROL_TIMEOUT,
+                  closing=False, _deadline=None):
+        deadline = _control_deadline(timeout, _deadline)
+        self._check_active(deadline, closing=closing)
         payload = json.dumps({**(fields or {}), "cmd": name, "protocol": version},
                              allow_nan=False, ensure_ascii=False).encode("utf-8") + b"\n"
         if len(payload) > 8192:
             raise ValueError("control request is too large")
-        deadline = time.monotonic() + timeout
         with control_parent(self.path) as (fd, leaf), self._connection(closing) as client:
             before = _endpoint(fd, leaf)
-            client.settimeout(max(.001, deadline - time.monotonic()))
+            self._check_active(deadline, closing=closing)
+            client.settimeout(max(0, deadline - time.monotonic()))
             client.connect(f"/proc/self/fd/{fd}/{leaf}")
             if self._closed.is_set() and not closing:
                 raise ValueError("control client is closed")
@@ -213,7 +240,8 @@ class MusicControl:
             identity = (*before, pid)
             if uid != os.geteuid() or _endpoint(fd, leaf) != before or (expected is not None and expected != identity):
                 raise ValueError("control peer changed; reconnect before another command")
-            client.settimeout(max(.001, deadline - time.monotonic()))
+            self._check_active(deadline, closing=closing)
+            client.settimeout(max(0, deadline - time.monotonic()))
             client.sendall(payload)
             data = bytearray()
             while b"\n" not in data:
@@ -234,33 +262,50 @@ class MusicControl:
                 reply = validate_reply(line)
             except (ValueError, TypeError, OverflowError, RecursionError) as failure:
                 raise ValueError("malformed reply from kilix-amp") from failure
-            return reply, identity
+            with self._connection_lock:
+                self._check_active(deadline, closing=closing)
+                return reply, identity
 
-    def negotiate(self, *, timeout=CONTROL_TIMEOUT) -> bool:
-        self.version = None
-        self.identity = None
-        self.capabilities = {}
+    def negotiate(self, *, timeout=CONTROL_TIMEOUT, _deadline=None) -> bool:
+        deadline = None
+        version = None
         try:
-            deadline = time.monotonic() + timeout
-            reply, identity = self._exchange("ping", 2, timeout=timeout)
-            self.version = reply["protocol"]
-            if self.version == 1:
+            deadline = _control_deadline(timeout, _deadline)
+            with self._connection_lock:
+                self.version = None
+                self.identity = None
+                self.capabilities = {}
+                self._check_active(deadline)
+            reply, identity = self._exchange("ping", 2, timeout=timeout, _deadline=deadline)
+            version = reply["protocol"]
+            if version == 1:
                 reply, identity = self._exchange("ping", 1, expected=identity,
-                                                 timeout=deadline - time.monotonic())
+                                                 timeout=timeout, _deadline=deadline)
             if reply["protocol"] not in {1, 2} or not reply["ok"]:
                 raise ValueError(f"unsupported kilix-amp protocol {reply['protocol']}")
-            if self.version == 1 and reply["protocol"] != 1:
+            if version == 1 and reply["protocol"] != 1:
                 raise ValueError("protocol changed during negotiation")
+            capabilities = {}
             if reply["protocol"] == 2:
                 if reply.get("max_protocol") != 2 or type(reply.get("encodec")) is not bool or type(reply.get("live_sources")) is not bool:
                     raise ValueError("incomplete version-2 capability reply")
-                self.capabilities = {key: reply[key] for key in ("encodec", "live_sources")}
-            self.identity = identity
-            self.version = reply["protocol"]
-            self.error = ""
-            return True
+                capabilities = {key: reply[key] for key in ("encodec", "live_sources")}
+            with self._connection_lock:
+                self._check_active(deadline)
+                self.identity = identity
+                self.version = reply["protocol"]
+                self.capabilities = capabilities
+                self.error = ""
+                return True
         except (OSError, ValueError, TypeError, OverflowError, RecursionError) as failure:
-            self.error = f"control socket: {failure}"
+            with self._connection_lock:
+                self.identity = None
+                self.capabilities = {}
+                # Keep an unsupported peer's version as a diagnostic only
+                # while this attempt still has authority to deliver it.
+                self.version = (version if deadline is not None
+                    and not self._closed.is_set() and time.monotonic() < deadline else None)
+                self.error = f"control socket: {failure}"
             return False
 
     def command(self, name, **fields):

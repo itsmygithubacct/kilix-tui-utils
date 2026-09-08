@@ -13,6 +13,7 @@ from unittest.mock import patch
 from test_music import music
 from test_music_sources import backend_fixture, wait_until
 from kilix_tui import app
+from kilix_tui import music_protocol
 
 
 class SelectedBackendTests(unittest.TestCase):
@@ -144,6 +145,167 @@ class SelectedBackendTests(unittest.TestCase):
         self.assertEqual(endpoint.read_text(),'keep')
         self.assertIsNone(state.backend._owned)
         state.close()
+
+
+class StartupAuthorityTests(unittest.TestCase):
+    """Real child/socket/reply cuts; barriers select timing, never fake results."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.executable = backend_fixture(self.base)
+        source = self.executable.read_text()
+        old = 'reply = {"protocol": 1, "ok": request["protocol"] == 1}'
+        self.assertIn(old, source)
+        self.executable.write_text(source.replace(old,
+            'reply = {"protocol": 2, "ok": True, "max_protocol": 2, '
+            '"encodec": False, "live_sources": False}'))
+        self.env = patch.dict(os.environ, {"HOME": str(self.base), "PATH": os.defpath,
+            "KILIX_AMP": str(self.executable), "KILIX_CONTENT_ROOT": str(self.base / "apps"),
+            "PYTHONDONTWRITEBYTECODE": "1"}, clear=True)
+        self.env.start(); self.addCleanup(self.env.stop)
+        self.fds = len(os.listdir('/proc/self/fd'))
+        self.threads = len(threading.enumerate())
+
+    def tearDown(self):
+        self.assertEqual(len(os.listdir('/proc/self/fd')), self.fds)
+        self.assertEqual(len(threading.enumerate()), self.threads)
+
+    def helper(self):
+        host = self.base / 'host'; (host / 'scripts').mkdir(parents=True)
+        launcher = host / 'kilix'; launcher.write_text('#!/bin/sh\nexit 99\n'); launcher.chmod(0o700)
+        helper = host / 'scripts/install-kilix-amp.py'
+        helper.write_text('import time\ntime.sleep(30)\n')
+        return launcher
+
+    def test_resolver_cancel_and_original_deadline_prevent_real_spawn(self):
+        launcher = self.helper()
+        for ending in ('cancel', 'deadline'):
+            with self.subTest(ending=ending):
+                stop = threading.Event(); spawned = []; original = subprocess.Popen
+                def resolve():
+                    if ending == 'cancel': stop.set()
+                    else: time.sleep(.12)
+                    return str(launcher)
+                def spawn(*args, **kwargs):
+                    child = original(*args, **kwargs); spawned.append(child); return child
+                with patch.object(music, 'kilix_launcher', side_effect=resolve), \
+                     patch.object(music.subprocess, 'Popen', side_effect=spawn):
+                    with self.assertRaises(ValueError):
+                        music._host_selection(cancelled=stop, timeout=.1 if ending == 'deadline' else 5)
+                self.assertTrue(all(child.poll() is not None for child in spawned))
+                self.assertEqual(spawned, [])
+
+    def test_cancel_racing_with_actual_query_spawn_reaps_before_refusal(self):
+        launcher = self.helper(); stop = threading.Event(); spawned = []; original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            child = original(*args, **kwargs); spawned.append(child); stop.set(); return child
+        with patch.object(music, 'kilix_launcher', return_value=str(launcher)), \
+             patch.object(music.subprocess, 'Popen', side_effect=spawn):
+            with self.assertRaises(ValueError): music._host_selection(cancelled=stop)
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].poll())
+        self.assertFalse(Path('/proc', str(spawned[0].pid)).exists())
+
+    def test_owned_and_attached_close_during_real_validation_refuse_success(self):
+        for attached in (False, True):
+            with self.subTest(attached=attached):
+                path = self.base / ('attached' if attached else 'owned')
+                external = subprocess.Popen([str(self.executable), '--socket', str(path)]) if attached else None
+                if external: wait_until(path.exists)
+                inode = path.stat().st_ino if external else None
+                backend = music.Backend(str(path)); entered = threading.Event(); release = threading.Event(); answer = []
+                original = music_protocol.validate_reply
+                def validate(data):
+                    result = original(data); entered.set()
+                    self.assertTrue(release.wait(5)); return result
+                worker = threading.Thread(target=lambda: answer.append(backend.start()))
+                try:
+                    with patch.object(music_protocol, 'validate_reply', side_effect=validate):
+                        worker.start(); self.assertTrue(entered.wait(3)); child = backend._owned
+                        backend.close()
+                        if child: self.assertIsNotNone(child.poll())
+                        release.set(); worker.join(3); self.assertFalse(worker.is_alive())
+                    self.assertEqual(answer, [False])
+                    self.assertIsNone(backend.identity)
+                    self.assertIsNone(backend.version)
+                    self.assertEqual(backend.capabilities, {})
+                    self.assertIsNone(backend._owned)
+                    if external:
+                        self.assertIsNone(external.poll()); self.assertEqual(path.stat().st_ino, inode)
+                finally:
+                    release.set(); backend.close()
+                    if worker.is_alive(): worker.join(3)
+                    if external: external.kill(); external.wait()
+
+    def test_late_negotiation_refuses_then_same_attached_client_retries(self):
+        path = self.base / 'retry'
+        external = subprocess.Popen([str(self.executable), '--socket', str(path)])
+        backend = music.Backend(str(path)); wait_until(path.exists)
+        entered = threading.Event(); release = threading.Event(); answer = []
+        original = music_protocol.validate_reply
+        def validate(data):
+            result = original(data); entered.set(); self.assertTrue(release.wait(3)); return result
+        worker = threading.Thread(target=lambda: answer.append(backend.start(timeout=.15)))
+        try:
+            with patch.object(music_protocol, 'validate_reply', side_effect=validate):
+                began = time.monotonic(); worker.start(); self.assertTrue(entered.wait(2))
+                time.sleep(max(0, .2 - (time.monotonic() - began)))
+                release.set(); worker.join(2)
+            self.assertFalse(worker.is_alive()); self.assertEqual(answer, [False])
+            self.assertIsNone(backend.identity); self.assertIsNone(backend.version)
+            self.assertTrue(backend.start(), backend.error)
+            self.assertEqual(backend.identity[-1], external.pid)
+            self.assertIsNone(backend._owned)
+            backend.close(); self.assertIsNone(external.poll())
+        finally:
+            release.set(); backend.close()
+            if worker.is_alive(): worker.join(3)
+            external.kill(); external.wait()
+
+    def test_close_between_actual_negotiation_and_owned_start_handoff(self):
+        backend = music.Backend(str(self.base / 'handoff'))
+        entered = threading.Event(); release = threading.Event(); answer = []
+        negotiate = backend.negotiate
+        def hold(**kwargs):
+            result = negotiate(**kwargs)
+            self.assertTrue(result, backend.error); entered.set()
+            self.assertTrue(release.wait(3)); return result
+        worker = threading.Thread(target=lambda: answer.append(backend.start()))
+        try:
+            with patch.object(backend, 'negotiate', side_effect=hold):
+                worker.start(); self.assertTrue(entered.wait(2)); child = backend._owned
+                self.assertIsNotNone(child); backend.close(); self.assertIsNotNone(child.poll())
+                release.set(); worker.join(2)
+            self.assertFalse(worker.is_alive()); self.assertEqual(answer, [False])
+            self.assertIsNone(backend.identity); self.assertIsNone(backend._owned)
+            self.assertFalse(Path('/proc', str(child.pid)).exists())
+        finally:
+            release.set(); backend.close()
+            if worker.is_alive(): worker.join(3)
+
+    def test_close_between_actual_exchange_and_negotiation_publication(self):
+        path = self.base / 'publication'
+        external = subprocess.Popen([str(self.executable), '--socket', str(path)])
+        backend = music.Backend(str(path)); wait_until(path.exists)
+        entered = threading.Event(); release = threading.Event(); answer = []
+        exchange = backend._exchange
+        def hold(*args, **kwargs):
+            result = exchange(*args, **kwargs); entered.set()
+            self.assertTrue(release.wait(3)); return result
+        worker = threading.Thread(target=lambda: answer.append(backend.negotiate()))
+        try:
+            with patch.object(backend, '_exchange', side_effect=hold):
+                worker.start(); self.assertTrue(entered.wait(2)); backend.close()
+                release.set(); worker.join(2)
+            self.assertFalse(worker.is_alive()); self.assertEqual(answer, [False])
+            self.assertIsNone(backend.identity); self.assertIsNone(backend.version)
+            self.assertIsNone(external.poll())
+        finally:
+            release.set(); backend.close()
+            if worker.is_alive(): worker.join(3)
+            external.kill(); external.wait()
 
 
 if __name__=='__main__':unittest.main()

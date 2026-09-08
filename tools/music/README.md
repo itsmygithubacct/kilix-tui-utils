@@ -5,7 +5,8 @@ Kilix tab, using the ordinary terminal handoff when tabs are unavailable.
 It attaches to an existing healthy user backend, or starts a headless backend
 when none exists. If Amp is absent, the existing pinned Kilix installer runs
 off the UI thread. Closing Music stops only a backend that Music started;
-an attached player keeps running. State construction, imports and rendering
+an attached player keeps running. A canceled or expired startup cannot publish
+a successful connection or peer identity after its reply arrives. State construction, imports and rendering
 perform no player lookup, setup or process launch.
 
 ```sh
@@ -68,13 +69,19 @@ sets that environment variable. For the host fallback it must use
 `kilix kilix-tui --content-root /absolute/apps` (or `kilix tui` with the same
 option immediately after the alias). The host validates and normalizes that
 explicit path; an ordinary host launch ignores inherited `KILIX_CONTENT_ROOT`
-and uses its actual host store. The read-only query does not create a missing root,
-install/build an application, or write model receipts. Setup uses the same
+and uses its actual host store. The query does not create a missing root,
+install/build an application, or write model receipts. Content readiness may
+refresh byte-identical Git index metadata in an existing checkout; it is not a
+promise of zero filesystem writes. Setup uses the same
 host installer in an owned supervised process and respects its auto-install
 setting. Cancellation/deadline waits for its owned cleanup; it never installs
 system/native prerequisites or accepts licenses. Each query is bounded by five
 seconds and setup by fifteen minutes, with cancellation support and a separate
 bounded allowance to finish owned teardown after interruption.
+Owned startup keeps one original five-second budget through catalog query and
+protocol negotiation, including the legacy fallback. Cancellation is checked
+again after host resolution before any setup/query process starts. A cancel
+racing with a real spawn still waits for that owned process to be reaped.
 
 `KILIX_AMP` is an explicit trusted operator executable override. It bypasses
 catalog selection and provides no catalog, enabled-codec or model-admission

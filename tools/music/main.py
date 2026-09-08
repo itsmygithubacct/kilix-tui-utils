@@ -94,13 +94,17 @@ def _launch_root():
     return _root(root)
 
 
-def _host_selection(*, install=False, timeout=QUERY_TIMEOUT, cancelled=None, root=None):
+def _host_selection(*, install=False, timeout=QUERY_TIMEOUT, cancelled=None, root=None,
+                    _deadline=None):
     """One bounded owned host query/setup; all catalog decisions stay there."""
     maximum = INSTALL_TIMEOUT if install else QUERY_TIMEOUT
     if type(timeout) not in (int, float) or not 0 < timeout <= maximum:
         raise ValueError("invalid player setup/query deadline")
-    deadline = time.monotonic() + timeout
-    if cancelled and cancelled.is_set():
+    maximum_deadline = time.monotonic() + timeout
+    deadline = maximum_deadline if _deadline is None else _deadline
+    if type(deadline) not in (int, float) or not deadline <= maximum_deadline:
+        raise ValueError("invalid player setup/query deadline")
+    if (cancelled and cancelled.is_set()) or time.monotonic() >= deadline:
         raise ValueError("player setup/query canceled")
     root = _root(root)
     launcher = kilix_launcher()
@@ -114,6 +118,10 @@ def _host_selection(*, install=False, timeout=QUERY_TIMEOUT, cancelled=None, roo
     process = None
     output, diagnostic = bytearray(), bytearray()
     try:
+        # Host/path resolution may yield to cancellation or consume the budget.
+        # Keep the caller's authority at the last boundary before side effects.
+        if (cancelled and cancelled.is_set()) or time.monotonic() >= deadline:
+            raise ValueError("player setup/query canceled or deadline exceeded")
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
@@ -184,7 +192,7 @@ def _host_selection(*, install=False, timeout=QUERY_TIMEOUT, cancelled=None, roo
                         stream.close()
 
 
-def backend_selection(timeout=QUERY_TIMEOUT, cancelled=None, root=None):
+def backend_selection(timeout=QUERY_TIMEOUT, cancelled=None, root=None, *, _deadline=None):
     root = _root(root)
     override = os.environ.get("KILIX_AMP", "")
     if override:
@@ -194,7 +202,7 @@ def backend_selection(timeout=QUERY_TIMEOUT, cancelled=None, root=None):
         if not os.path.isfile(executable) or not os.access(executable, os.X_OK):
             raise ValueError("explicit KILIX_AMP is not built or executable")
         return {"executable": executable, "root": root, "override": True}
-    return _host_selection(timeout=timeout, cancelled=cancelled, root=root)
+    return _host_selection(timeout=timeout, cancelled=cancelled, root=root, _deadline=_deadline)
 
 
 def backend_executable() -> str:
@@ -227,8 +235,8 @@ class Backend(MusicControl):
         # Rendering reads only the last explicit worker lookup.
         return bool(self.selection.get("executable"))
 
-    def select(self, *, timeout=QUERY_TIMEOUT, cancelled=None, root=None):
-        self.selection = backend_selection(timeout, cancelled, root)
+    def select(self, *, timeout=QUERY_TIMEOUT, cancelled=None, root=None, _deadline=None):
+        self.selection = backend_selection(timeout, cancelled, root, _deadline=_deadline)
         return self.selection
 
     def start(self, timeout: float = START_TIMEOUT) -> bool:
@@ -237,12 +245,24 @@ class Backend(MusicControl):
             return False
         if self._closed.is_set():
             return False
-        if os.path.lexists(self.path):
-            return self.negotiate(timeout=timeout)
         deadline = time.monotonic() + timeout
+        if os.path.lexists(self.path):
+            if not self.negotiate(timeout=timeout, _deadline=deadline):
+                return False
+            with self._connection_lock:
+                try:
+                    self._check_active(deadline)
+                except (OSError, ValueError) as failure:
+                    self.identity = None
+                    self.version = None
+                    self.capabilities = {}
+                    self.error = str(failure)
+                    return False
+                return True
         try:
             root = self.selection["root"] if "root" in self.selection else _launch_root()
-            selected = self.select(timeout=timeout, cancelled=self._closed, root=root)
+            selected = self.select(timeout=timeout, cancelled=self._closed, root=root,
+                                   _deadline=deadline)
         except (OSError, ValueError, TypeError, subprocess.SubprocessError) as failure:
             self.error = str(failure)
             return False
@@ -277,11 +297,21 @@ class Backend(MusicControl):
         while time.monotonic() < deadline and not self._closed.is_set():
             if child.poll() is not None:
                 break
-            if self.available() and self.negotiate(timeout=max(.001, deadline - time.monotonic())):
-                if self.identity[-1] == child.pid:
-                    return True
-                self.error = "another backend replaced the startup endpoint"
-                break
+            if self.available() and self.negotiate(timeout=timeout, _deadline=deadline):
+                with self._connection_lock:
+                    try:
+                        self._check_active(deadline)
+                    except (OSError, ValueError) as failure:
+                        self.identity = None
+                        self.version = None
+                        self.capabilities = {}
+                        self.error = str(failure)
+                        break
+                    if (self._owned is child and child.poll() is None
+                            and self.identity and self.identity[-1] == child.pid):
+                        return True
+                    self.error = "another backend replaced the startup endpoint"
+                    break
             self._closed.wait(.05)
         failure = self.error or "kilix-amp did not open a healthy control socket"
         self._stop_owned()
@@ -290,18 +320,20 @@ class Backend(MusicControl):
 
     def close(self) -> None:
         """Never send quit or a signal to an attached, pre-existing backend."""
-        super().close()
-        self._stop_owned()
+        identity, version = self._close_control()
+        self._stop_owned(identity=identity, version=version)
 
-    def _stop_owned(self) -> None:
+    def _stop_owned(self, *, identity=None, version=None) -> None:
         child = self._owned
         if child is None:
             return
+        if identity is None:
+            identity, version = self.identity, self.version
         try:
             if child.poll() is None:
-                if self.identity and self.identity[-1] == child.pid:
+                if identity and identity[-1] == child.pid:
                     try:
-                        self._exchange("quit", self.version, expected=self.identity, timeout=.5, closing=True)
+                        self._exchange("quit", version, expected=identity, timeout=.5, closing=True)
                     except (OSError, ValueError, TypeError, OverflowError, RecursionError):
                         pass
                 try:
@@ -318,6 +350,11 @@ class Backend(MusicControl):
             return
         if self._owned is child and child.poll() is not None:
             self._owned = None
+            with self._connection_lock:
+                if self.identity and self.identity[-1] == child.pid:
+                    self.identity = None
+                    self.version = None
+                    self.capabilities = {}
 
 
 class State:
