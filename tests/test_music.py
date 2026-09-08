@@ -36,11 +36,20 @@ def load():
 music = load()
 
 
+def handle(key, state):
+    result = music.handle(key, state)
+    if state._worker:
+        state._worker.join(timeout=6)
+        if state._worker.is_alive():
+            raise AssertionError("UI command worker did not finish")
+    return result
+
+
 class ContractTests(unittest.TestCase):
     """Anything asserted here also has to hold in kilix-amp."""
 
-    def test_protocol_version_is_one(self):
-        self.assertEqual(music.PROTOCOL_VERSION, 1)
+    def test_protocol_version_is_two(self):
+        self.assertEqual(music.PROTOCOL_VERSION, 2)
 
     def test_socket_path_prefers_the_explicit_override(self):
         with _environment(KILIX_AMP_SOCKET="/custom/amp.sock",
@@ -86,7 +95,8 @@ class ContractTests(unittest.TestCase):
         seen = []
         with _server({"protocol": 1, "ok": True}, seen) as path:
             music.Backend(path).command("play", index=3)
-        self.assertEqual(seen[0], {"cmd": "play", "protocol": 1, "index": 3})
+        self.assertEqual(seen, [{"cmd": "ping", "protocol": 2}, {"cmd": "ping", "protocol": 1},
+                                {"cmd": "play", "protocol": 1, "index": 3}])
 
     def test_a_malformed_reply_is_reported_not_raised(self):
         with _server("not json", raw=True) as path:
@@ -217,8 +227,11 @@ class RestraintTests(unittest.TestCase):
         class _Result:
             returncode = 0
 
-        original = subprocess.run
-        subprocess.run = lambda argv, **k: (seen.append(argv), _Result())[1]
+            def poll(self):
+                return 0
+
+        original = subprocess.Popen
+        subprocess.Popen = lambda argv, **k: (seen.append(argv), _Result())[1]
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 launcher = os.path.join(tmp, "kilix")
@@ -228,7 +241,7 @@ class RestraintTests(unittest.TestCase):
                 with _environment(PATH=tmp, KILIX_AMP=""):
                     music.install_backend()
         finally:
-            subprocess.run = original
+            subprocess.Popen = original
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0][1:], ["amp", "--install-only"])
 
@@ -289,28 +302,34 @@ class _server:
         self.path = os.path.join(self.tmp, "amp.sock")
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(self.path)
-        self.sock.listen(1)
+        os.chmod(self.path, 0o600)
+        self.sock.listen(3)
+        self.sock.settimeout(.1)
+        self.stop = threading.Event()
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
         return self.path
 
     def _serve(self):
-        try:
-            client, _ = self.sock.accept()
-        except OSError:
-            return
-        with client:
-            data = client.recv(65536).decode("utf-8", errors="replace")
-            if self.seen is not None and data.strip():
-                self.seen.append(json.loads(data.splitlines()[0]))
-            body = (self.reply if self.raw
-                    else json.dumps(self.reply)) + "\n"
+        while not self.stop.is_set():
             try:
-                client.sendall(body.encode("utf-8"))
+                client, _ = self.sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
-                pass
+                return
+            with client:
+                data = client.recv(65536).decode("utf-8", errors="replace")
+                if self.seen is not None and data.strip():
+                    self.seen.append(json.loads(data.splitlines()[0]))
+                body = (self.reply if self.raw else json.dumps(self.reply)) + "\n"
+                try:
+                    client.sendall(body.encode("utf-8"))
+                except OSError:
+                    pass
 
     def __exit__(self, *exc):
+        self.stop.set()
         self.sock.close()
         self.thread.join(timeout=2)
         for name in os.listdir(self.tmp):
@@ -368,6 +387,8 @@ def player(**kwargs):
     state.prompt = None
     state.filter = shell.Filter()
     state._worker = None
+    state._closing = threading.Event()
+    state.prompt_kind = "add"
     state.refresh()
     return state
 
@@ -377,42 +398,42 @@ class TransportTests(unittest.TestCase):
 
     def test_seek_moves_relative_to_the_current_position(self):
         state = player()
-        music.handle(ord("."), state)                    # +30s from 30s
+        handle(ord("."), state)                    # +30s from 30s
         self.assertEqual(state.backend.last("seek")[-1]["pos"], 60.0)
 
     def test_seek_never_runs_past_either_end(self):
         state = player()
         for _ in range(20):
-            music.handle(ord(","), state)                # -30s, repeatedly
+            handle(ord(","), state)                # -30s, repeatedly
         self.assertGreaterEqual(state.backend.last("seek")[-1]["pos"], 0.0)
         state = player()
         for _ in range(20):
-            music.handle(ord("."), state)
+            handle(ord("."), state)
         self.assertLessEqual(state.backend.last("seek")[-1]["pos"], 100.0)
 
     def test_seek_with_no_track_says_so_instead_of_sending(self):
         state = player(status={"state": "stopped", "pos": 0, "len": 0})
-        music.handle(ord("."), state)
+        handle(ord("."), state)
         self.assertEqual(state.backend.last("seek"), [])
         self.assertIn("nothing playing", state.message)
 
     def test_volume_steps_and_clamps_to_the_backend_range(self):
         state = player()
-        music.handle(ord("+"), state)
+        handle(ord("+"), state)
         self.assertEqual(state.backend.last("volume")[-1]["level"], 55)
         state = player(status={"volume": 98, "state": "playing"})
         for _ in range(5):
-            music.handle(ord("+"), state)
+            handle(ord("+"), state)
         self.assertEqual(state.backend.last("volume")[-1]["level"], 100)
         state = player(status={"volume": 2, "state": "playing"})
         for _ in range(5):
-            music.handle(ord("-"), state)
+            handle(ord("-"), state)
         self.assertEqual(state.backend.last("volume")[-1]["level"], 0)
 
     def test_shuffle_and_repeat_reach_the_backend(self):
         state = player()
-        music.handle(ord("s"), state)
-        music.handle(ord("m"), state)
+        handle(ord("s"), state)
+        handle(ord("m"), state)
         self.assertEqual(len(state.backend.last("shuffle")), 1)
         self.assertEqual(len(state.backend.last("repeat")), 1)
 
@@ -421,7 +442,7 @@ class TransportTests(unittest.TestCase):
         for key, command in ((" ", "toggle"), ("b", "next"), ("z", "previous"),
                              ("v", "stop")):
             state.backend.sent.clear()
-            music.handle(ord(key), state)
+            handle(ord(key), state)
             self.assertTrue(state.backend.last(command), f"{key} -> {command}")
 
 
@@ -430,7 +451,7 @@ class PlaylistTests(unittest.TestCase):
         state = player()
         state.section = 1
         state.selected = 2
-        music.handle(ord("\n"), state)
+        handle(ord("\n"), state)
         self.assertEqual(state.backend.last("play")[-1]["index"], 2)
 
     def test_the_cursor_and_the_playing_track_are_marked_differently(self):
@@ -443,34 +464,34 @@ class PlaylistTests(unittest.TestCase):
 
     def test_adding_a_path_expands_the_home_shorthand(self):
         state = player()
-        music.handle(ord("a"), state)
+        handle(ord("a"), state)
         self.assertTrue(state.typing())
         for letter in "~/Music":
-            music.handle(ord(letter), state)
-        music.handle(ord("\n"), state)
+            handle(ord(letter), state)
+        handle(ord("\n"), state)
         self.assertEqual(state.backend.last("add")[-1]["path"],
                          os.path.expanduser("~/Music"))
 
     def test_a_rejected_path_is_reported_rather_than_silently_dropped(self):
         state = player(ok=False, error="nothing playable at that path")
         state.prompt = "/nope"
-        music.handle(ord("\n"), state)
+        handle(ord("\n"), state)
         self.assertIn("nothing playable", state.message)
 
     def test_typing_a_path_takes_every_character_as_text(self):
         # '?' opens help everywhere else; inside the prompt it is a character,
         # which is why this tool owns the key instead of the shared loop.
         state = player()
-        music.handle(ord("a"), state)
-        music.handle(ord("?"), state)
+        handle(ord("a"), state)
+        handle(ord("?"), state)
         self.assertFalse(state.help_open)
         self.assertEqual(state.prompt, "?")
 
     def test_escape_abandons_the_prompt_without_adding(self):
         state = player()
-        music.handle(ord("a"), state)
-        music.handle(ord("x"), state)
-        music.handle(27, state)
+        handle(ord("a"), state)
+        handle(ord("x"), state)
+        handle(27, state)
         self.assertFalse(state.typing())
         self.assertEqual(state.backend.last("add"), [])
 

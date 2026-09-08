@@ -14,9 +14,9 @@ that reads as a hang.
 """
 from __future__ import annotations
 
-import json
+import argparse
 import shutil
-import socket
+import signal
 import subprocess
 import threading
 import time
@@ -30,8 +30,8 @@ sys.path.insert(0, os.path.join(
 
 from kilix_desk import sources  # noqa: E402
 from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
+from kilix_tui.music_protocol import MusicControl, PROTOCOL_VERSION, control_parent  # noqa: E402
 
-PROTOCOL_VERSION = 1
 # Long enough for the backend to open its audio device on a slow disk, short
 # enough that a wedged one does not look like a hung UI.
 START_TIMEOUT = 5.0
@@ -56,7 +56,7 @@ def clock(seconds: float) -> str:
     """
     try:
         total = max(0, int(float(seconds)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         total = 0
     hours, rest = divmod(total, 3600)
     minutes, secs = divmod(rest, 60)
@@ -106,108 +106,131 @@ def kilix_launcher() -> str:
     return candidate if os.access(candidate, os.X_OK) else ""
 
 
-def install_backend(timeout: float = INSTALL_TIMEOUT) -> bool:
+def install_backend(timeout: float = INSTALL_TIMEOUT, cancelled: threading.Event | None = None) -> bool:
     """Build the pinned Media Player, through Kilix rather than around it.
 
     Kilix owns the content catalog that pins kilix-amp and the installer that
     verifies and builds it. Cloning it from here would mean a second, unpinned
     copy of that decision.
     """
+    if type(timeout) not in (int, float) or not 0 < timeout <= INSTALL_TIMEOUT:
+        return False
     launcher = kilix_launcher()
-    if not launcher:
+    if not launcher or (cancelled and cancelled.is_set()):
         return False
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             [launcher, "amp", "--install-only"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if time.monotonic() >= deadline or (cancelled and cancelled.is_set()):
+                # The unreaped session leader pins this owned process-group ID.
+                try:
+                    if os.getpgid(process.pid) == process.pid:
+                        os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+                return False
+            if cancelled:
+                cancelled.wait(.05)
+            else:
+                time.sleep(.05)
     except (OSError, subprocess.SubprocessError):
         return False
-    return completed.returncode == 0 and bool(backend_executable())
+    return process.returncode == 0 and bool(backend_executable())
 
 
-class Backend:
-    """Thin client for kilix-amp's control socket."""
+class Backend(MusicControl):
+    """An authenticated local client, owning only a backend it starts itself."""
 
     def __init__(self, path: str | None = None) -> None:
-        self.path = path or socket_path()
-        self.error = ""
-        self.version: int | None = None
-
-    def available(self) -> bool:
-        return os.path.exists(self.path)
+        super().__init__(path or socket_path())
+        self._owned: subprocess.Popen | None = None
 
     def installed(self) -> bool:
         return bool(backend_executable())
 
     def start(self, timeout: float = START_TIMEOUT) -> bool:
-        """Launch a headless backend and wait for its socket to appear."""
-        if self.available():
-            return True
+        if type(timeout) not in (float, int) or not 0 < timeout <= START_TIMEOUT:
+            self.error = "invalid backend startup deadline"
+            return False
+        if self._closed.is_set():
+            return False
+        if os.path.lexists(self.path):
+            return self.negotiate(timeout=timeout)
         executable = backend_executable()
         if not executable:
             self.error = "kilix-amp is not built on this machine"
             return False
-        # The socket is passed explicitly rather than left to the default, so
-        # the backend cannot resolve a different path from a different
-        # environment than the one this client just computed.
+        try:
+            with control_parent(self.path, create=True):
+                pass
+        except (OSError, ValueError) as failure:
+            self.error = f"cannot create a private player endpoint: {failure}"
+            return False
         command = [executable, "--headless", "--socket", self.path]
         music = os.path.expanduser("~/Music")
         if os.path.isdir(music):
             command.append(music)
         try:
-            subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                # Its own session: the backend outlives this front end, which
-                # is the point of putting playback behind a socket.
-                start_new_session=True,
-            )
+            self._owned = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError as failure:
             self.error = f"could not start kilix-amp: {failure}"
             return False
+        child = self._owned
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.available():
-                self.error = ""
-                return True
-            time.sleep(0.05)
-        self.error = "kilix-amp did not open its control socket"
+        while time.monotonic() < deadline and not self._closed.is_set():
+            if child.poll() is not None:
+                break
+            if self.available() and self.negotiate(timeout=max(.001, deadline - time.monotonic())):
+                if self.identity[-1] == child.pid:
+                    return True
+                self.error = "another backend replaced the startup endpoint"
+                break
+            self._closed.wait(.05)
+        failure = self.error or "kilix-amp did not open a healthy control socket"
+        self._stop_owned()
+        self.error = failure
         return False
 
-    def command(self, name: str, **fields: object) -> dict:
-        if not self.available():
-            self.error = "kilix-amp is not running with a control socket"
-            return {}
-        payload = json.dumps({"cmd": name, "protocol": PROTOCOL_VERSION,
-                              **fields}) + "\n"
+    def close(self) -> None:
+        """Never send quit or a signal to an attached, pre-existing backend."""
+        super().close()
+        self._stop_owned()
+
+    def _stop_owned(self) -> None:
+        child = self._owned
+        if child is None:
+            return
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.settimeout(5)
-                client.connect(self.path)
-                client.sendall(payload.encode("utf-8"))
-                data = client.recv(65536).decode("utf-8", errors="replace")
-        except (OSError, socket.timeout) as failure:
-            self.error = f"control socket: {failure}"
-            return {}
-        try:
-            reply = json.loads(data.splitlines()[0]) if data.strip() else {}
-        except (ValueError, IndexError):
-            self.error = "malformed reply from kilix-amp"
-            return {}
-        if (their := reply.get("protocol")) and their != PROTOCOL_VERSION:
-            self.version = int(their)
-            self.error = (f"kilix-amp speaks protocol {their}, this client "
-                          f"speaks {PROTOCOL_VERSION}")
-            return {}
-        self.error = ""
-        return reply
+            if child.poll() is None:
+                if self.identity and self.identity[-1] == child.pid:
+                    try:
+                        self._exchange("quit", self.version, expected=self.identity, timeout=.5, closing=True)
+                    except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+                        pass
+                try:
+                    child.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=3)
+        except (OSError, subprocess.SubprocessError) as failure:
+            self.error = f"could not confirm owned player exit: {failure}"
+            return
+        if self._owned is child and child.poll() is not None:
+            self._owned = None
 
 
 class State:
@@ -232,7 +255,8 @@ class State:
         self.prompt: str | None = None   # the "add path" entry, when open
         self.filter = shell.Filter()
         self._worker: threading.Thread | None = None
-        self.refresh()
+        self._closing = threading.Event()
+        self.prompt_kind = "add"
 
     def busy(self) -> bool:
         return bool(self._worker and self._worker.is_alive())
@@ -260,6 +284,10 @@ class State:
 
     def refresh(self) -> None:
         self.status = self.backend.command("state") or {}
+        if not self.status or self.status.get("ok") is False:
+            self.message = safe_text(self.backend.error or str(self.status.get("error") or "player unavailable"))
+            self.status = {}; self.playlist = []
+            return
         listing = self.backend.command("playlist") or {}
         self.playlist = [str(i) for i in listing.get("items", [])]
         if self.selected >= len(self.playlist):
@@ -276,14 +304,40 @@ class State:
         if self.busy() or not self.backend.available():
             return
         if self.typing():
-            self.status = self.backend.command("state") or {}
+            self._work(lambda: self.absorb(self.backend.command("state")))
             return
-        self.refresh()
+        self._work(self.refresh)
+
+    def _work(self, action) -> None:
+        if self.busy() or self._closing.is_set():
+            return
+        def run():
+            try:
+                if not self._closing.is_set():
+                    action()
+            except (OSError, ValueError, TypeError, OverflowError) as failure:
+                self.message = safe_text(str(failure))
+        self._worker = threading.Thread(target=run, daemon=True)
+        self._worker.start()
 
     # ── transport, as the backend defines it ────────────────────────────────
 
     def send(self, name: str, **fields: object) -> None:
-        self.absorb(self.backend.command(name, **fields))
+        def request():
+            reply = self.backend.command(name, **fields)
+            self.absorb(reply)
+            if not reply or reply.get("ok") is False:
+                self.message = safe_text(self.backend.error or str(reply.get("error") or "player command failed"))
+            elif name == "shuffle":
+                self.message = "shuffle on" if reply.get("shuffle") else "shuffle off"
+            elif name == "repeat":
+                self.message = REPEAT_LABELS.get(self.repeat_mode(), "repeat")
+            elif name == "clear":
+                self.refresh()
+                self.message = "playlist cleared"
+            elif name == "volume":
+                self.message = f"volume {self.volume()}%"
+        self._work(request)
 
     def position(self) -> float:
         return float(self.status.get("pos", 0) or 0)
@@ -298,6 +352,9 @@ class State:
         return number(self.status, "repeat", 0)
 
     def seek_by(self, delta: float) -> None:
+        if self.status.get("live") or self.status.get("seekable") is False:
+            self.message = "this source cannot seek"
+            return
         length = self.length()
         if length <= 0:
             self.message = "nothing playing to seek in"
@@ -308,41 +365,68 @@ class State:
     def nudge_volume(self, delta: int) -> None:
         level = max(0, min(100, self.volume() + delta))
         self.send("volume", level=level)
-        self.message = f"volume {level}%"
 
     def add_path(self, raw: str) -> None:
         path = os.path.expanduser(raw.strip())
         if not path:
             return
-        reply = self.backend.command("add", path=path)
-        self.absorb(reply)
-        if reply.get("ok") is False:
-            self.message = str(reply.get("error") or "could not add that path")
-        else:
-            self.refresh()
-            self.message = f"added {os.path.basename(path.rstrip('/')) or path}"
+        def add():
+            reply = self.backend.command("add", path=path)
+            self.absorb(reply)
+            if not reply or reply.get("ok") is False:
+                self.message = safe_text(self.backend.error or str(reply.get("error") or "could not add that path"))
+            else:
+                self.refresh()
+                self.message = f"added {safe_text(os.path.basename(path.rstrip('/')) or path)}"
+        self._work(add)
 
-    def begin_setup(self) -> None:
+    def open_source(self, kind: str, raw: str) -> None:
+        path = os.path.abspath(os.path.expanduser(raw.strip())) if raw.strip() else ""
+        if not path:
+            return
+        def opened():
+            reply = self.backend.command("open", source_type=kind, path=path)
+            self.absorb(reply)
+            if not reply or reply.get("ok") is False:
+                self.message = safe_text(self.backend.error or str(reply.get("error") or "could not open source"))
+            else:
+                self.refresh()
+        self._work(opened)
+
+    def begin_setup(self, source: tuple[str, str] | None = None) -> None:
         """Install the player if needed, then start a backend, off this thread."""
         if self.busy():
             return
         self.note = ""
-        self._worker = threading.Thread(target=self._setup, daemon=True)
-        self._worker.start()
+        self._work(lambda: self._setup(source))
 
-    def _setup(self) -> None:
+    def _setup(self, source: tuple[str, str] | None = None) -> None:
         try:
-            if not backend_executable():
+            if not self.backend.available() and not backend_executable():
                 self.phase = "installing"
-                if not install_backend():
+                if not install_backend(cancelled=self._closing):
                     self.note = ("could not install the Media Player — "
                                  "run 'kilix amp' to see why")
                     return
             self.phase = "starting"
             if not self.backend.start():
                 self.note = self.backend.error
+                return
+            if source and not self._closing.is_set():
+                kind, path = source
+                reply = self.backend.command("open", source_type=kind, path=path)
+                self.absorb(reply)
+                if not reply or reply.get("ok") is False:
+                    self.note = self.backend.error
+            self.refresh()
         finally:
             self.phase = ""
+
+    def close(self) -> None:
+        self._closing.set()
+        self.backend.close()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=6)
 
 
 WAITING = {
@@ -362,8 +446,12 @@ def number(status: dict, key: str, default: int = 0) -> int:
         return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
+
+
+def safe_text(value: str) -> str:
+    return "".join(" " if ord(c) < 32 or 127 <= ord(c) < 160 else c for c in value)
 
 
 SECTIONS = ("Now playing", "Playlist")
@@ -378,24 +466,32 @@ def footer(state: State) -> str:
     if state.filter.typing:
         return state.filter.footer()
     if state.prompt is not None:
-        return "type a file or folder · Enter add · Esc cancel"
+        kind = state.prompt_kind
+        return ("type a private socket path · Enter open · Esc cancel" if kind == "encodec-unix"
+                else "type a file path · Enter open · Esc cancel" if kind == "file"
+                else "type a file or folder · Enter add · Esc cancel")
     if state.phase:
         return "q quit"
     if not state.backend.available():
         return "s start backend · r retry · q quit"
     if state.section == 1:
         return ("↑/↓ select · Enter play · / filter · a add · c clear "
-                "· space play/pause · Tab now playing · ? keys · q quit")
+                "· o file · u stream · Tab now playing · ? keys · q quit")
+    if state.status.get("live"):
+        reconnect = (state.status.get("source_type") == "encodec-unix"
+                     and (state.status.get("ended") or state.status.get("reconnect_required")))
+        return ("space play/pause · v stop · +/- volume · u stream · r "
+                + ("reconnect" if reconnect else "refresh") + " · Tab playlist · ? keys · q quit")
     return ("space play/pause · ←/→ seek · +/- volume · z/b prev/next "
-            "· s shuffle · m repeat · Tab playlist · ? keys · q quit")
+            "· o file · u stream · Tab playlist · ? keys · q quit")
 
 
 def _draw_now_playing(surface, state: State, body) -> None:
     status = state.status
     playing = str(status.get("state", "stopped"))
     glyph = STATE_GLYPH.get(playing, "·")
-    title = str(status.get("title") or "")
-    path = str(status.get("file") or "")
+    title = safe_text(str(status.get("title") or ""))
+    path = safe_text(str(status.get("file") or ""))
     if not title:
         title = os.path.basename(path) or "nothing loaded"
     index = number(status, "index", -1)
@@ -413,7 +509,13 @@ def _draw_now_playing(surface, state: State, body) -> None:
 
     length = state.length()
     position = state.position()
-    if length > 0:
+    if status.get("live"):
+        state_name = ("reconnect required" if status.get("reconnect_required") else
+                      "ended" if status.get("ended") and playing == "stopped" else
+                      "recovering" if status.get("degraded") else playing)
+        shell.put(surface, row, body.left, f"LIVE · {clock(position)} elapsed · {state_name}",
+                  shell.tango.attr("alert" if status.get("reconnect_required") else "accent"))
+    elif length > 0:
         times = f"{clock(position)} / {clock(length)}"
         width = max(4, body.width - len(times) - 4)
         shell.put(surface, row, body.left, times, shell.tango.attr("accent"))
@@ -421,7 +523,7 @@ def _draw_now_playing(surface, state: State, body) -> None:
                   proc.bar(position / length, width),
                   shell.tango.attr("accent"))
     else:
-        shell.put(surface, row, body.left, "no track loaded",
+        shell.put(surface, row, body.left, "duration unavailable" if path else "no track loaded",
                   shell.tango.attr("muted"))
     row += 2
 
@@ -443,6 +545,25 @@ def _draw_now_playing(surface, state: State, body) -> None:
         shell.put(surface, row, body.left + 30,
                   f"track {index + 1} of {count}" if index >= 0
                   else f"{count} in playlist", shell.tango.attr("muted"))
+    if status.get("codec") == "encodec":
+        row += 2
+        profile = {1: "24 kHz mono", 2: "48 kHz stereo"}.get(status.get("profile"), "profile pending")
+        rate = number(status, "bitrate")
+        detail = f"EnCodec · {profile}"
+        if rate:
+            detail += f" · {rate // 1000} kb/s"
+        if number(status, "threads"):
+            detail += f" · {number(status, 'threads')} threads"
+        shell.put(surface, row, body.left, detail[:body.width], shell.tango.attr("accent"))
+        row += 1
+        readiness = "model ready" if status.get("model_ready") else "model not ready"
+        if status.get("buffering"):
+            readiness += " · buffering"
+        readiness += " · seekable" if status.get("seekable") else " · seek unavailable"
+        shell.put(surface, row, body.left, readiness[:body.width], shell.tango.attr("muted"))
+    if status.get("source_error_message"):
+        shell.put(surface, row + 2, body.left, safe_text(status["source_error_message"])[:body.width],
+                  shell.tango.attr("alert"))
 
 
 def _draw_playlist(surface, state: State, body) -> None:
@@ -465,7 +586,7 @@ def _draw_playlist(surface, state: State, body) -> None:
         # are, the note is what the backend is actually playing.
         cursor = "▶" if selected else " "
         playing = "♪" if index == current else " "
-        label = f" {cursor}{playing} {os.path.basename(item)}"
+        label = f" {cursor}{playing} {safe_text(os.path.basename(item))}"
         if selected:
             shell.put(surface, body.top + line, 0,
                       label.ljust(body.width + 1)[:body.width + 1],
@@ -491,11 +612,11 @@ def render(surface, state: State) -> None:
     elif state.section == 1 and state.filter.active():
         summary = state.filter.summary(len(state.view()))
     elif state.message:
-        summary = state.message
+        summary = safe_text(state.message)
     elif available:
         summary = f"{state.status.get('state', 'stopped')}"
         if state.backend.error:
-            summary = state.backend.error
+            summary = safe_text(state.backend.error)
     else:
         summary = "kilix-amp backend not running"
     body = shell.draw(
@@ -523,9 +644,10 @@ def render(surface, state: State) -> None:
         _draw_now_playing(surface, state, body)
     else:
         _draw_playlist(surface, state, body)
-    if state.typing():
+    if state.prompt is not None:
+        label = {"add": "add", "file": "file", "encodec-unix": "stream"}[state.prompt_kind]
         shell.put(surface, body.bottom - 1, body.left,
-                  f"add: {state.prompt}_"[:body.width],
+                  f"{label}: {safe_text(state.prompt)}_"[:body.width],
                   shell.tango.attr("selected"))
     if state.help_open:
         app.help_overlay(surface)
@@ -548,11 +670,11 @@ def _draw_offline(surface, state: State, body) -> None:
         shell.put(surface, body.top + 4, body.left,
                   "to build it with. Run 'kilix amp' from a Kilix checkout.")
     shell.put(surface, body.top + 6, body.left,
-              f"expected socket: {state.backend.path}",
+              f"expected socket: {safe_text(state.backend.path)}",
               shell.tango.attr("muted"))
     for offset, message in enumerate((state.note, state.backend.error)):
         if message:
-            shell.put(surface, body.top + 7 + offset, body.left, message,
+            shell.put(surface, body.top + 7 + offset, body.left, safe_text(message),
                       shell.tango.attr("alert"))
 
 
@@ -562,11 +684,18 @@ def _typed(key: int, state: State) -> bool:
         state.prompt = None
     elif key in (ord("\n"), ord("\r")):
         entry, state.prompt = state.prompt or "", None
-        state.add_path(entry)
+        if state.prompt_kind == "add":
+            state.add_path(entry)
+        else:
+            state.open_source(state.prompt_kind, entry)
     elif key in keymap.BACKSPACE:
         state.prompt = (state.prompt or "")[:-1]
     elif keymap.is_text(key):
-        state.prompt = (state.prompt or "") + chr(key)
+        candidate = (state.prompt or "") + chr(key)
+        if len(candidate.encode("utf-8")) < 4096:
+            state.prompt = candidate
+        else:
+            state.message = "path is too long"
     return True
 
 
@@ -594,7 +723,7 @@ def handle(key: int, state: State) -> bool:
         if key == ord("s"):
             state.begin_setup()
         elif keymap.is_refresh(key):
-            state.refresh()
+            state._work(state.refresh)
         return True
     if key == ord("\t"):
         state.section = (state.section + 1) % len(SECTIONS)
@@ -622,17 +751,16 @@ def handle(key: int, state: State) -> bool:
         state.nudge_volume(-VOLUME_STEP)
     elif key == ord("s"):
         state.send("shuffle")
-        state.message = ("shuffle on" if state.status.get("shuffle")
-                         else "shuffle off")
     elif key == ord("m"):
         state.send("repeat")
-        state.message = REPEAT_LABELS.get(state.repeat_mode(), "repeat")
     elif key == ord("a"):
-        state.prompt = ""
+        state.prompt = ""; state.prompt_kind = "add"
+    elif key == ord("o"):
+        state.prompt = ""; state.prompt_kind = "file"
+    elif key == ord("u"):
+        state.prompt = ""; state.prompt_kind = "encodec-unix"
     elif key == ord("c"):
         state.send("clear")
-        state.refresh()
-        state.message = "playlist cleared"
     elif (step := keymap.direction(key)) and state.section == 1:
         rows = state.view()
         state.selected = max(0, min(len(rows) - 1, state.selected + step))
@@ -642,7 +770,10 @@ def handle(key: int, state: State) -> bool:
             # The playlist index, not the row number on screen.
             state.send("play", index=rows[state.selected][0])
     elif keymap.is_refresh(key):
-        state.refresh()
+        if state.status.get("source_type") == "encodec-unix" and (state.status.get("reconnect_required") or state.status.get("ended")):
+            state.open_source("encodec-unix", state.status.get("file", ""))
+        else:
+            state._work(state.refresh)
     return True
 
 
@@ -654,15 +785,30 @@ def main(argv: list[str] | None = None) -> int:
         # here would make the name local to `main` and unbound at `app.run`.
         with open(path, "w", encoding="utf-8") as out:
             out.write(app.render_to_text(render, state) + "\n")
+        state.close()
         return 0
+
+    parser = argparse.ArgumentParser(description="Control the shared Kilix Amp player")
+    parser.add_argument("file", nargs="?", help="open a file with a protocol-2 backend")
+    parser.add_argument("--encodec-socket", help="open a framed EnCodec stream from a private Unix socket")
+    options = parser.parse_args(argv)
+    if options.file and options.encodec_socket:
+        parser.error("choose one file or live socket source")
+    source = None
+    if options.file or options.encodec_socket:
+        source = ("encodec-unix" if options.encodec_socket else "file",
+                  os.path.abspath(os.path.expanduser(options.encodec_socket or options.file)))
 
     # Opening the player is the request for a player: bring the backend up —
     # building it first if this machine never has — rather than making the
     # first thing on screen an instruction to.
-    if not state.backend.available():
-        state.begin_setup()
+    if source or not state.backend.available():
+        state.begin_setup(source)
 
-    return app.run(render, state, handle=handle, tick_ms=1000, help_key=False)
+    try:
+        return app.run(render, state, handle=handle, tick_ms=1000, help_key=False)
+    finally:
+        state.close()
 
 
 if __name__ == "__main__":

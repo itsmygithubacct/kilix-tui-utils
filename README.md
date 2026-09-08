@@ -32,7 +32,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-weather` | Forecast from Open-Meteo |
 | `kilix-cameras` | Camera views and stream profiles for kilix-rtsp — view a camera, mosaic a group, `n` writes a profile to `cameras.conf` |
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
-| `kilix-music` | Player driving kilix-amp over its control socket |
+| `kilix-music` | [File and live EnCodec player](tools/music/README.md) controlling the shared Amp backend |
 | `kilix-character-map` | Search Unicode names/codepoints and copy with OSC 52 |
 | `kilix-notepad` | Portable UTF-8 editor with atomic saves and guarded discard |
 | `kilix-find-files` | Bounded filename/glob search that does not follow directory symlinks |

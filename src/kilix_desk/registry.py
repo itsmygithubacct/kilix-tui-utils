@@ -81,7 +81,7 @@ PROGRAMS = (
     # wizard writes — read from the same folders `kilix-launcher` reads, so
     # a launcher made on any desktop is reachable from this one.
     Item("Launchers", submenu="launchers"),
-    Item("Music", command="kilix-music", sibling="music"),
+    Item("Music", command="kilix-music", sibling="music", verb="tab"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
     Item("Voice Studio", submenu="voice"),
