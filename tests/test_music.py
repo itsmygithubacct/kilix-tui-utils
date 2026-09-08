@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -149,8 +150,8 @@ class RestraintTests(unittest.TestCase):
             subprocess.Popen = original
         self.assertEqual(started, [])
 
-    def test_it_spawns_only_the_backend_and_the_kilix_installer(self):
-        """Read out of the source: two spawn sites, and both are known.
+    def test_it_spawns_only_the_backend_and_the_host_query_or_setup(self):
+        """Two sites: owned backend, and bounded host catalog query/setup.
 
         A front end that launched the player windowed, or that cloned kilix-amp
         itself instead of asking Kilix to, would stop being a client of one
@@ -179,7 +180,11 @@ class RestraintTests(unittest.TestCase):
             for node in ast.walk(tree) if isinstance(node, ast.List)
         ]
         self.assertIn(["--headless", "--socket"], literals)
-        self.assertIn(["amp", "--install-only"], literals)
+        words = [node.value for node in ast.walk(tree)
+                 if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        self.assertIn("install-kilix-amp.py", words)
+        self.assertIn("--resolve", words)
+        self.assertIn("--json", words)
         self.assertNotIn("git", [word for row in literals for word in row])
 
     def test_setup_runs_off_the_ui_thread(self):
@@ -199,6 +204,9 @@ class RestraintTests(unittest.TestCase):
                 state = music.State()
                 original = music.install_backend
                 music.install_backend = fake_install
+                selected = mock.patch.object(music, "backend_selection", return_value={
+                    "root": tmp, "executable": None})
+                selected.start()
                 try:
                     state.begin_setup()
                     # Wait for the worker rather than assuming it has been
@@ -217,37 +225,22 @@ class RestraintTests(unittest.TestCase):
                             break
                         time.sleep(0.05)
                     music.install_backend = original
+                    selected.stop()
         self.assertFalse(state.busy())
         self.assertEqual(state.phase, "")
         self.assertIn("could not install", state.note)
 
     def test_install_asks_kilix_rather_than_cloning(self):
-        seen = []
-
-        class _Result:
-            returncode = 0
-
-            def poll(self):
-                return 0
-
-        original = subprocess.Popen
-        subprocess.Popen = lambda argv, **k: (seen.append(argv), _Result())[1]
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                launcher = os.path.join(tmp, "kilix")
-                with open(launcher, "w") as handle:
-                    handle.write("#!/bin/sh\n")
-                os.chmod(launcher, 0o755)
-                with _environment(PATH=tmp, KILIX_AMP=""):
-                    music.install_backend()
-        finally:
-            subprocess.Popen = original
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0][1:], ["amp", "--install-only"])
+        with mock.patch.object(music, "_host_selection", return_value={
+                "executable": "/selected/amp"}) as selected:
+            self.assertTrue(music.install_backend(root="/selected"))
+        selected.assert_called_once_with(install=True, timeout=music.INSTALL_TIMEOUT,
+                                         cancelled=None, root="/selected")
 
     def test_install_without_a_kilix_command_fails_quietly(self):
         with tempfile.TemporaryDirectory() as tmp:
             with _environment(PATH=tmp,
+                              KILIX_HOME=os.path.join(tmp, "absent-host"),
                               GPU_TERMINAL_SOURCE_HOME=tmp,
                               KILIX_AMP=os.path.join(tmp, "nothing-here")):
                 if music.kilix_launcher():

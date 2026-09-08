@@ -15,7 +15,8 @@ that reads as a hang.
 from __future__ import annotations
 
 import argparse
-import shutil
+import json
+import selectors
 import signal
 import subprocess
 import threading
@@ -28,7 +29,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "src"))
 
-from kilix_desk import sources  # noqa: E402
+from kilix_desk import registry  # noqa: E402
 from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
 from kilix_tui.music_protocol import MusicControl, PROTOCOL_VERSION, control_parent  # noqa: E402
 
@@ -38,6 +39,7 @@ START_TIMEOUT = 5.0
 # A first install clones and compiles kilix-amp. This is an upper bound on a
 # slow machine, not an expected wait; it runs off the UI thread either way.
 INSTALL_TIMEOUT = 900.0
+QUERY_TIMEOUT = 5.0
 
 
 def socket_path() -> str:
@@ -65,86 +67,153 @@ def clock(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def _storage_home() -> str:
-    """Kilix's writable root, resolved the way Kilix itself resolves it."""
-    base = os.environ.get("GPU_TERMINAL_HOME") or os.path.expanduser(
-        "~/.local/gpu_terminal")
-    return os.environ.get("KILIX_STORAGE_HOME") or os.path.join(base, "kilix")
+def kilix_launcher() -> str:
+    """Use the shared selected-host resolver, never an Amp PATH lookup."""
+    explicit = os.environ.get("KILIX_HOME")
+    if explicit is not None:
+        if not os.path.isabs(explicit):
+            return ""
+        path = os.path.join(explicit, "kilix")
+        return path if os.path.isfile(path) and os.access(path, os.X_OK) else ""
+    command = registry.kilix_command()
+    return command[0] if command else ""
+
+
+def _root(root):
+    if root is None:
+        return None
+    if not isinstance(root, str) or not os.path.isabs(root) or "\0" in root:
+        raise ValueError("Music content root must be an absolute path")
+    return os.path.normpath(root)
+
+
+def _launch_root():
+    root = os.environ.get("KILIX_CONTENT_ROOT")
+    if root is None and os.environ.get("KILIX95_HOME"):
+        raise ValueError("the embedding desktop must pass its actual KILIX_CONTENT_ROOT")
+    return _root(root)
+
+
+def _host_selection(*, install=False, timeout=QUERY_TIMEOUT, cancelled=None, root=None):
+    """One bounded owned host query/setup; all catalog decisions stay there."""
+    maximum = INSTALL_TIMEOUT if install else QUERY_TIMEOUT
+    if type(timeout) not in (int, float) or not 0 < timeout <= maximum:
+        raise ValueError("invalid player setup/query deadline")
+    deadline = time.monotonic() + timeout
+    if cancelled and cancelled.is_set():
+        raise ValueError("player setup/query canceled")
+    root = _root(root)
+    launcher = kilix_launcher()
+    helper = os.path.join(os.path.dirname(os.path.realpath(launcher)),
+                          "scripts", "install-kilix-amp.py") if launcher else ""
+    if not helper or not os.path.isfile(helper):
+        raise ValueError("selected Kilix host lacks the Amp catalog query; update the host")
+    command = [sys.executable, "-I", "-B", helper, "--json" if install else "--resolve"]
+    if root is not None:
+        command.extend(["--content-root", root])
+    process = None
+    output, diagnostic = bytearray(), bytearray()
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+        with selectors.DefaultSelector() as poller:
+            for stream in (process.stdout, process.stderr):
+                os.set_blocking(stream.fileno(), False)
+                poller.register(stream, selectors.EVENT_READ)
+            while poller.get_map() or process.poll() is None:
+                if (cancelled and cancelled.is_set()) or time.monotonic() >= deadline:
+                    raise ValueError("player setup/query canceled or deadline exceeded")
+                for key, _ in poller.select(min(.05, max(0, deadline-time.monotonic()))):
+                    block = os.read(key.fd, 4096)
+                    if not block:
+                        poller.unregister(key.fileobj)
+                        continue
+                    if key.fileobj is process.stdout:
+                        output.extend(block)
+                        if len(output) > 32768:
+                            raise ValueError("host player selection exceeds its bound")
+                    else:
+                        diagnostic.extend(block)
+                        del diagnostic[:-8192]
+        if (cancelled and cancelled.is_set()) or time.monotonic() >= deadline:
+            raise ValueError("player setup/query canceled or deadline exceeded")
+        if process.returncode != 0:
+            detail = diagnostic.decode("utf-8", errors="replace").strip()
+            raise ValueError(detail or "selected host refused player setup/query")
+        try:
+            result = json.loads(output)
+        except (RecursionError, UnicodeDecodeError) as failure:
+            raise ValueError("malformed host player selection") from failure
+        if (not isinstance(result, dict) or result.get("id") != "kilix-amp"
+                or _root(result.get("root")) != result.get("root")
+                or result.get("root") is None
+                or (root is not None and result["root"] != root)
+                or not isinstance(result.get("ref"), str) or len(result["ref"]) != 40
+                or any(c not in "0123456789abcdef" for c in result["ref"])
+                or not isinstance(result.get("build"), list)
+                or not all(isinstance(item, str) for item in result["build"])):
+            raise ValueError("host player selection does not match the requested catalog/root")
+        executable = result.get("executable")
+        if executable is not None and (not isinstance(executable, str)
+                or not os.path.isabs(executable) or not os.path.isfile(executable)
+                or not os.access(executable, os.X_OK)):
+            raise ValueError("selected catalog player is not executable")
+        if (cancelled and cancelled.is_set()) or time.monotonic() >= deadline:
+            raise ValueError("player setup/query canceled or deadline exceeded")
+        return result
+    finally:
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    # The host supervisor reaps Content's separate build
+                    # sessions before exiting. A cancel ACK is not cleanup.
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=1)
+                        raise ValueError("player setup cleanup was not confirmed")
+            finally:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+
+
+def backend_selection(timeout=QUERY_TIMEOUT, cancelled=None, root=None):
+    root = _root(root)
+    override = os.environ.get("KILIX_AMP", "")
+    if override:
+        if cancelled and cancelled.is_set():
+            raise ValueError("player startup canceled")
+        executable = os.path.abspath(os.path.expanduser(override))
+        if not os.path.isfile(executable) or not os.access(executable, os.X_OK):
+            raise ValueError("explicit KILIX_AMP is not built or executable")
+        return {"executable": executable, "root": root, "override": True}
+    return _host_selection(timeout=timeout, cancelled=cancelled, root=root)
 
 
 def backend_executable() -> str:
-    """The kilix-amp binary, or "" when it is not built on this machine.
-
-    Kilix 95 installs catalog apps under its own data directory, and a
-    development checkout has it built in place; neither is on PATH.
-    """
-    override = os.environ.get("KILIX_AMP", "")
-    if override:
-        return override if os.access(override, os.X_OK) else ""
-    found = shutil.which("kilix-amp")
-    if found:
-        return found
-    data = os.environ.get("KILIX_DATA_HOME") or os.path.join(
-        _storage_home(), "data")
-    candidates = (
-        os.path.join(data, "desktop-apps", "kilix-amp", "kilix-amp"),
-        os.path.join(sources.component_dir("kilix-apps/kilix-amp"),
-                     "kilix-amp"),
-    )
-    for candidate in candidates:
-        if os.access(candidate, os.X_OK):
-            return candidate
-    return ""
-
-
-def kilix_launcher() -> str:
-    """The `kilix` command, or "" when this is not running under Kilix."""
-    found = shutil.which("kilix")
-    if found:
-        return found
-    candidate = os.path.join(sources.component_dir("kilix"), "kilix")
-    return candidate if os.access(candidate, os.X_OK) else ""
-
-
-def install_backend(timeout: float = INSTALL_TIMEOUT, cancelled: threading.Event | None = None) -> bool:
-    """Build the pinned Media Player, through Kilix rather than around it.
-
-    Kilix owns the content catalog that pins kilix-amp and the installer that
-    verifies and builds it. Cloning it from here would mean a second, unpinned
-    copy of that decision.
-    """
-    if type(timeout) not in (int, float) or not 0 < timeout <= INSTALL_TIMEOUT:
-        return False
-    launcher = kilix_launcher()
-    if not launcher or (cancelled and cancelled.is_set()):
-        return False
+    """Read-only catalog lookup for explicit callers, never for rendering."""
     try:
-        process = subprocess.Popen(
-            [launcher, "amp", "--install-only"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        deadline = time.monotonic() + timeout
-        while process.poll() is None:
-            if time.monotonic() >= deadline or (cancelled and cancelled.is_set()):
-                # The unreaped session leader pins this owned process-group ID.
-                try:
-                    if os.getpgid(process.pid) == process.pid:
-                        os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=5)
-                return False
-            if cancelled:
-                cancelled.wait(.05)
-            else:
-                time.sleep(.05)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return process.returncode == 0 and bool(backend_executable())
+        return backend_selection(root=_launch_root())["executable"] or ""
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return ""
 
+
+def install_backend(timeout: float = INSTALL_TIMEOUT, cancelled: threading.Event | None = None,
+                    *, root=None) -> bool:
+    """Explicit cancellable setup through the same host catalog and root."""
+    try:
+        root = _launch_root() if root is None else _root(root)
+        return bool(_host_selection(install=True, timeout=timeout, cancelled=cancelled,
+                                    root=root)["executable"])
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
 
 class Backend(MusicControl):
     """An authenticated local client, owning only a backend it starts itself."""
@@ -152,9 +221,15 @@ class Backend(MusicControl):
     def __init__(self, path: str | None = None) -> None:
         super().__init__(path or socket_path())
         self._owned: subprocess.Popen | None = None
+        self.selection = {}
 
     def installed(self) -> bool:
-        return bool(backend_executable())
+        # Rendering reads only the last explicit worker lookup.
+        return bool(self.selection.get("executable"))
+
+    def select(self, *, timeout=QUERY_TIMEOUT, cancelled=None, root=None):
+        self.selection = backend_selection(timeout, cancelled, root)
+        return self.selection
 
     def start(self, timeout: float = START_TIMEOUT) -> bool:
         if type(timeout) not in (float, int) or not 0 < timeout <= START_TIMEOUT:
@@ -164,9 +239,16 @@ class Backend(MusicControl):
             return False
         if os.path.lexists(self.path):
             return self.negotiate(timeout=timeout)
-        executable = backend_executable()
+        deadline = time.monotonic() + timeout
+        try:
+            root = self.selection["root"] if "root" in self.selection else _launch_root()
+            selected = self.select(timeout=timeout, cancelled=self._closed, root=root)
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as failure:
+            self.error = str(failure)
+            return False
+        executable = selected["executable"]
         if not executable:
-            self.error = "kilix-amp is not built on this machine"
+            self.error = "the selected catalog kilix-amp is not built; request setup"
             return False
         try:
             with control_parent(self.path, create=True):
@@ -174,19 +256,24 @@ class Backend(MusicControl):
         except (OSError, ValueError) as failure:
             self.error = f"cannot create a private player endpoint: {failure}"
             return False
+        if self._closed.is_set() or time.monotonic() >= deadline:
+            self.error = "player startup canceled or deadline exceeded"
+            return False
         command = [executable, "--headless", "--socket", self.path]
         music = os.path.expanduser("~/Music")
         if os.path.isdir(music):
             command.append(music)
         try:
+            environment = dict(os.environ)
+            if selected["root"] is not None:
+                environment["KILIX_CONTENT_ROOT"] = selected["root"]
             self._owned = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True)
+                stderr=subprocess.DEVNULL, start_new_session=True, env=environment)
         except OSError as failure:
             self.error = f"could not start kilix-amp: {failure}"
             return False
         child = self._owned
-        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not self._closed.is_set():
             if child.poll() is not None:
                 break
@@ -402,12 +489,15 @@ class State:
 
     def _setup(self, source: tuple[str, str] | None = None) -> None:
         try:
-            if not self.backend.available() and not backend_executable():
-                self.phase = "installing"
-                if not install_backend(cancelled=self._closing):
-                    self.note = ("could not install the Media Player — "
-                                 "run 'kilix amp' to see why")
-                    return
+            if not os.path.lexists(self.backend.path):
+                self.phase = "checking"
+                selected = self.backend.select(cancelled=self._closing,
+                    root=_launch_root())
+                if not selected["executable"]:
+                    self.phase = "installing"
+                    if not install_backend(cancelled=self._closing, root=selected["root"]):
+                        self.note = "could not install the selected Media Player; check host setup prerequisites"
+                        return
             self.phase = "starting"
             if not self.backend.start():
                 self.note = self.backend.error
@@ -419,6 +509,8 @@ class State:
                 if not reply or reply.get("ok") is False:
                     self.note = self.backend.error
             self.refresh()
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as failure:
+            self.note = safe_text(str(failure))
         finally:
             self.phase = ""
 
@@ -430,6 +522,7 @@ class State:
 
 
 WAITING = {
+    "checking": "checking the selected Media Player",
     "installing": "building the Media Player — this takes a few minutes",
     "starting": "starting kilix-amp…",
 }
@@ -660,15 +753,9 @@ def _draw_offline(surface, state: State, body) -> None:
               "no backend is listening yet.")
     if state.backend.installed():
         shell.put(surface, body.top + 3, body.left, "Press s to start one.")
-    elif kilix_launcher():
-        shell.put(surface, body.top + 3, body.left,
-                  "Press s to build the pinned Media Player and start it.")
     else:
         shell.put(surface, body.top + 3, body.left,
-                  "kilix-amp is not built, and no kilix command was found",
-                  shell.tango.attr("alert"))
-        shell.put(surface, body.top + 4, body.left,
-                  "to build it with. Run 'kilix amp' from a Kilix checkout.")
+                  "Press s to prepare the selected Media Player and start it.")
     shell.put(surface, body.top + 6, body.left,
               f"expected socket: {safe_text(state.backend.path)}",
               shell.tango.attr("muted"))

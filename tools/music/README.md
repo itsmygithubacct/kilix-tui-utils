@@ -5,7 +5,8 @@ Kilix tab, using the ordinary terminal handoff when tabs are unavailable.
 It attaches to an existing healthy user backend, or starts a headless backend
 when none exists. If Amp is absent, the existing pinned Kilix installer runs
 off the UI thread. Closing Music stops only a backend that Music started;
-an attached player keeps running.
+an attached player keeps running. State construction, imports and rendering
+perform no player lookup, setup or process launch.
 
 ```sh
 kilix-music                         # current player and playlist
@@ -53,8 +54,34 @@ removed by the TUI.
 
 The default socket is `$XDG_RUNTIME_DIR/kilix-amp.sock`, falling back to
 `~/.local/gpu_terminal/kilix/session/kilix-amp.sock`. `KILIX_AMP_SOCKET` selects
-another private endpoint. `KILIX_AMP` selects the executable for development;
-normal launches resolve the installed, Kilix-pinned player.
+another private endpoint. Normal owned startup asks the selected host's
+`scripts/install-kilix-amp.py --resolve` for the packaged catalog executable.
+It does not use an Amp found on PATH or in a development checkout. A missing
+host query API refuses with an update/setup message.
+
+The launching host or embedding desktop passes its actual application store
+in `KILIX_CONTENT_ROOT`. Music uses that same normalized absolute root for
+readiness, explicit setup and the owned backend environment. A bare standalone
+launch uses the host's ordinary storage derivation; a declared95 embedding
+without its root refuses. For a direct installed `kilix-tui` launch, the caller
+sets that environment variable. For the host fallback it must use
+`kilix kilix-tui --content-root /absolute/apps` (or `kilix tui` with the same
+option immediately after the alias). The host validates and normalizes that
+explicit path; an ordinary host launch ignores inherited `KILIX_CONTENT_ROOT`
+and uses its actual host store. The read-only query does not create a missing root,
+install/build an application, or write model receipts. Setup uses the same
+host installer in an owned supervised process and respects its auto-install
+setting. Cancellation/deadline waits for its owned cleanup; it never installs
+system/native prerequisites or accepts licenses. Each query is bounded by five
+seconds and setup by fifteen minutes, with cancellation support and a separate
+bounded allowance to finish owned teardown after interruption.
+
+`KILIX_AMP` is an explicit trusted operator executable override. It bypasses
+catalog selection and provides no catalog, enabled-codec or model-admission
+guarantee. An invalid override refuses instead of falling through to another
+binary. Attached existing backends retain their identity/negotiation contract.
+Content's general same-ref build-flag cache behavior is unchanged; final Amp
+source/build selection belongs to the release catalog.
 
 ```sh
 python3 tests/run.py music

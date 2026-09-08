@@ -216,7 +216,7 @@ class OwnedProcessTests(unittest.TestCase):
             backend = music.Backend(str(root / "control"))
             unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
             try:
-                with patch.object(music, "backend_executable", return_value=str(executable)):
+                with patch.object(music, "backend_selection", return_value={"executable": str(executable), "root": None}):
                     self.assertTrue(backend.start())
                 child = backend._owned
                 self.assertEqual(backend.identity[-1], child.pid)
@@ -263,7 +263,7 @@ class OwnedProcessTests(unittest.TestCase):
             def capture(*args, **kwargs):
                 spawned.append(popen(*args, **kwargs))
                 return spawned[-1]
-            with patch.object(music, "backend_executable", return_value=str(executable)), \
+            with patch.object(music, "backend_selection", return_value={"executable": str(executable), "root": None}), \
                  patch.object(music.subprocess, "Popen", side_effect=capture):
                 self.assertFalse(backend.start(timeout=.1))
             self.assertEqual(len(spawned), 1)
@@ -280,7 +280,7 @@ class OwnedProcessTests(unittest.TestCase):
             root = Path(tmp)
             executable = backend_fixture(root)
             backend = music.Backend(str(root / "control"))
-            with patch.object(music, "backend_executable", return_value=str(executable)):
+            with patch.object(music, "backend_selection", return_value={"executable": str(executable), "root": None}):
                 self.assertTrue(backend.start())
             child = backend._owned
             os.unlink(backend.path)
@@ -315,9 +315,13 @@ class OwnedProcessTests(unittest.TestCase):
             root = Path(tmp)
             launcher = root / "kilix"
             pid_file = root / "pid"
-            launcher.write_text("#!" + sys.executable + "\nimport os, time\n"
+            scripts = root / "scripts"
+            scripts.mkdir()
+            helper = scripts / "install-kilix-amp.py"
+            helper.write_text("import os, time\n"
                                 + f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
                                 + "time.sleep(30)\n")
+            launcher.write_text("#!/bin/sh\nexit 1\n")
             launcher.chmod(0o700)
             cancelled = threading.Event()
             result = []
