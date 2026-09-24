@@ -12,7 +12,7 @@ available with `--graphics`:
 - history graphs, compact-pane rendering, ANSI fallback, JSON, and one-shot CLI
 
 The graphical path is built from the shared
-[`soft-raster-py`](https://github.com/itsmygithubacct/soft-raster-py),
+[`soft-raster` Python binding](https://github.com/itsmygithubacct/soft-raster/tree/main/python),
 [`soft-raster`](https://github.com/itsmygithubacct/soft-raster), and
 [`kitty-frame-presenter`](https://github.com/itsmygithubacct/kitty-frame-presenter)
 libraries used by other Kilix graphical applications.
@@ -64,7 +64,7 @@ The generated command is a small launcher back into
 `kilix-tui-utils/tools/memory`, so this checkout remains the source of truth.
 The graphical dashboard discovers installed libraries first, then sibling
 checkouts at `../../kilix-modules/kitty-frame-presenter`,
-`../../kilix-modules/soft-raster-py`, and
+`../../kilix-modules/soft-raster/python`, and
 `../../kilix-modules/soft-raster`. Run the
 complete repository test suite with
 `python3 tests/run.py`, or only this tool's suite with
@@ -116,6 +116,6 @@ machine, and the direct reader remains available without its daemon.
 
 ## License
 
-MIT. The optional graphical path uses kitty-frame-presenter, soft-raster-py,
-and soft-raster. See
+MIT. The optional graphical path uses kitty-frame-presenter and the Python and
+native packages maintained in soft-raster. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

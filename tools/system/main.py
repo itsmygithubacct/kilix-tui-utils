@@ -6,8 +6,11 @@ the two tools blurring into each other.
 """
 from __future__ import annotations
 
+import json
 import platform
 import socket
+import time
+from datetime import datetime, timezone
 
 import os
 import sys
@@ -59,6 +62,66 @@ def facts() -> list[tuple[str, str]]:
     return rows
 
 
+def health_snapshot(top_n: int = 10, sample_seconds: float = 0.1) -> dict:
+    """Collect one dependency-free, machine-readable system health report."""
+    previous = proc.cpu_sample()
+    if sample_seconds > 0:
+        time.sleep(sample_seconds)
+    current = proc.cpu_sample()
+    memory = proc.meminfo()
+    total_memory = memory.get("MemTotal", 0)
+    available_memory = memory.get("MemAvailable", memory.get("MemFree", 0))
+    used_memory = max(0, total_memory - available_memory)
+    swap_total = memory.get("SwapTotal", 0)
+    swap_free = memory.get("SwapFree", 0)
+    swap_used = max(0, swap_total - swap_free)
+
+    disks = []
+    for device, mountpoint, fstype in proc.mounts():
+        total, used, free = proc.disk_usage(mountpoint)
+        if total:
+            disks.append({
+                "mountpoint": mountpoint, "device": device, "fstype": fstype,
+                "total": total, "used": used, "free": free,
+                "percent": round(100.0 * used / total, 1),
+            })
+
+    processes = proc.processes(limit=top_n, key="cpu_time")
+    for process in processes:
+        rss = int(process["rss"])
+        process["memory_percent"] = round(
+            100.0 * rss / total_memory, 1) if total_memory else 0.0
+
+    timestamp = time.time()
+    loads = proc.loadavg()
+    return {
+        "schema_version": 1,
+        "timestamp": timestamp,
+        "timestamp_iso": datetime.fromtimestamp(
+            timestamp, timezone.utc).isoformat(),
+        "cpu": {
+            "percent_per_core": proc.per_core_usage(previous, current),
+            "percent_total": proc.usage_since(previous, current),
+            "load_avg": list(loads),
+            "core_count_logical": os.cpu_count() or 0,
+        },
+        "memory": {
+            "total": total_memory,
+            "available": available_memory,
+            "used": used_memory,
+            "percent": round(100.0 * used_memory / total_memory, 1)
+            if total_memory else 0.0,
+            "swap_total": swap_total,
+            "swap_used": swap_used,
+            "swap_percent": round(100.0 * swap_used / swap_total, 1)
+            if swap_total else 0.0,
+        },
+        "disks": disks,
+        "network": proc.network_io(),
+        "top_processes": processes,
+    }
+
+
 def render(surface, state) -> None:
     host = next((value for label, value in state if label == "host"), "")
     body = shell.draw(
@@ -78,6 +141,21 @@ def render(surface, state) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "--json" in argv or "-j" in argv:
+        top_n = 10
+        if "--top" in argv:
+            index = argv.index("--top")
+            try:
+                top_n = int(argv[index + 1])
+            except (IndexError, ValueError):
+                print("kilix-system: --top requires an integer", file=sys.stderr)
+                return 2
+            if not 1 <= top_n <= 50:
+                print("kilix-system: --top must be between 1 and 50",
+                      file=sys.stderr)
+                return 2
+        print(json.dumps(health_snapshot(top_n), indent=2, sort_keys=True))
+        return 0
     state = facts()
     if path := app.screenshot_argv(argv):
         with open(path, "w", encoding="utf-8") as handle:

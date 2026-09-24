@@ -75,5 +75,31 @@ def tail_records(path: str, limit: int | None = 200) -> Iterator[dict]:
             return
 
 
+def tail_records_matching(
+    path: str,
+    needles: tuple[bytes, ...],
+    limit: int | None = None,
+) -> Iterator[dict]:
+    """Yield newest records whose raw line contains one inexpensive marker.
+
+    Agent logs can contain multi-megabyte tool results. A caller interested in
+    turn boundaries should not UTF-8 decode and JSON-parse those payloads just
+    to learn that their outer record type is irrelevant. The byte prefilter is
+    deliberately only an optimization: a false positive is parsed normally,
+    while a caller supplies every spelling it considers relevant.
+    """
+    seen = 0
+    for raw in reverse_lines(path):
+        if needles and not any(needle in raw for needle in needles):
+            continue
+        record = load(raw)
+        if record is None:
+            continue
+        yield record
+        seen += 1
+        if limit is not None and seen >= limit:
+            return
+
+
 def condense(text: str, limit: int = 160) -> str:
     return " ".join(str(text).split())[:limit]

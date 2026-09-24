@@ -26,9 +26,10 @@ used under the MIT License:
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
 
-The optional pixel dashboard also uses
-[`soft-raster-py`](https://github.com/itsmygithubacct/soft-raster-py) and
-[`soft-raster`](https://github.com/itsmygithubacct/soft-raster), each under the
-MIT License. These dependencies are not vendored here; their complete license
-texts remain in their respective projects. `soft-raster` includes an embedded
-bitmap font whose provenance and redistribution notice are retained there.
+The optional pixel dashboard also uses the Python binding maintained under
+[`soft-raster/python`](https://github.com/itsmygithubacct/soft-raster/tree/main/python)
+and [`soft-raster`](https://github.com/itsmygithubacct/soft-raster), each under
+the MIT License. These dependencies are not vendored here; their complete
+license texts remain in the maintained `soft-raster` repository.
+`soft-raster` includes an embedded bitmap font whose provenance and
+redistribution notice are retained there.

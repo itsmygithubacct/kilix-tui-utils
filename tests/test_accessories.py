@@ -108,7 +108,7 @@ class RuntimeTests(unittest.TestCase):
                 "kilix-system-center", "kilix-settings-center",
                 "kilix-software-center", "kilix-session-center",
                 "kilix-voice-studio", "kilix-character-map",
-                "kilix-find-files", "kilix-notepad",
+                "kilix-find-files", "kilix-notepad", "kilix-panes",
             }
             self.assertTrue(expected <= {path.name for path in (prefix / "bin").iterdir()})
             launcher = (prefix / "bin" / "kilix-system-center").read_text()

@@ -9,6 +9,8 @@ suites because their renderer and event-loop contracts are deliberately richer.
 """
 import glob
 import importlib.util
+import io
+import json
 import os
 import re
 import shutil
@@ -108,6 +110,34 @@ class ToolContractTests(unittest.TestCase):
                     state.entry = ""
                 self.assertFalse(module.handle(ord("q"), state))
 
+    def test_volume_supports_compact_settings_and_mouse_slider(self):
+        module = load("volume")
+        state = object.__new__(module.State)
+        state.control = "pactl"
+        state.mode = "compact"
+        state.selected = 0
+        state.sinks = [{
+            "index": "1", "name": "sink", "description": "Speakers",
+            "volume": 50, "muted": False, "default": True,
+        }]
+        state.hits = {}
+        frame = app.render_to_text(module.render, state)
+        self.assertIn("Quick adjustment", frame)
+        self.assertIn("[ ] Mute", frame)
+        row, left, width, _index = state.hits["slider"]
+        with mock.patch.object(module.curses, "getmouse", return_value=(
+                0, left + width - 1, row, 0,
+                getattr(module.curses, "BUTTON1_CLICKED", 4))), \
+                mock.patch.object(module, "set_volume") as set_level, \
+                mock.patch.object(state, "refresh"):
+            module.mouse(state)
+        set_level.assert_called_once_with("sink", 100)
+
+        state.mode = "settings"
+        frame = app.render_to_text(module.render, state)
+        self.assertIn("Volume settings", frame)
+        self.assertIn("Open full volume control", frame)
+
 
 class SafetyTests(unittest.TestCase):
     """Properties that make a tool safe to put one keystroke from a menu."""
@@ -184,6 +214,37 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("api.open-meteo.com", source)
         for forbidden in ("api_key", "apikey", "ipinfo", "ip-api", "geolocate"):
             self.assertNotIn(forbidden, source.lower())
+
+    def test_system_json_report_has_all_health_sections(self):
+        module = load("system")
+        with mock.patch.object(module.time, "sleep"):
+            report = module.health_snapshot(top_n=3)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(
+            {"cpu", "memory", "disks", "network", "top_processes"},
+            {key for key in report if key in {
+                "cpu", "memory", "disks", "network", "top_processes",
+            }},
+        )
+        self.assertLessEqual(len(report["top_processes"]), 3)
+        self.assertTrue(0.0 <= report["cpu"]["percent_total"] <= 100.0)
+        self.assertTrue(0.0 <= report["memory"]["percent"] <= 100.0)
+
+    def test_system_json_cli_emits_valid_json(self):
+        module = load("system")
+        with mock.patch.object(module, "health_snapshot", return_value={"ok": True}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(module.main(["--json", "--top", "5"]), 0)
+        self.assertEqual(json.loads(output.getvalue()), {"ok": True})
+
+    def test_network_io_aggregates_interfaces(self):
+        fixture = """Inter-| Receive | Transmit\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n  lo: 10 2 1 0 0 0 0 0 20 3 4 0 0 0 0 0\neth0: 100 5 0 0 0 0 0 0 200 6 1 0 0 0 0 0\n"""
+        with mock.patch.object(proc, "_read", return_value=fixture):
+            self.assertEqual(proc.network_io(), {
+                "bytes_sent": 220, "bytes_recv": 110,
+                "packets_sent": 9, "packets_recv": 7,
+                "errin": 1, "errout": 5,
+            })
 
     def test_control_tui_confirms_before_power_and_autologin(self):
         module = load("plebian_control")

@@ -16,8 +16,9 @@ visibility as CPU, GPU, NVMe, PCH, and Wi-Fi sensors. It is a monitor only: it
 never kills jobs, changes fan policy, throttles the CPU, or powers off the
 computer.
 
-The optional pixel view uses `soft-raster-py`, the Python binding for Kilix's
-native `soft-raster` graphics library, and hands RGB frames to
+The optional pixel view uses the Python binding maintained under
+[`soft-raster/python`](https://github.com/itsmygithubacct/soft-raster/tree/main/python)
+for Kilix's native `soft-raster` graphics library, and hands RGB frames to
 `kitty-frame-presenter`. Unchanged frames are skipped and changing frames use
 bounded rectangular updates. The default text TUI has no graphical dependency.
 
@@ -29,8 +30,9 @@ python3 tools/temps/main.py
 ```
 
 Python 3.10 or newer is required. The pixel dashboard needs sibling checkouts
-of `soft-raster-py`, `soft-raster`, and `kitty-frame-presenter` when run from
-source; it has no Pillow dependency. Text, JSON, list, and snapshot modes remain
+of `soft-raster` (including its `python/` binding) and
+`kitty-frame-presenter` when run from source; it has no Pillow dependency.
+Text, JSON, list, and snapshot modes remain
 usable if the graphical libraries are unavailable. `lm-sensors` is useful for
 the separate `sensors` command but is not required by this dashboard; Kilix
 Temps reads `/sys/class/thermal` and `/sys/class/hwmon` directly.
@@ -46,7 +48,7 @@ The generated command is a small launcher back into
 `kilix-tui-utils/tools/temps`, so this checkout remains the source of truth.
 The pixel dashboard discovers installed graphical libraries first, then sibling
 checkouts at `../../kilix-modules/kitty-frame-presenter`,
-`../../kilix-modules/soft-raster-py`, and
+`../../kilix-modules/soft-raster/python`, and
 `../../kilix-modules/soft-raster`. The
 installed command can be launched from any Kilix pane. Run the complete
 repository test suite with `python3 tests/run.py`, or only this tool's suite

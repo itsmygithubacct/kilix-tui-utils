@@ -392,9 +392,16 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(getattr(first.func, "id", ""), "_kitten")
 
     def test_the_preview_never_reads_scrollback(self):
-        source = (ROOT / "src/kilix_tui/kitty_rc.py").read_text()
-        self.assertIn('"--extent", "screen"', source)
-        self.assertNotIn('"all"', source)
+        source = (ROOT / "tools/switcher/main.py").read_text()
+        start = source.index("def preview_text")
+        end = source.index("# ── drawing", start)
+        preview = source[start:end]
+        self.assertIn("kitty_rc.pane_text(", preview)
+        self.assertNotIn("scrollback=True", preview)
+        # The separate `kilix panes dump` CLI may explicitly request history;
+        # moving around the interactive tree still reads only visible text.
+        client = (ROOT / "src/kilix_tui/kitty_rc.py").read_text()
+        self.assertIn('["--extent", "screen"]', client)
 
 
 if __name__ == "__main__":
