@@ -3,9 +3,9 @@
 Three agents store conversations three different ways, so most of these build a
 small transcript in each layout and assert the recovery state read back out of
 it. The rest pin the properties that make this safe to put behind a menu: it
-never resumes a session another process still owns, it never pipes anything
-into a shell without a yes, and the install commands it would run are exactly
-the ones its vendors document.
+never resumes a session another process still owns, it never runs an
+installer without a yes, and the installer it would run is the pinned vendor
+script.
 """
 import ast
 from contextlib import redirect_stdout
@@ -417,19 +417,49 @@ class ResumeTests(unittest.TestCase):
 
 class ManagementTests(unittest.TestCase):
     def test_install_commands_match_the_vendor_documentation(self):
-        """Pinned so any change to what gets piped into a shell shows in a diff."""
+        """Pinned so a changed vendor script cannot run until the digest moves."""
         documented = {
-            "claude": ("curl -fsSL https://claude.ai/install.sh | bash",
+            "claude": ("https://claude.ai/install.sh",
+                       "3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944",
+                       "bash",
                        "https://code.claude.com/docs/en/quickstart"),
-            "codex": ("curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+            "codex": ("https://chatgpt.com/codex/install.sh",
+                      "150e3cf675682efeaac115aa3747add3f27887896d04ce6d0b56478d8b428bf6",
+                      "sh",
                       "https://developers.openai.com/codex/cli/"),
-            "kimi": ("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+            "kimi": ("https://code.kimi.com/kimi-code/install.sh",
+                     "270a86f2d2304529b6d8a3783fca9534874ebaeecb6cfcc1aebcdb6ce20ae1d7",
+                     "bash",
                      "https://moonshotai.github.io/kimi-code/"),
         }
         for item in providers.PROVIDERS:
-            command, source = documented[item.key]
-            self.assertEqual(item.install_shell, command)
+            url, digest, interpreter, source = documented[item.key]
+            self.assertEqual(item.install_url, url)
+            self.assertEqual(item.install_sha256, digest)
+            self.assertEqual(item.install_interpreter, interpreter)
             self.assertEqual(item.install_source, source)
+            self.assertNotIn("|", item.install_shell)
+
+    def test_install_runs_the_pinned_file_and_refuses_a_different_body(self):
+        item = providers.provider("claude")
+        calls = []
+
+        class Result:
+            returncode = 0
+
+        with mock.patch.object(manage, "fetch_pinned", return_value=b"#!/bin/bash\necho pinned\n"):
+            code = manage.run_install(
+                item,
+                runner=lambda argv, **kwargs: calls.append(list(argv)) or Result())
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0][0], "bash")
+        self.assertTrue(calls[0][1].endswith(".sh"))
+        self.assertNotIn("-c", calls[0])
+
+        with mock.patch.object(manage, "fetch_pinned", side_effect=RuntimeError("digest")):
+            with self.assertRaises(RuntimeError):
+                manage.run_install(item, runner=lambda *args, **kwargs: calls.append(["ran"]))
+        self.assertNotIn(["ran"], calls)
 
     def test_updates_delegate_to_each_agent_rather_than_reinstalling(self):
         for item in providers.PROVIDERS:

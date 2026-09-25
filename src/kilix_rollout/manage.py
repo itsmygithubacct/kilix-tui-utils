@@ -1,19 +1,22 @@
 """Install and update the coding agents themselves.
 
 A recovery tool is useless if the agent that owns the transcript is missing, so
-this offers the install — but an install here is a pipe from the network into a
-shell, which is the vendor's documented method and still the most consequential
-thing this tool can do. Every path therefore states the exact command and the
-page it came from, and nothing runs without an explicit yes.
+this offers the install. The vendor script is downloaded, checked against the
+sha256 on the provider, and only then executed as a file. Every path states
+the URL, the pin and the source page, and nothing runs without an explicit yes.
 
 Updates delegate to each agent's own updater rather than re-running the install
 script, so the agent stays in charge of how it upgrades itself.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
+import urllib.error
+import urllib.request
 
 from . import config
 from .providers import Provider
@@ -55,12 +58,43 @@ def _shell() -> str:
     return os.environ.get("SHELL") or "/bin/sh"
 
 
-def run_install(item: Provider, *, runner=subprocess.run) -> int:
-    """Run the vendor's documented install command. Confirm before calling."""
+def fetch_pinned(url: str, digest: str, *, timeout: float = 60) -> bytes:
+    """Download an installer and refuse it unless it matches digest."""
+    expected = digest.lower()
+    request = urllib.request.Request(url, headers={"User-Agent": "kilix-install"})
     try:
-        result = runner([_shell(), "-c", item.install_shell], check=False)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RuntimeError(f"could not run the installer: {error}") from error
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read()
+    except (OSError, urllib.error.URLError) as error:
+        raise RuntimeError(f"could not download {url}: {error}") from error
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"installer from {url} sha256 {actual} does not match pin {expected}")
+    return payload
+
+
+def run_install(item: Provider, *, runner=subprocess.run) -> int:
+    """Run the pinned vendor script. Confirm before calling."""
+    if item.install_interpreter not in {"bash", "sh"}:
+        raise RuntimeError(f"{item.label}: installer interpreter is not bash or sh")
+    payload = fetch_pinned(item.install_url, item.install_sha256)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f"kilix-{item.key}-install-", suffix=".sh", delete=False)
+    path = handle.name
+    try:
+        handle.write(payload)
+        handle.close()
+        os.chmod(path, 0o700)
+        try:
+            result = runner([item.install_interpreter, path], check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError(f"could not run the installer: {error}") from error
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
     return int(result.returncode)
 
 
