@@ -8,6 +8,8 @@ installer without a yes, and the installer it would run is the pinned vendor
 script.
 """
 import ast
+from dataclasses import replace
+import hashlib
 from contextlib import redirect_stdout
 import importlib.util
 import io
@@ -460,6 +462,27 @@ class ManagementTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 manage.run_install(item, runner=lambda *args, **kwargs: calls.append(["ran"]))
         self.assertNotIn(["ran"], calls)
+
+    def test_installer_bytes_must_match_the_pin_before_execution(self):
+        payload = b"#!/bin/sh\necho pinned\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "install.sh"
+            source.write_bytes(payload)
+            item = replace(providers.provider("codex"),
+                           install_url=source.as_uri(), install_sha256=digest)
+            executed = []
+
+            def run(argv, **kwargs):
+                executed.append(Path(argv[1]).read_bytes())
+                return mock.Mock(returncode=0)
+
+            self.assertEqual(manage.run_install(item, runner=run), 0)
+            self.assertEqual(executed, [payload])
+            source.write_bytes(payload + b"echo changed\n")
+            with self.assertRaisesRegex(RuntimeError, "does not match pin"):
+                manage.run_install(item, runner=run)
+            self.assertEqual(executed, [payload])
 
     def test_updates_delegate_to_each_agent_rather_than_reinstalling(self):
         for item in providers.PROVIDERS:
