@@ -25,8 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kilix_rollout import (  # noqa: E402
-    claude, codex, config, installer, kimi, launch, liveness, manage, menu,
-    pacing, providers,
+    claude, codex, config, grok, installer, kimi, launch, liveness, manage, menu,
+    omp, pacing, providers,
 )
 from kilix_rollout.model import Session  # noqa: E402
 
@@ -283,6 +283,96 @@ class KimiTests(unittest.TestCase):
                 handle.write(json.dumps({"sessionId": KIMI_ID,
                                          "sessionDir": "/nonexistent/session"}) + "\n")
             self.assertEqual(kimi.discover(root=temporary), [])
+
+
+class GrokTests(unittest.TestCase):
+    """Readable by key for kilix-needle's agents job: resume lists and the
+    working / waiting / idle a pane's live grok is in."""
+
+    def build(self, root, events, *, cwd="/tmp/grok project", sid="01a0-grok"):
+        from urllib.parse import quote
+        directory = os.path.join(root, "sessions", quote(cwd, safe=""), sid)
+        os.makedirs(directory)
+        write_lines(os.path.join(directory, "events.jsonl"), [{"type": e} for e in events])
+        write_lines(os.path.join(directory, "chat_history.jsonl"), [
+            {"type": "system", "content": "sys"},
+            {"type": "user", "content": [{"type": "text", "text": "<ctx>"}],
+             "synthetic_reason": "meta"},
+            {"type": "user", "content": [{"type": "text", "text": "fix the tests"}]}])
+        return directory
+
+    def test_turn_and_permission_events_decide_the_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            cases = {("turn_started", "turn_ended"): "idle",
+                     ("turn_ended", "turn_started", "tool_started"): "working",
+                     ("turn_started", "permission_requested"): "waiting",
+                     ("turn_started", "permission_requested", "permission_resolved"): "working",
+                     (): "unknown"}
+            for index, (events, want) in enumerate(cases.items()):
+                folder = self.build(root, list(events), sid=f"s{index}")
+                self.assertEqual(grok.activity(folder), want, events)
+
+    def test_discover_reads_cwd_title_and_liveness(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.build(root, ["turn_started"])
+            proc = os.path.join(root, "proc")
+            found = grok.discover(root=root, proc_root=proc)
+            self.assertEqual((found[0].cwd, found[0].title, found[0].state),
+                             ("/tmp/grok project", "fix the tests", "cut-off"))
+            os.makedirs(os.path.join(proc, "4242"))
+            with open(os.path.join(root, "active_sessions.json"), "w") as handle:
+                json.dump([{"session_id": "01a0-grok", "pid": 4242, "cwd": "/tmp/grok project"},
+                           {"session_id": "gone", "pid": 99999, "cwd": "/x"}], handle)
+            self.assertEqual(grok.active(root, proc_root=proc),
+                             {"01a0-grok": (4242, "/tmp/grok project")})
+            found = grok.discover(root=root, proc_root=proc)
+            self.assertEqual((found[0].state, found[0].pids, found[0].live_status),
+                             ("live", (4242,), "working"))
+
+    def test_resume_argv(self):
+        self.assertEqual(grok.resume_argv(sample("grok")), ["grok", "--resume", "abc123"])
+        self.assertEqual(grok.resume_argv(sample("grok"), yolo=True),
+                         ["grok", "--always-approve", "--resume", "abc123"])
+
+
+class OmpTests(unittest.TestCase):
+    def build(self, root, messages, *, cwd="/tmp/qwen", sid="01a0-omp", name="t_01a0-omp.jsonl"):
+        directory = os.path.join(root, "sessions", omp.folder_for(cwd))
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name)
+        write_lines(path, [{"type": "title", "title": "Check torch"},
+                           {"type": "session", "id": sid, "cwd": cwd},
+                           *[{"type": "message", "message": m} for m in messages]])
+        return path
+
+    def test_the_newest_message_decides_the_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            done = {"role": "assistant", "stopReason": "stop", "content": [{"type": "text"}]}
+            tool = {"role": "assistant", "stopReason": "toolUse", "content": [{"type": "toolCall"}]}
+            cases = [([{"role": "user"}, done], "idle"), ([{"role": "user"}], "working"),
+                     ([tool], "working"), ([tool, {"role": "toolResult"}], "working"), ([], "unknown")]
+            for index, (messages, want) in enumerate(cases):
+                path = self.build(root, messages, name=f"t{index}.jsonl", sid=f"s{index}")
+                self.assertEqual(omp.activity(path), want, messages)
+
+    def test_discover_and_the_newest_session_in_a_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.build(root, [{"role": "user"}])
+            found = omp.discover(root=root)
+            self.assertEqual((found[0].session_id, found[0].cwd, found[0].title, found[0].state),
+                             ("01a0-omp", "/tmp/qwen", "Check torch", "cut-off"))
+            self.assertEqual(omp.newest_in("/tmp/qwen", root=root).session_id, "01a0-omp")
+            self.assertIsNone(omp.newest_in("/tmp/qwen", root=root, after=found[0].updated + 60))
+            self.assertIsNone(omp.newest_in("/elsewhere", root=root))
+
+    def test_resume_argv(self):
+        self.assertEqual(omp.resume_argv(sample("omp"), yolo=True, model_name="qwen3.8-max"),
+                         ["omp", "--model", "qwen3.8-max", "--auto-approve", "--resume=abc123"])
+
+
+class ReadableOnlyByKeyTests(unittest.TestCase):
+    def test_grok_and_omp_are_not_installed_or_offered_by_the_menu(self):
+        self.assertEqual({p.key for p in providers.PROVIDERS}, {"claude", "codex", "kimi"})
 
 
 # ── resume commands and pacing ───────────────────────────────────────────────

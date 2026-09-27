@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from kilix_rollout import claude, codex, liveness
+from kilix_rollout import claude, codex, grok, liveness, omp
 from kilix_rollout.model import Session
 
 from . import kitty_rc
@@ -282,6 +282,10 @@ def _process_agent(process: kitty_rc.Process) -> str:
         return "claude"
     if "kimi" in names or "kimi-code" in names:
         return "kimi"
+    if "grok" in names:
+        return "grok"
+    if "omp" in names:
+        return "omp"
     return ""
 
 
@@ -460,6 +464,31 @@ class Inspector:
                     version=str(record.get("version") or ""),
                     entrypoint=str(record.get("entrypoint") or ""),
                 )
+            if provider == "grok":
+                # Its own registry names the session a live pid holds; its
+                # event log says whether that session's turn is running.
+                known = grok.active(proc_root=self.proc_root)
+                for session_id, (pid, cwd) in known.items():
+                    if pid == process.pid:
+                        folder = grok.session_dir(session_id, cwd)
+                        return _minimal_session(
+                            "grok", pane, session_id=session_id,
+                            status=grok.activity(folder), cwd=cwd,
+                            pids=(process.pid,))
+                return _minimal_session("grok", pane, session_id=_argument_session(process),
+                                        pids=(process.pid,) if process.pid else ())
+            if provider == "omp":
+                # No registry: the newest session file for this pane's
+                # working directory, written since the process started.
+                started = liveness.start_time(process.pid, proc_root=self.proc_root)
+                found = omp.newest_in(pane.cwd, after=started) if started else None
+                if found is not None:
+                    return _minimal_session(
+                        "omp", pane, session_id=found.session_id,
+                        status=omp.activity(found.path), cwd=found.cwd,
+                        title=found.title, pids=(process.pid,))
+                return _minimal_session("omp", pane, session_id=_argument_session(process),
+                                        pids=(process.pid,) if process.pid else ())
             if provider == "kimi":
                 return _minimal_session(
                     "kimi", pane,

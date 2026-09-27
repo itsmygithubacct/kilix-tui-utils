@@ -16,7 +16,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_rollout import codex  # noqa: E402
+from kilix_rollout import codex, grok, omp  # noqa: E402
 from kilix_rollout.model import Session  # noqa: E402
 from kilix_tui import kitty_rc, pane_center  # noqa: E402
 
@@ -185,6 +185,50 @@ class CodexStateTests(unittest.TestCase):
             self.assertEqual(got.panes[0].activity, "idle")
             self.assertEqual(got.panes[0].doing, "real task")
             self.assertEqual(got.panes[0].coding.session_id, CODEX_ID)
+
+
+def agent_tree(argv: list[str], pid: int = 91) -> kitty_rc.Tree:
+    return kitty_rc.parse([{"id": 1, "is_focused": True, "tabs": [{
+        "id": 2, "title": "work", "is_active": True, "windows": [{
+            "id": 9, "pid": 70, "title": "agent", "cwd": "/tmp/project",
+            "is_focused": True, "env": {"KITTY_PTY_BROKER_SESSION": SESSION},
+            "foreground_processes": [{"pid": pid, "cmdline": argv, "cwd": "/tmp/project"}],
+        }]}]}])
+
+
+class GrokAndOmpStateTests(unittest.TestCase):
+    """kilix-needle's agents job: idle detection for grok and qwen-omp panes."""
+
+    def inspect(self, argv, proc_root):
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}):
+            return pane_center.Inspector(proc_root=proc_root).snapshot(agent_tree(argv)).panes[0]
+
+    def test_a_live_grok_pane_reports_its_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(grok, "active", return_value={"sid": (91, "/tmp/project")}), \
+                    mock.patch.object(grok, "activity", side_effect=["idle", "working", "waiting"]):
+                for want in ("idle", "working", "waiting"):
+                    got = self.inspect(["/home/u/.grok/bin/grok"], temporary)
+                    self.assertEqual((got.activity, got.coding.session_id), (want, "sid"))
+
+    def test_a_live_omp_pane_uses_the_newest_session_since_it_started(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Session(provider="omp", session_id="osid", path="/p", cwd="/tmp/project",
+                              title="t", updated=5.0)
+            with mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
+                    mock.patch.object(omp, "newest_in", return_value=session) as newest, \
+                    mock.patch.object(omp, "activity", return_value="idle"):
+                got = self.inspect(["omp", "--model", "qwen3.8-max"], temporary)
+            newest.assert_called_once_with("/tmp/project", after=4.0)
+            self.assertEqual((got.activity, got.coding.session_id), ("idle", "osid"))
+
+    def test_without_a_session_record_the_pane_is_only_an_agent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(grok, "active", return_value={}), \
+                    mock.patch.object(pane_center.liveness, "start_time", return_value=0.0):
+                self.assertEqual(self.inspect(["grok"], temporary).activity, "agent")
+                self.assertEqual(self.inspect(["omp"], temporary).activity, "agent")
 
 
 class SnapshotTests(unittest.TestCase):
