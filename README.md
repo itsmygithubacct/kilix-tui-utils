@@ -313,6 +313,14 @@ without an explicit signal stays `agent`; it is never optimistically called
 idle. Shells, SSH sessions, and other foreground programs are labelled
 separately.
 
+For live OMP panes, a clean assistant stop becomes idle only after a short
+stability window. OMP 18.3.2 can automatically retry a provider error after a
+backoff (five minutes by default, potentially longer for an opted-in quota-reset
+wait), but writes the failed assistant row without persisting its
+`auto_retry_start` event. Therefore a transcript ending in provider `error`
+remains conservatively `working`; a finite idle debounce would expose the pane
+during a retry backoff. Deliberate aborts still use the short stability window.
+
 The same snapshot is a scriptable `kilix panes` interface:
 
 ```sh

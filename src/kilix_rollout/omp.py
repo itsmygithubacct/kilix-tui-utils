@@ -5,10 +5,12 @@ with "/" as "-">/<timestamp>_<id>.jsonl`. A `session` record holds the id and wo
 directory, a `title` record the title, and `message` records the turns:
 an assistant message whose stopReason is `stop` with no tool call ends a
 turn; a tool result, user/developer message, or custom async message after it
-means the agent is still at work. omp does not record whether a tool call is
-running or awaiting approval, so a pending call is `unknown`: it is neither
-idle nor safe to type into. `terminal-sessions/<tty>` maps a terminal to the
-session it owns. It is preferred over the ambiguous newest-file heuristic.
+means the agent is still at work. A provider `error` stays `working` because
+omp may be in an automatic retry backoff which is not persisted to JSONL.
+omp does not record whether a tool call is running or awaiting approval, so a
+pending call is `unknown`: it is neither idle nor safe to type into.
+`terminal-sessions/<tty>` maps a terminal to the session it owns. It is
+preferred over the ambiguous newest-file heuristic.
 
 Readable by explicit key only: omp is not one of the agents this package
 installs or resumes from its own menu (see providers.py).
@@ -69,7 +71,13 @@ def activity(path: str, *, now: float | None = None) -> str:
             calls = [part for part in message.get("content") or []
                      if isinstance(part, dict) and part.get("type") == "toolCall"]
             reason = message.get("stopReason")
-            if reason in ("aborted", "error"):
+            if reason == "error":
+                # OMP 18.3.2 persists the failed assistant message, then emits
+                # auto_retry_start only in process.  Default backoff can reach
+                # five minutes and quota-reset waits can be longer, so no
+                # finite transcript debounce can safely infer idle here.
+                return "working"
+            if reason == "aborted":
                 return _stable_idle(path, record, now)
             if calls or reason == "toolUse":
                 return "unknown"

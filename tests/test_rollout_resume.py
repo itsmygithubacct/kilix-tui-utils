@@ -341,6 +341,12 @@ class GrokTests(unittest.TestCase):
                                          "decision": "allow", "wait_ms": 13922}) + "\n")
             self.assertEqual(grok.activity(folder, now=then + 14), "working")
 
+    def test_permission_without_a_timestamp_is_already_waiting(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = self.build(root, [{"type": "permission_requested",
+                                        "tool_name": "bash"}])
+            self.assertEqual(grok.activity(folder, now=0), "waiting")
+
     def test_planner_and_boundaries_beyond_the_last_400_records_are_found(self):
         with tempfile.TemporaryDirectory() as root:
             folder = self.build(root, ["turn_ended"] + ["phase_changed"] * 500
@@ -440,7 +446,7 @@ class OmpTests(unittest.TestCase):
                      ([tool], "unknown"), ([stopped_tool], "unknown"),
                      ([tool, {"role": "toolResult"}], "working"),
                      ([{"role": "assistant", "stopReason": "aborted"}], "idle"),
-                     ([{"role": "assistant", "stopReason": "error"}], "idle"),
+                     ([{"role": "assistant", "stopReason": "error"}], "working"),
                      ([], "unknown")]
             for index, (messages, want) in enumerate(cases):
                 path = self.build(root, messages, name=f"t{index}.jsonl", sid=f"s{index}")
@@ -468,7 +474,17 @@ class OmpTests(unittest.TestCase):
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"type": "custom_message",
                                          "customType": "async-result"}) + "\n")
-            self.assertEqual(omp.activity(path), "working")
+            # Make the prior completed turn old enough that the idle debounce
+            # cannot mask whether custom_message itself was recognized.
+            old = 1_000_000
+            os.utime(path, (old, old))
+            self.assertEqual(omp.activity(path, now=old + 60), "working")
+
+    def test_provider_error_cannot_read_idle_during_retry_backoff(self):
+        with tempfile.TemporaryDirectory() as root:
+            stamp = "2026-09-27T10:48:50.483Z"
+            path = self.build(root, [{"role": "assistant", "stopReason": "error"}])
+            self.assertEqual(omp.activity(path, now=omp._timestamp(stamp) + 3600), "working")
 
     def test_discover_and_the_newest_session_in_a_directory(self):
         with tempfile.TemporaryDirectory() as root:
@@ -520,6 +536,23 @@ class OmpTests(unittest.TestCase):
             with open(marker, "w") as handle:
                 handle.write(f"/tmp/qwen\n{inside}\nfresh\n")
             self.assertIsNone(omp.session_for_pid(91, root=root, proc_root=proc))
+
+    def test_terminal_marker_older_than_the_process_does_not_count(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "proc")
+            descriptors = os.path.join(proc, "91", "fd")
+            os.makedirs(descriptors)
+            os.symlink("/dev/pts/9", os.path.join(descriptors, "0"))
+            terminal = os.path.join(root, "terminal-sessions")
+            os.makedirs(terminal)
+            marker = os.path.join(terminal, "pts-9")
+            with open(marker, "w") as handle:
+                handle.write("/tmp/qwen\n/missing.jsonl\n")
+            os.utime(marker, (1000, 1000))
+            self.assertFalse(omp.has_terminal_marker(
+                91, root=root, proc_root=proc, after=1001))
+            self.assertTrue(omp.has_terminal_marker(
+                91, root=root, proc_root=proc, after=999))
 
     def test_resume_argv(self):
         self.assertEqual(omp.resume_argv(sample("omp"), yolo=True, model_name="qwen3.8-max"),
