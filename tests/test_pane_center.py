@@ -144,7 +144,24 @@ class CodexStateTests(unittest.TestCase):
                 "content": [{"type": "input_text", "text":
                              "<codex_internal_context>ignore me</codex_internal_context>"}]}},
         ]
-        if boundary == "task_complete":
+        if boundary == "approval":
+            # Shape emitted by Codex 0.157.1's rollout serializer for an exec
+            # approval (field names verified from the installed client).
+            records.append({"type": "event_msg", "payload": {
+                "type": "exec_approval_request", "approval_id": "approval-1",
+                "command": ["make", "test"], "cwd": "/tmp/project",
+                "reason": "run the project test suite",
+                "available_decisions": ["approved", "denied"]}})
+        elif boundary == "approval-resolved":
+            records.extend([
+                {"type": "event_msg", "payload": {
+                    "type": "exec_approval_request", "approval_id": "approval-1",
+                    "command": ["make", "test"], "cwd": "/tmp/project"}},
+                {"type": "event_msg", "payload": {
+                    "type": "exec_command_begin", "call_id": "approval-1",
+                    "command": ["make", "test"], "cwd": "/tmp/project"}},
+            ])
+        elif boundary == "task_complete":
             records.append({"type": "event_msg", "payload": {
                 "type": "task_complete"}})
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +183,20 @@ class CodexStateTests(unittest.TestCase):
             self.write_rollout(working_path, "task_started")
             working = codex.session_from_path(str(working_path), pids=(78,))
             self.assertEqual(working.live_status, "working")
+
+    def test_live_rollout_reports_a_pending_codex_approval_as_waiting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pending_path = Path(temporary) / f"rollout-{CODEX_ID}.jsonl"
+            self.write_rollout(pending_path, "approval")
+            pending = codex.session_from_path(str(pending_path), pids=(77,))
+            self.assertEqual(pending.live_status, "waiting")
+            self.assertEqual(pending.pending_tool, "command approval")
+
+            resolved_path = Path(temporary) / "resolved" / f"rollout-{CODEX_ID}.jsonl"
+            self.write_rollout(resolved_path, "approval-resolved")
+            resolved = codex.session_from_path(str(resolved_path), pids=(78,))
+            self.assertEqual(resolved.live_status, "working")
+            self.assertEqual(resolved.pending_tool, "")
 
     def test_inspector_uses_only_the_rollout_opened_by_the_pane_pid(self):
         with tempfile.TemporaryDirectory() as temporary:
