@@ -38,11 +38,14 @@ def adapt_record(provider: str, row: dict) -> dict:
         if category not in result["excluded"]:
             result["excluded"].append(category)
     def unsupported(what: object) -> None:
-        result["errors"].append({"code": "unsupported_record", "message": f"unsupported {provider} record: {what}"})
+        result["errors"].append({"code": "unsupported_record", "message": f"unsupported {provider} record: {str(what)[:160]}"})
     if not isinstance(row, dict):
         unsupported("non-object")
         return result
     kind = row.get("type")
+    if not isinstance(kind, str):
+        unsupported("type")
+        return result
     if provider == "claude":
         if kind in {"system", "summary", "file-history-snapshot", "file-history-delta", "last-prompt", "attachment", "queue-operation", "ai-title", "custom-title", "agent-name", "mode", "permission-mode", "agent-name"}:
             exclude("system_or_metadata")
@@ -51,7 +54,8 @@ def adapt_record(provider: str, row: dict) -> dict:
                 exclude("synthetic_or_sidechain")
                 return result
             msg = row.get("message")
-            if not isinstance(msg, dict) or msg.get("role") not in {None, kind}:
+            if not isinstance(msg, dict) or (msg.get("role") is not None and
+                    (not isinstance(msg.get("role"), str) or msg.get("role") != kind)):
                 unsupported("message role mismatch")
                 return result
             content = msg.get("content")
@@ -67,6 +71,9 @@ def adapt_record(provider: str, row: dict) -> dict:
                         continue
                     block_kind = block.get("type")
                     base = _pointer("message", "content", i)
+                    if not isinstance(block_kind, str):
+                        unsupported("content block type")
+                        continue
                     if block_kind == "text":
                         value = block.get("text")
                         if kind == "user" and isinstance(value, str) and value.lstrip().startswith(("<system-reminder>", "<task-notification>", "<local-command-stdout>")):
@@ -85,7 +92,7 @@ def adapt_record(provider: str, row: dict) -> dict:
                             emit("tool", "tool_result", value, base + "/content", tool_id=block.get("tool_use_id"))
                         elif isinstance(value, list):
                             for j, item in enumerate(value):
-                                if isinstance(item, dict) and item.get("type") == "text":
+                                if isinstance(item, dict) and isinstance(item.get("type"), str) and item.get("type") == "text":
                                     emit("tool", "tool_result", item.get("text"), base + _pointer("content", j, "text"), tool_id=block.get("tool_use_id"))
                                 else:
                                     exclude("nontext_tool_payload")
@@ -106,8 +113,24 @@ def adapt_record(provider: str, row: dict) -> dict:
             return result
         if kind == "response_item":
             item_type = payload.get("type")
+            if not isinstance(item_type, str):
+                unsupported("payload type")
+                return result
+            channel = payload.get("channel")
+            if not (channel is None or isinstance(channel, str)):
+                unsupported("response channel")
+                return result
+            if channel in {"analysis", "reasoning"}:
+                exclude("reasoning")
+                return result
+            if channel not in {None, "final", "commentary"}:
+                unsupported("response channel")
+                return result
             if item_type == "message":
                 role = payload.get("role")
+                if not isinstance(role, str):
+                    unsupported("message role")
+                    return result
                 if role in {"system", "developer"}:
                     exclude("system_or_developer")
                     return result
@@ -123,6 +146,9 @@ def adapt_record(provider: str, row: dict) -> dict:
                         unsupported("content part")
                         continue
                     typ = part.get("type")
+                    if not isinstance(typ, str):
+                        unsupported("content part type")
+                        continue
                     if typ in {"input_text", "output_text"} and ((role == "user" and typ == "input_text") or (role == "assistant" and typ == "output_text")):
                         value = part.get("text")
                         if role == "user" and isinstance(value, str) and value.lstrip().startswith(("<environment_context>", "<permissions instructions>", "<skills_instructions>", "<codex_internal_context")):
@@ -147,6 +173,9 @@ def adapt_record(provider: str, row: dict) -> dict:
                 unsupported(item_type)
         elif kind == "event_msg":
             event = payload.get("type")
+            if not isinstance(event, str):
+                unsupported("event type")
+                return result
             if event in {"task_started", "task_complete", "turn_started", "turn_complete", "turn_completed"}:
                 emit("unknown", "lifecycle", event, _pointer("payload", "type"))
             elif event in {"agent_reasoning", "agent_reasoning_raw_content", "agent_reasoning_section_break"}:
