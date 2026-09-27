@@ -1,13 +1,14 @@
 """omp (oh-my-pi) sessions; qwen-omp is omp running a Qwen model.
 
-omp writes one JSONL file per session under `agent/sessions/<cwd with "/" as
-"-">/<timestamp>_<id>.jsonl`. A `session` record holds the id and working
+omp writes one JSONL file per session under `agent/sessions/<cwd below home,
+with "/" as "-">/<timestamp>_<id>.jsonl`. A `session` record holds the id and working
 directory, a `title` record the title, and `message` records the turns:
 an assistant message whose stopReason is `stop` with no tool call ends a
-turn; `toolUse`, a tool result or a user message after it means the agent is
-still at work. omp does not keep the file open and has no registry of live
-processes, so liveness comes from the pane: an omp process whose working
-directory and start time match the newest session there.
+turn; a tool result, user/developer message, or custom async message after it
+means the agent is still at work. omp does not record whether a tool call is
+running or awaiting approval, so a pending call is `unknown`: it is neither
+idle nor safe to type into. `terminal-sessions/<tty>` maps a terminal to the
+session it owns. It is preferred over the ambiguous newest-file heuristic.
 
 Readable by explicit key only: omp is not one of the agents this package
 installs or resumes from its own menu (see providers.py).
@@ -26,13 +27,18 @@ def home() -> str:
 
 
 def folder_for(cwd: str) -> str:
-    return cwd.replace("/", "-")
+    home_dir = os.path.expanduser("~").rstrip(os.sep)
+    relative = cwd[len(home_dir):] if cwd == home_dir or cwd.startswith(home_dir + os.sep) else cwd
+    return relative.replace("/", "-") or "-"
 
 
 def activity(path: str) -> str:
-    """`working` or `idle` from the newest message; `unknown` with none."""
+    """`working` or `idle` from the newest message; `unknown` when ambiguous."""
     for record in jsonl.tail_records(path, limit=200):
-        if record.get("type") != "message":
+        kind = record.get("type")
+        if kind == "custom_message":
+            return "working"
+        if kind != "message":
             continue
         message = record.get("message")
         if not isinstance(message, dict):
@@ -41,8 +47,13 @@ def activity(path: str) -> str:
         if role == "assistant":
             calls = [part for part in message.get("content") or []
                      if isinstance(part, dict) and part.get("type") == "toolCall"]
-            return "idle" if message.get("stopReason") == "stop" and not calls else "working"
-        if role in ("user", "toolResult"):
+            reason = message.get("stopReason")
+            if reason in ("aborted", "error"):
+                return "idle"
+            if calls or reason == "toolUse":
+                return "unknown"
+            return "idle" if reason == "stop" else "working"
+        if role in ("user", "developer", "toolResult", "bashExecution"):
             return "working"
     return "unknown"
 
@@ -104,6 +115,44 @@ def newest_in(cwd: str, *, root: str = "", after: float = 0.0) -> Session | None
     `after` (a process start time); None when there is none."""
     candidates = [s for s in discover(root=root) if s.cwd == cwd and s.updated >= after]
     return max(candidates, key=lambda s: s.updated) if candidates else None
+
+
+def session_for_pid(pid: int, *, root: str = "", proc_root: str = "/proc",
+                    after: float = 0.0) -> Session | None:
+    """Return the session named by omp's terminal state for ``pid``.
+
+    The mapping is trusted only when it points inside this omp home, matches
+    the session header, and was updated after the process began.
+    """
+    if pid <= 0:
+        return None
+    base = root or home()
+    try:
+        terminal_path = os.readlink(os.path.join(proc_root, str(pid), "fd", "0"))
+        terminal = terminal_path.removeprefix("/dev/").replace(os.sep, "-")
+        with open(os.path.join(base, "terminal-sessions", terminal),
+                  encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle.read(4096).splitlines()[:4]]
+    except OSError:
+        return None
+    if len(lines) < 2 or not lines[1]:
+        return None
+    path = os.path.realpath(lines[1])
+    sessions_root = os.path.realpath(os.path.join(base, "sessions"))
+    if os.path.commonpath((sessions_root, path)) != sessions_root:
+        return None
+    try:
+        updated = os.stat(path).st_mtime
+    except OSError:
+        return None
+    if after and updated < after:
+        return None
+    session_id, cwd, title = _header(path)
+    if not session_id or (lines[0] and cwd != lines[0]):
+        return None
+    return Session(provider="omp", session_id=session_id, path=path, cwd=cwd,
+                   title=jsonl.condense(title, 120), updated=updated,
+                   state="cut-off" if activity(path) != "idle" else "idle")
 
 
 def resume_argv(session: Session, *, yolo: bool = False, model_name: str = "") -> list[str]:

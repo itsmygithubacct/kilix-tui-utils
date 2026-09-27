@@ -193,7 +193,19 @@ def agent_tree(argv: list[str], pid: int = 91) -> kitty_rc.Tree:
             "id": 9, "pid": 70, "title": "agent", "cwd": "/tmp/project",
             "is_focused": True, "env": {"KITTY_PTY_BROKER_SESSION": SESSION},
             "foreground_processes": [{"pid": pid, "cmdline": argv, "cwd": "/tmp/project"}],
-        }]}]}])
+    }]}]}])
+
+
+def two_agent_tree(first, second) -> kitty_rc.Tree:
+    return kitty_rc.parse([{"id": 1, "is_focused": True, "tabs": [{
+        "id": 2, "title": "work", "is_active": True, "windows": [
+            {"id": 9, "pid": 70, "title": "one", "cwd": "/tmp/project",
+             "foreground_processes": [{"pid": 91, "cmdline": first,
+                                        "cwd": "/tmp/project"}]},
+            {"id": 10, "pid": 71, "title": "two", "cwd": "/tmp/project",
+             "foreground_processes": [{"pid": 92, "cmdline": second,
+                                        "cwd": "/tmp/project"}]},
+        ]}]}])
 
 
 class GrokAndOmpStateTests(unittest.TestCase):
@@ -223,12 +235,44 @@ class GrokAndOmpStateTests(unittest.TestCase):
             newest.assert_called_once_with("/tmp/project", after=4.0)
             self.assertEqual((got.activity, got.coding.session_id), ("idle", "osid"))
 
+    def test_two_omp_panes_in_one_directory_do_not_share_the_newest_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}), \
+                    mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
+                    mock.patch.object(omp, "session_for_pid", return_value=None), \
+                    mock.patch.object(omp, "newest_in") as newest:
+                got = pane_center.Inspector(proc_root=temporary).snapshot(
+                    two_agent_tree(["omp"], ["omp"]))
+            newest.assert_not_called()
+            self.assertEqual([item.activity for item in got.panes], ["agent", "agent"])
+
+    def test_outer_claude_owns_a_pane_with_an_omp_child(self):
+        nested = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{
+            "id": 9, "pid": 70, "title": "claude", "cwd": "/tmp/project",
+            "foreground_processes": [
+                {"pid": 91, "cmdline": ["claude"], "cwd": "/tmp/project"},
+                {"pid": 92, "cmdline": ["omp", "-p", "review"],
+                 "cwd": "/tmp/project"},
+            ],
+        }]}]}])
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={
+                        91: ("claude-sid", {"status": "busy", "cwd": "/tmp/project"})
+                    }), mock.patch.object(omp, "newest_in") as newest:
+                got = pane_center.Inspector(proc_root=temporary).snapshot(nested).panes[0]
+            newest.assert_not_called()
+            self.assertEqual((got.coding.provider, got.activity), ("claude", "working"))
+
     def test_without_a_session_record_the_pane_is_only_an_agent(self):
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(grok, "active", return_value={}), \
-                    mock.patch.object(pane_center.liveness, "start_time", return_value=0.0):
+                    mock.patch.object(pane_center.liveness, "start_time", return_value=0.0), \
+                    mock.patch.object(omp, "newest_in") as newest:
                 self.assertEqual(self.inspect(["grok"], temporary).activity, "agent")
                 self.assertEqual(self.inspect(["omp"], temporary).activity, "agent")
+            newest.assert_not_called()
 
 
 class SnapshotTests(unittest.TestCase):

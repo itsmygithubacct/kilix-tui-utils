@@ -445,10 +445,11 @@ class Inspector:
         self,
         pane: kitty_rc.Pane,
         claude_by_pid: dict[int, tuple[str, dict[str, object]]],
+        ambiguous_omp_cwds: frozenset[str] = frozenset(),
     ) -> Session | None:
         if session := self._codex_for(pane):
             return session
-        for process in reversed(pane.processes):
+        for process in pane.processes:
             provider = _process_agent(process)
             if provider == "claude":
                 known = claude_by_pid.get(process.pid)
@@ -478,10 +479,12 @@ class Inspector:
                 return _minimal_session("grok", pane, session_id=_argument_session(process),
                                         pids=(process.pid,) if process.pid else ())
             if provider == "omp":
-                # No registry: the newest session file for this pane's
-                # working directory, written since the process started.
                 started = liveness.start_time(process.pid, proc_root=self.proc_root)
-                found = omp.newest_in(pane.cwd, after=started) if started else None
+                found = omp.session_for_pid(
+                    process.pid, proc_root=self.proc_root, after=started
+                ) if started else None
+                if found is None and started and pane.cwd not in ambiguous_omp_cwds:
+                    found = omp.newest_in(pane.cwd, after=started)
                 if found is not None:
                     return _minimal_session(
                         "omp", pane, session_id=found.session_id,
@@ -509,9 +512,15 @@ class Inspector:
         page_index = {
             page.id: page.index for page in tree.pages
         }
+        omp_counts: dict[str, int] = {}
+        for current in tree.panes:
+            if any(_process_agent(process) == "omp" for process in current.processes):
+                omp_counts[current.cwd] = omp_counts.get(current.cwd, 0) + 1
+        ambiguous_omp_cwds = frozenset(
+            cwd for cwd, count in omp_counts.items() if count > 1)
         panes = []
         for pane in tree.panes:
-            coding = self._coding_for(pane, claude_by_pid)
+            coding = self._coding_for(pane, claude_by_pid, ambiguous_omp_cwds)
             broker = brokers.get(pane.broker_session)
             panes.append(PaneInfo(
                 pane=pane,
