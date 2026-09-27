@@ -21,6 +21,7 @@ TOOLS=(
     "disk:kilix-disk"
     "system:kilix-system"
     "volume:kilix-volume"
+    "network:kilix-network"
     "file:kilix-file"
     "launcher:kilix-launcher"
     "package:kilix-package"

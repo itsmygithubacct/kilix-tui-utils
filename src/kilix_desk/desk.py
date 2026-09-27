@@ -30,12 +30,13 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from kilix_tui import keys as keymap, kitty_rc, privileged, shell
 
-from . import facts, registry, tango
+from . import durable, facts, manual, registry, tango
 
 SECTIONS = ("Home", "Programs", "Machine", "System", "Session", "Power")
 QUIT_SENTINEL: tuple[str, ...] = ()
@@ -46,7 +47,7 @@ BACK_LABEL = ".."
 # something the screen does not already show.
 TIPS: dict[str, str] = {
     "": "Enter walks in, ← walks back — the trail above always says where you are",
-    "Home": "r refreshes these numbers without leaving",
+    "Home": "p on any entry pins it here · r refreshes these numbers",
     "Programs": "press / and type to filter — 'chess' finds Chess Bash",
     "Machine": "these open live dashboards; q returns you here",
     "System": "settings, desktops and updates for the whole stack",
@@ -56,10 +57,16 @@ TIPS: dict[str, str] = {
     "Catalog apps": "every application comes from the host's one content catalog",
     "Voice": "speech tools share the stack's models, settings and diagnostics",
     "Default desktop": "Enter chooses what every later session starts with",
+    "Scripts": "the stack's own maintenance scripts; Enter runs one in place",
+    "Manual": "the stack's help book — Enter reads a topic in the pager",
+    "Man pages": "press / and type a command name — Enter opens its manual page",
     "Games": "Enter toggles a game on or off for the whole stack",
     "Games+play": "Enter plays; t turns a game on or off for the whole stack",
     "Screensavers": "Enter runs one; any key stops it",
+    "Palette": "Enter wears a flavor now — KILIX_TUI_FLAVOR in settings.conf "
+               "keeps it",
     "Applications": "what this machine itself installs — the stack list is above",
+    "Launchers": "your own desktop-folder launchers, from any desktop's Create Launcher",
 }
 
 
@@ -76,6 +83,8 @@ class Entry:
     back: bool = False               # the ".." row
     prompt: bool = False             # Enter opens the run-a-command prompt
     alt_argv: tuple[str, ...] | None = None   # `t` runs this quietly
+    restart: bool = False            # a clean run re-execs the desktop
+    flavor: str = ""                 # Enter wears this palette, in-process
 
 
 def entry_hint(entry: Entry) -> str:
@@ -120,6 +129,26 @@ def _quiet_run(argv: Sequence[str]) -> int:
         return 126
 
 
+def _restart_desktop() -> None:
+    """Replace this process with a fresh desktop.
+
+    The point of "Update and restart desktop" is that the menu you come back
+    to is drawn by the code the update just installed; a child process would
+    leave the old desktop underneath it. curses is shut down first so the
+    fresh process inherits a sane terminal. Reached again only when the exec
+    itself failed — the caller words that failure.
+    """
+    try:
+        import curses
+        curses.endwin()
+    except Exception:
+        pass
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    except OSError:
+        pass
+
+
 def report_argv(argv: Sequence[str]) -> tuple[str, ...]:
     """Wrap a command that prints and exits so its output can be read.
 
@@ -131,6 +160,29 @@ def report_argv(argv: Sequence[str]) -> tuple[str, ...]:
     quoted = " ".join(shlex.quote(part) for part in argv)
     return ("sh", "-c",
             f"{quoted}; printf '\\n— press Enter to return —'; read -r _")
+
+
+def _freedesktop_entry(app: dict, kilix: Sequence[str] | None) -> Entry | None:
+    """One parsed `.desktop` entry under the desk's containment policy.
+
+    Terminal applications launch like any tool (a page inside Kilix, in place
+    elsewhere). GUI applications go through `kilix run`, the same containment
+    Kilix 95 uses — so without a Kilix checkout they are listed disabled with
+    the reason, not launched raw onto whatever display may or may not exist.
+    None means the entry does not parse to an argv at all.
+    """
+    try:
+        argv = tuple(shlex.split(app["exec"]))
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    if app.get("terminal"):
+        return Entry(app["name"], argv, verb="tab")
+    if kilix is None:
+        return Entry(app["name"], None,
+                     reason="needs a Kilix checkout to contain it")
+    return Entry(app["name"], (*kilix, "run", *argv), verb="tab")
 
 
 def visible_window(count: int, height: int, selected: int) -> int:
@@ -145,7 +197,8 @@ class State:
                  application_name: str = "",
                  runner: Callable[[Sequence[str]], int] | None = None,
                  quiet: Callable[[Sequence[str]], int] | None = None,
-                 live: Callable[[], bool] | None = None) -> None:
+                 live: Callable[[], bool] | None = None,
+                 restart: Callable[[], None] | None = None) -> None:
         self.root_path = tuple(root_path)
         self.application_name = application_name
         self.path: list[str] = list(self.root_path)
@@ -155,18 +208,25 @@ class State:
         self.help_open = False
         self.message = ""
         self.confirm: tuple[str, tuple[str, ...]] | None = None
+        self.confirm_restart = False     # the pending confirm re-execs on success
         self.running_prompt = False      # the `!` run-a-command line is open
         self.command = ""                # what has been typed into it
         self.runner = runner or _attached_run
         self.quiet = quiet or _quiet_run
         self.live = live or kitty_rc.available
+        self.restart = restart or _restart_desktop
         self.status = facts.status_rows()
+        self.alerts = facts.alerts()
         # `entries()` runs on every keystroke, so anything that costs a
         # subprocess or a filesystem walk is fetched once per visit rather
         # than per frame. `r` drops all of it.
         self.software: list[dict] | None = None
         self.default_desktop: str | None = None
         self.apps: dict[str, list[dict]] | None = None
+        self.launchers: list[dict] | None = None
+        self.scripts: list[dict] | None = None
+        self.man_pages: list[dict] | None = None
+        self.home_rows: list[dict] | None = None
         self.play_support: bool | None = None
         self.text_hits: dict = {}
 
@@ -242,13 +302,21 @@ class State:
             return self._game_entries()
         if self.submenu == "screensavers":
             return self._screensaver_entries()
+        if self.submenu == "palette":
+            return self._palette_entries()
+        if self.submenu == "scripts":
+            return self._script_entries()
+        if self.submenu == "manual":
+            return self._manual_entries()
         if self.submenu == "applications":
             return self._application_entries()
+        if self.submenu == "launchers":
+            return self._launcher_entries()
         if self.submenu == "voice":
             return self._registry_entries(registry.VOICE)
         name = self.path[0]
         if name == "Home":
-            return []
+            return self._home_entries()
         if name == "Power":
             return [Entry(label, tuple(argv), confirm=True)
                     for label, argv, _needs in privileged.power_actions()]
@@ -275,6 +343,10 @@ class State:
                 continue
             plan = registry.resolve(item)
             if plan is None:
+                if item.helper:
+                    # Presence-gated like the reference desktop's System
+                    # menu: no OS helper, no row.
+                    continue
                 out.append(Entry(item.label, None,
                                  reason=registry.disabled_reason(item)))
                 continue
@@ -282,8 +354,26 @@ class State:
             argv = (report_argv(plan.argv) if verb == "report"
                     else plan.argv)
             out.append(Entry(item.label, argv, verb=verb,
-                             confirm=item.confirm))
+                             confirm=item.confirm, restart=item.restart))
         return out
+
+    def _home_entries(self) -> list[Entry]:
+        """Pinned rows first, then recent launches: the one durable list.
+
+        These are the desk's only persisted state (`durable.py` records the
+        decision). Each row re-runs through the normal launch policy — the
+        argv stored is the one the entry offered, re-resolved at launch time,
+        so a recents row survives a reinstall the same way the entry does.
+        The facts render below; `p` on a row here unpins or re-pins it.
+        """
+        if self.home_rows is None:
+            pins = [dict(row, pinned=True) for row in durable.pinned()]
+            names = {row["label"] for row in pins}
+            self.home_rows = pins + [row for row in durable.recents()
+                                     if row["label"] not in names]
+        return [Entry(row["label"], tuple(row["argv"]), verb="tab",
+                      hint="pinned" if row.get("pinned") else "recent")
+                for row in self.home_rows if row.get("argv")]
 
     def _section_entries(self) -> list[Entry]:
         """The root: the six sections, as things the one cursor can open."""
@@ -383,28 +473,68 @@ class State:
         ]
 
     def _game_entries(self) -> list[Entry]:
-        rows = registry.games()
+        """Every stack game: the catalog's list, with the SDK's on/off state.
+
+        The rows come from the same cached `kilix install --json` answer the
+        Software place reads — one list — so a game added to the catalog is
+        listed and playable here with no desktop change. The SDK toggle table
+        supplies only the on/off hint (and the `t` flip), never the listing
+        gate; games only that table knows stay listed too, so an older
+        catalog loses nothing.
+        """
         kilix = registry.kilix_command()
-        if rows is None or kilix is None:
+        if kilix is None:
+            return [Entry("games need a Kilix checkout", None,
+                          reason="no kilix launcher reachable")]
+        toggles = registry.games()
+        if self.software is None:
+            self.software = registry.installable()
+        catalog = [row for row in (self.software or [])
+                   if row.get("kind") == "game" and row.get("id")]
+        if toggles is None and not catalog:
             return [Entry("games need a Kilix checkout", None,
                           reason="no kilix_sdk reachable")]
         if self.play_support is None:
             self.play_support = registry.games_play_supported(kilix)
-        out = []
-        for game_id, label, enabled in rows:
-            action = "disable" if enabled else "enable"
-            flip = (*kilix, "games", action, game_id)
+        toggle_state = {game_id: enabled
+                        for game_id, _label, enabled in (toggles or ())}
+        rows: list[tuple[str, str, dict | None]] = [
+            (str(row["id"]), str(row.get("label") or row["id"]), row)
+            for row in sorted(
+                catalog, key=lambda r: str(r.get("label", "")).casefold())]
+        seen = {game_id for game_id, _label, _row in rows}
+        rows.extend((game_id, label, None)
+                    for game_id, label, _enabled in (toggles or ())
+                    if game_id not in seen)
+        out: list[Entry] = []
+        for game_id, label, row in rows:
+            enabled = toggle_state.get(game_id)
+            if enabled is None:
+                # Catalog-only: no toggle to flip, so the hint carries the
+                # install state the way the Software place words it.
+                hint = ("installed" if row and row.get("installed")
+                        else "installs on first play")
+                flip = None
+            else:
+                hint = "on" if enabled else "off"
+                flip = (*kilix, "games",
+                        "disable" if enabled else "enable", game_id)
             if self.play_support:
                 # Enter plays — the natural reading of a games list — and `t`
-                # keeps the availability toggle one key away.
+                # keeps the availability toggle one key away where one exists.
                 out.append(Entry(label, (*kilix, "games", "play", game_id),
-                                 verb="tab", hint="on" if enabled else "off",
-                                 alt_argv=flip))
-            else:
+                                 verb="tab", hint=hint, alt_argv=flip))
+            elif flip is not None:
                 # Older launchers know no `play`: Enter stays the toggle so
                 # the list is never a dead end.
-                out.append(Entry(label, flip, toggle=True,
-                                 hint="on" if enabled else "off"))
+                out.append(Entry(label, flip, toggle=True, hint=hint))
+            else:
+                # No `play` and no toggle either: Enter installs the game to
+                # its pin — the one thing an old launcher can still do here.
+                out.append(Entry(label, (*kilix, "install", game_id),
+                                 hint=("installed" if row
+                                       and row.get("installed")
+                                       else "install")))
         return out
 
     def _application_entries(self) -> list[Entry]:
@@ -428,26 +558,87 @@ class State:
                     for bucket, rows in groups.items()]
         bucket = self.path[2]
         kilix = registry.kilix_command()
-        out: list[Entry] = []
-        for app in groups.get(bucket, ()):
-            try:
-                argv = tuple(shlex.split(app["exec"]))
-            except ValueError:
-                continue
-            if not argv:
-                continue
-            if app.get("terminal"):
-                out.append(Entry(app["name"], argv, verb="tab"))
-            elif kilix is None:
-                out.append(Entry(app["name"], None,
-                                 reason="needs a Kilix checkout to contain it"))
-            else:
-                out.append(Entry(app["name"], (*kilix, "run", *argv),
-                                 verb="tab"))
+        out = [entry for app in groups.get(bucket, ())
+               if (entry := _freedesktop_entry(app, kilix)) is not None]
         if not out:
             return [Entry("nothing launchable in this bucket", None,
                           reason="every entry here failed to parse")]
         return out
+
+    def _launcher_entries(self) -> list[Entry]:
+        """The user's own desktop-folder launchers, launched like Applications.
+
+        The listing is `registry.user_launchers()`, shared with the launcher
+        catalog, so the two surfaces can never disagree about what the user's
+        desktop folder holds. Same containment policy as discovered apps:
+        terminal launchers run like any tool, GUI ones through `kilix run`.
+        """
+        if self.launchers is None:
+            self.launchers = registry.user_launchers()
+        if not self.launchers:
+            return [Entry("no launchers yet", None,
+                          reason="no .desktop files in the desktop folders")]
+        kilix = registry.kilix_command()
+        out = [entry for app in self.launchers
+               if (entry := _freedesktop_entry(app, kilix)) is not None]
+        if not out:
+            return [Entry("nothing launchable here", None,
+                          reason="every launcher failed to parse")]
+        return out
+
+    def _script_entries(self) -> list[Entry]:
+        """The stack's executable maintenance scripts, run in place.
+
+        The listing is `registry.script_rows()`, shared with the launcher
+        catalog, so the two surfaces can never disagree about what a script
+        is: executable `*.sh` under the stack's own scripts directories.
+        """
+        if self.scripts is None:
+            self.scripts = registry.script_rows()
+        if not self.scripts:
+            return [Entry("no scripts installed", None,
+                          reason="no executable *.sh under the stack's "
+                                 "scripts directories")]
+        return [Entry(str(row["label"]), tuple(row["argv"]))
+                for row in self.scripts]
+
+    def _manual_entries(self) -> list[Entry]:
+        """The stack's help book: topics at depth two, man pages below.
+
+        The book is `manual.TOPICS`, one text source however many surfaces
+        page it. The recovery guide resolves its document ladder when
+        launched, not when listed, so a guide installed after this desktop
+        started is still found; the hint says which way the launch will go —
+        the entry answers either way, because a recovery row that refuses is
+        useless at exactly the moment it is needed.
+        """
+        if len(self.path) == 3:
+            return self._man_page_entries()
+        guide = manual.recovery_path()
+        out: list[Entry] = []
+        for key, title in manual.topics():
+            hint = ""
+            if key == "recovery":
+                hint = "installed guide" if guide else "self-help steps"
+            out.append(Entry(title, (sys.executable, manual.PATH, key),
+                             hint=hint))
+        out.append(Entry("Man pages", None, submenu="man pages"))
+        return out
+
+    def _man_page_entries(self) -> list[Entry]:
+        """Every installed manual page, rendered by `man` in place.
+
+        The walk over the manpath is cached per visit like every other
+        list that costs more than a frame; `r` rescans. Thousands of rows
+        are what `/` exists for.
+        """
+        if self.man_pages is None:
+            self.man_pages = manual.man_pages()
+        if not self.man_pages:
+            return [Entry("no manual pages found", None,
+                          reason="nothing under the manpath directories")]
+        return [Entry(page["label"], ("man", page["section"], page["name"]))
+                for page in self.man_pages]
 
     def _screensaver_entries(self) -> list[Entry]:
         kilix = registry.kilix_command()
@@ -456,6 +647,20 @@ class State:
             return [Entry("screensavers need a Kilix checkout", None,
                           reason="no Kilix checkout reachable")]
         return [Entry(name, (*kilix, "screensaver", name)) for name in names]
+
+    def _palette_entries(self) -> list[Entry]:
+        """The Tango flavors, tried on in place (F-FLAVOR).
+
+        Wearing one is in-process — `tango.apply` re-aims the ramp both
+        renderers read — so the choice costs no subprocess and no restart.
+        Deliberately not here: writing `settings.conf`. The desk launches
+        and reads; the one shared config file is written by the host's own
+        settings surfaces, so the message names the key instead.
+        """
+        return [Entry(str(spec["label"]), None, flavor=name,
+                      hint=("current" if name == tango.FLAVOR
+                            else str(spec["note"])))
+                for name, spec in tango.FLAVORS.items()]
 
     def breadcrumb(self) -> str:
         if self.application_name:
@@ -486,6 +691,11 @@ def _put(surface, row: int, col: int, text: str, attr: int = 0) -> None:
 def _draw_home(surface, state: State, top: int,
                height: int, width: int) -> None:
     row = top
+    for line in state.alerts:
+        if row >= top + height - 1:
+            break
+        _put(surface, row, 2, f"! {line}"[: width - 3], tango.attr("alert"))
+        row += 1
     for label, value in state.status:
         if row >= top + height - 1:
             break
@@ -603,8 +813,12 @@ def render(surface, state: State) -> None:
         # Home is a place like any other, so the way out of it has to be on
         # screen. Drawing only the status rows left the cursor sitting on a
         # ".." the user could not see: Enter went back, and nothing said so.
-        _draw_entries(surface, state, body.top, 1, width)
-        _draw_home(surface, state, body.top + 2, max(0, body.height - 2), width)
+        # The list is ".." plus the pinned and recent rows; the facts keep
+        # whatever height remains below it.
+        rows = min(len(state.entries()), max(1, body.height - 2))
+        _draw_entries(surface, state, body.top, rows, width)
+        _draw_home(surface, state, body.top + rows + 1,
+                   max(0, body.height - rows - 1), width)
     else:
         _draw_entries(surface, state, body.top, body.height, width)
 
@@ -661,7 +875,10 @@ def _run_command(state: State) -> None:
     if not argv:
         state.message = ""
         return
-    _launch(state, Entry(text, argv, verb="tab"))
+    # Never remembered: a typed command went through nobody's list, so
+    # offering it again on Home would make a one-Enter row out of whatever
+    # was typed once — exactly what the recents record promises not to hold.
+    _launch(state, Entry(text, argv, verb="tab"), remember=False)
 
 
 def _run_key(key: int, state: State) -> bool:
@@ -700,7 +917,7 @@ def _resolve_program(name: str) -> str | None:
     return local if os.access(local, os.X_OK) else None
 
 
-def _launch(state: State, entry: Entry) -> None:
+def _launch(state: State, entry: Entry, *, remember: bool = True) -> None:
     """The verbs shared by list entries and the run prompt."""
     # Resolved here, not by the terminal: kitty spawns a page's child from
     # its own environment, whose PATH may lack ~/.local/bin — the child then
@@ -715,6 +932,15 @@ def _launch(state: State, entry: Entry) -> None:
                          "(not on PATH or in ~/.local/bin)")
         return
     argv[0] = program
+    # The one durable record (durable.py): a launch that resolved is worth
+    # offering again on Home. The argv remembered is the entry's own, not the
+    # resolved one, so the row keeps re-resolving as tools come and go.
+    # Confirmed actions and quiet toggles never reach this path, and the run
+    # prompt opts out, so nothing dangerous can become a one-Enter recents
+    # row.
+    if remember:
+        durable.remember_launch(entry.label, entry.argv)
+        state.home_rows = None
     if entry.verb == "tab" and state.live():
         try:
             kitty_rc.launch_tab(argv, title=entry.label)
@@ -742,6 +968,13 @@ def _open(state: State, entry: Entry) -> None:
         state.message = ""
         state.filter = ""
         return
+    if entry.flavor:
+        # In-process, quiet, and never a Home row: a palette is worn, not
+        # launched. Persistence stays with the one shared settings file.
+        applied = tango.apply(entry.flavor)
+        state.message = (f"wearing {applied} — KILIX_TUI_FLAVOR={applied} "
+                         "in settings.conf keeps it")
+        return
     if entry.argv is None:
         state.message = entry.reason
         return
@@ -752,6 +985,7 @@ def _open(state: State, entry: Entry) -> None:
         return
     if entry.confirm:
         state.confirm = (entry.label, entry.argv)
+        state.confirm_restart = entry.restart
         return
     _launch(state, entry)
 
@@ -766,11 +1000,15 @@ def _back(state: State) -> None:
         leaving = state.path[-1]
         state.path = state.path[:-1]
         state.message = ""
-        # Land the cursor on the place just left, so walking out and back in
-        # returns to where you were rather than to the top of the list.
-        siblings = [entry.label for entry in state.entries()]
-        state.selected = (siblings.index(leaving)
-                          if leaving in siblings else 0)
+        # Land the cursor on the row just walked through, so walking out and
+        # back in returns to where you were rather than to the top of the
+        # list. The row is found by where it leads before what it says: the
+        # Software place is entered through 'Install software', and matching
+        # labels alone stranded the cursor on ".." for every row named
+        # differently from its place.
+        state.selected = next(
+            (index for index, entry in enumerate(state.entries())
+             if leaving in (entry.submenu.capitalize(), entry.label)), 0)
 
 
 def _enter_section(state: State, section: int) -> None:
@@ -875,11 +1113,19 @@ def handle(key: int, state: State) -> bool:
         return True
     if state.confirm is not None:
         label, argv = state.confirm
+        restart = state.confirm_restart
         state.confirm = None
+        state.confirm_restart = False
         if key in (ord("y"), ord("Y")):
             if argv == QUIT_SENTINEL:
                 return False
             code = state.runner(argv)
+            if code == 0 and restart:
+                # Replaced on success; still here means the exec failed
+                # (or a test stubbed it), so say what remains to be done.
+                state.restart()
+                state.message = f"{label}: restart the desktop to finish"
+                return True
             state.message = (f"{label} exited {code}" if code
                              else f"{label}: done")
         else:
@@ -910,6 +1156,20 @@ def handle(key: int, state: State) -> bool:
                 state.message = (f"{entry.label}: {entry.alt_argv[-2]}d"
                                  if not code
                                  else f"{entry.label}: failed ({code})")
+                return True
+    if key in (ord("p"), ord("P")):
+        # Pin the selected entry to Home, or unpin it when it already is.
+        # Only plain launches qualify: a row that confirms or toggles must
+        # never become a one-Enter Home row.
+        entries = state.entries()
+        if state.selected < len(entries):
+            entry = entries[state.selected]
+            if (entry.argv is not None and not entry.confirm
+                    and not entry.toggle):
+                pinned = durable.toggle_pin(entry.label, entry.argv)
+                state.home_rows = None
+                state.message = (f"{entry.label}: pinned to Home" if pinned
+                                 else f"{entry.label}: unpinned")
                 return True
     if key == keymap.ESCAPE:
         # Esc walks out one level at a time, then asks before leaving.
@@ -952,9 +1212,14 @@ def handle(key: int, state: State) -> bool:
         return True
     if keymap.is_refresh(key):
         state.status = facts.status_rows()
+        state.alerts = facts.alerts()    # re-ask the security helper
         state.software = None            # re-ask the launcher for the list
         state.default_desktop = None
         state.apps = None                # rescan the .desktop entries
+        state.launchers = None           # reread the desktop folders
+        state.scripts = None             # relist the maintenance scripts
+        state.man_pages = None           # rescan the manpath
+        state.home_rows = None           # reread the durable record
         state.play_support = None        # re-probe the launcher's verbs
         state.message = ""
         return True
@@ -964,3 +1229,57 @@ def handle(key: int, state: State) -> bool:
 def self_next_section(state: State) -> int:
     """Tab cycles sections from wherever you are."""
     return (state.section + 1) % len(SECTIONS)
+
+
+# ── the idle screensaver (F-SAVER) ───────────────────────────────────────────
+
+
+def idle_saver_seconds() -> float | None:
+    """How long the desk may sit untouched before the screensaver starts.
+
+    `KILIX_TUI_SAVER_MINUTES` in the shared settings file (or environment)
+    decides, and `0` switches it off. Unset, the default depends on who owns
+    the terminal: ten minutes when the desktop *is* the session — the console
+    that would otherwise burn its menu in — and off in a pane or over ssh,
+    where taking the terminal after an idle spell would interrupt whatever
+    surrounds it. A value that does not parse is off, never a crash.
+    """
+    from kilix_tui import theme
+    fallback = "10" if os.environ.get("KILIX_TUI_SESSION") == "1" else "0"
+    try:
+        minutes = float(str(theme.setting("KILIX_TUI_SAVER_MINUTES",
+                                          fallback)).strip())
+    except ValueError:
+        minutes = 0.0
+    return minutes * 60 if minutes > 0 else None
+
+
+def saver_argv() -> tuple[str, ...] | None:
+    """The launch the idle timer runs, or None when there is nothing to run.
+
+    The same `kilix screensaver <name>` the Screensavers place offers:
+    `KILIX_TUI_SAVER` picks a favourite by name, anything else means the
+    first the checkout ships. Any key stops the saver — that is its own
+    contract — so returning from it is the user coming back.
+    """
+    kilix = registry.kilix_command()
+    names = registry.screensavers()
+    if kilix is None or not names:
+        return None
+    from kilix_tui import theme
+    wanted = str(theme.setting("KILIX_TUI_SAVER", "")).strip()
+    name = wanted if wanted in names else names[0]
+    return (*kilix, "screensaver", name)
+
+
+def start_screensaver(state: State) -> None:
+    """The idle action: hand the terminal to a screensaver until a key.
+
+    Deliberately not `_launch`: an idle start is nobody's launch, so it is
+    never remembered on Home, and it always runs attached — a screensaver
+    opened in a background page would save nothing. Without a checkout it
+    quietly does nothing; an idle desk needs no error either.
+    """
+    argv = saver_argv()
+    if argv is not None:
+        state.runner(argv)

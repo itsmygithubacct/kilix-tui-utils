@@ -16,7 +16,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_rollout import codex  # noqa: E402
+from kilix_rollout import codex, grok, omp  # noqa: E402
 from kilix_rollout.model import Session  # noqa: E402
 from kilix_tui import kitty_rc, pane_center  # noqa: E402
 
@@ -144,7 +144,24 @@ class CodexStateTests(unittest.TestCase):
                 "content": [{"type": "input_text", "text":
                              "<codex_internal_context>ignore me</codex_internal_context>"}]}},
         ]
-        if boundary == "task_complete":
+        if boundary == "approval":
+            # Shape emitted by Codex 0.157.1's rollout serializer for an exec
+            # approval (field names verified from the installed client).
+            records.append({"type": "event_msg", "payload": {
+                "type": "exec_approval_request", "approval_id": "approval-1",
+                "command": ["make", "test"], "cwd": "/tmp/project",
+                "reason": "run the project test suite",
+                "available_decisions": ["approved", "denied"]}})
+        elif boundary == "approval-resolved":
+            records.extend([
+                {"type": "event_msg", "payload": {
+                    "type": "exec_approval_request", "approval_id": "approval-1",
+                    "command": ["make", "test"], "cwd": "/tmp/project"}},
+                {"type": "event_msg", "payload": {
+                    "type": "exec_command_begin", "call_id": "approval-1",
+                    "command": ["make", "test"], "cwd": "/tmp/project"}},
+            ])
+        elif boundary == "task_complete":
             records.append({"type": "event_msg", "payload": {
                 "type": "task_complete"}})
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +184,20 @@ class CodexStateTests(unittest.TestCase):
             working = codex.session_from_path(str(working_path), pids=(78,))
             self.assertEqual(working.live_status, "working")
 
+    def test_live_rollout_reports_a_pending_codex_approval_as_waiting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pending_path = Path(temporary) / f"rollout-{CODEX_ID}.jsonl"
+            self.write_rollout(pending_path, "approval")
+            pending = codex.session_from_path(str(pending_path), pids=(77,))
+            self.assertEqual(pending.live_status, "waiting")
+            self.assertEqual(pending.pending_tool, "command approval")
+
+            resolved_path = Path(temporary) / "resolved" / f"rollout-{CODEX_ID}.jsonl"
+            self.write_rollout(resolved_path, "approval-resolved")
+            resolved = codex.session_from_path(str(resolved_path), pids=(78,))
+            self.assertEqual(resolved.live_status, "working")
+            self.assertEqual(resolved.pending_tool, "")
+
     def test_inspector_uses_only_the_rollout_opened_by_the_pane_pid(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -185,6 +216,106 @@ class CodexStateTests(unittest.TestCase):
             self.assertEqual(got.panes[0].activity, "idle")
             self.assertEqual(got.panes[0].doing, "real task")
             self.assertEqual(got.panes[0].coding.session_id, CODEX_ID)
+
+
+def agent_tree(argv: list[str], pid: int = 91) -> kitty_rc.Tree:
+    return kitty_rc.parse([{"id": 1, "is_focused": True, "tabs": [{
+        "id": 2, "title": "work", "is_active": True, "windows": [{
+            "id": 9, "pid": 70, "title": "agent", "cwd": "/tmp/project",
+            "is_focused": True, "env": {"KITTY_PTY_BROKER_SESSION": SESSION},
+            "foreground_processes": [{"pid": pid, "cmdline": argv, "cwd": "/tmp/project"}],
+    }]}]}])
+
+
+def two_agent_tree(first, second) -> kitty_rc.Tree:
+    return kitty_rc.parse([{"id": 1, "is_focused": True, "tabs": [{
+        "id": 2, "title": "work", "is_active": True, "windows": [
+            {"id": 9, "pid": 70, "title": "one", "cwd": "/tmp/project",
+             "foreground_processes": [{"pid": 91, "cmdline": first,
+                                        "cwd": "/tmp/project"}]},
+            {"id": 10, "pid": 71, "title": "two", "cwd": "/tmp/project",
+             "foreground_processes": [{"pid": 92, "cmdline": second,
+                                        "cwd": "/tmp/project"}]},
+        ]}]}])
+
+
+class GrokAndOmpStateTests(unittest.TestCase):
+    """kilix-needle's agents job: idle detection for grok and qwen-omp panes."""
+
+    def inspect(self, argv, proc_root):
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}):
+            return pane_center.Inspector(proc_root=proc_root).snapshot(agent_tree(argv)).panes[0]
+
+    def test_a_live_grok_pane_reports_its_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(grok, "active", return_value={"sid": (91, "/tmp/project")}), \
+                    mock.patch.object(grok, "activity", side_effect=["idle", "working", "waiting"]):
+                for want in ("idle", "working", "waiting"):
+                    got = self.inspect(["/home/u/.grok/bin/grok"], temporary)
+                    self.assertEqual((got.activity, got.coding.session_id), (want, "sid"))
+
+    def test_a_live_omp_pane_uses_the_newest_session_since_it_started(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Session(provider="omp", session_id="osid", path="/p", cwd="/tmp/project",
+                              title="t", updated=5.0)
+            with mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
+                    mock.patch.object(omp, "newest_in", return_value=session) as newest, \
+                    mock.patch.object(omp, "activity", return_value="idle"):
+                got = self.inspect(["omp", "--model", "qwen3.8-max"], temporary)
+            newest.assert_called_once_with("/tmp/project", after=4.0)
+            self.assertEqual((got.activity, got.coding.session_id), ("idle", "osid"))
+
+    def test_two_omp_panes_in_one_directory_do_not_share_the_newest_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}), \
+                    mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
+                    mock.patch.object(omp, "session_for_pid", return_value=None), \
+                    mock.patch.object(omp, "newest_in") as newest:
+                got = pane_center.Inspector(proc_root=temporary).snapshot(
+                    two_agent_tree(["omp"], ["omp"]))
+            newest.assert_not_called()
+            self.assertEqual([item.activity for item in got.panes], ["agent", "agent"])
+
+    def test_a_fresh_omp_breadcrumb_never_falls_back_to_another_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}), \
+                    mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
+                    mock.patch.object(omp, "session_for_pid", return_value=None), \
+                    mock.patch.object(omp, "has_terminal_marker", return_value=True), \
+                    mock.patch.object(omp, "newest_in") as newest:
+                got = self.inspect(["omp", "--model", "qwen3.8-max"], temporary)
+            newest.assert_not_called()
+            self.assertEqual(got.activity, "agent")
+
+    def test_outer_claude_owns_a_pane_with_an_omp_child(self):
+        nested = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{
+            "id": 9, "pid": 70, "title": "claude", "cwd": "/tmp/project",
+            "foreground_processes": [
+                {"pid": 91, "cmdline": ["claude"], "cwd": "/tmp/project"},
+                {"pid": 92, "cmdline": ["omp", "-p", "review"],
+                 "cwd": "/tmp/project"},
+            ],
+        }]}]}])
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={
+                        91: ("claude-sid", {"status": "busy", "cwd": "/tmp/project"})
+                    }), mock.patch.object(omp, "newest_in") as newest:
+                got = pane_center.Inspector(proc_root=temporary).snapshot(nested).panes[0]
+            newest.assert_not_called()
+            self.assertEqual((got.coding.provider, got.activity), ("claude", "working"))
+
+    def test_without_a_session_record_the_pane_is_only_an_agent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(grok, "active", return_value={}), \
+                    mock.patch.object(pane_center.liveness, "start_time", return_value=0.0), \
+                    mock.patch.object(omp, "newest_in") as newest:
+                self.assertEqual(self.inspect(["grok"], temporary).activity, "agent")
+                self.assertEqual(self.inspect(["omp"], temporary).activity, "agent")
+            newest.assert_not_called()
 
 
 class SnapshotTests(unittest.TestCase):

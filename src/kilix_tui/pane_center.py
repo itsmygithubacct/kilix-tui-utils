@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from kilix_rollout import claude, codex, liveness
+from kilix_rollout import claude, codex, grok, liveness, omp
 from kilix_rollout.model import Session
 
 from . import kitty_rc
@@ -282,6 +282,10 @@ def _process_agent(process: kitty_rc.Process) -> str:
         return "claude"
     if "kimi" in names or "kimi-code" in names:
         return "kimi"
+    if "grok" in names:
+        return "grok"
+    if "omp" in names:
+        return "omp"
     return ""
 
 
@@ -441,10 +445,11 @@ class Inspector:
         self,
         pane: kitty_rc.Pane,
         claude_by_pid: dict[int, tuple[str, dict[str, object]]],
+        ambiguous_omp_cwds: frozenset[str] = frozenset(),
     ) -> Session | None:
         if session := self._codex_for(pane):
             return session
-        for process in reversed(pane.processes):
+        for process in pane.processes:
             provider = _process_agent(process)
             if provider == "claude":
                 known = claude_by_pid.get(process.pid)
@@ -460,6 +465,37 @@ class Inspector:
                     version=str(record.get("version") or ""),
                     entrypoint=str(record.get("entrypoint") or ""),
                 )
+            if provider == "grok":
+                # Its own registry names the session a live pid holds; its
+                # event log says whether that session's turn is running.
+                known = grok.active(proc_root=self.proc_root)
+                for session_id, (pid, cwd) in known.items():
+                    if pid == process.pid:
+                        folder = grok.session_dir(session_id, cwd)
+                        return _minimal_session(
+                            "grok", pane, session_id=session_id,
+                            status=grok.activity(folder), cwd=cwd,
+                            pids=(process.pid,))
+                return _minimal_session("grok", pane, session_id=_argument_session(process),
+                                        pids=(process.pid,) if process.pid else ())
+            if provider == "omp":
+                started = liveness.start_time(process.pid, proc_root=self.proc_root)
+                found = omp.session_for_pid(
+                    process.pid, proc_root=self.proc_root, after=started
+                ) if started else None
+                marked = omp.has_terminal_marker(
+                    process.pid, proc_root=self.proc_root, after=started
+                ) if started else False
+                if (found is None and not marked and started
+                        and pane.cwd not in ambiguous_omp_cwds):
+                    found = omp.newest_in(pane.cwd, after=started)
+                if found is not None:
+                    return _minimal_session(
+                        "omp", pane, session_id=found.session_id,
+                        status=omp.activity(found.path), cwd=found.cwd,
+                        title=found.title, pids=(process.pid,))
+                return _minimal_session("omp", pane, session_id=_argument_session(process),
+                                        pids=(process.pid,) if process.pid else ())
             if provider == "kimi":
                 return _minimal_session(
                     "kimi", pane,
@@ -480,9 +516,15 @@ class Inspector:
         page_index = {
             page.id: page.index for page in tree.pages
         }
+        omp_counts: dict[str, int] = {}
+        for current in tree.panes:
+            if any(_process_agent(process) == "omp" for process in current.processes):
+                omp_counts[current.cwd] = omp_counts.get(current.cwd, 0) + 1
+        ambiguous_omp_cwds = frozenset(
+            cwd for cwd, count in omp_counts.items() if count > 1)
         panes = []
         for pane in tree.panes:
-            coding = self._coding_for(pane, claude_by_pid)
+            coding = self._coding_for(pane, claude_by_pid, ambiguous_omp_cwds)
             broker = brokers.get(pane.broker_session)
             panes.append(PaneInfo(
                 pane=pane,

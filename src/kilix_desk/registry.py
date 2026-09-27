@@ -19,9 +19,15 @@ import shutil
 import sys
 from dataclasses import dataclass
 
-from kilix_desk import sources
+from kilix_desk import manual, sources
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# The Plebian-OS dependency reinstaller, deployed by the OS itself. Helper
+# entries are presence-gated like the reference desktop's System menu: a
+# machine without the helper hides the row rather than offering a command
+# that can only fail.
+DEPS_HELPER = "/usr/local/sbin/plebian-os-install-deps"
 
 
 @dataclass(frozen=True)
@@ -31,10 +37,13 @@ class Item:
     sibling: str | None = None       # tools/<dir> in this checkout
     source: str | None = None        # <dir>/main.py in this checkout
     kilix: tuple[str, ...] = ()      # `kilix <subcommand>` fallback
+    topic: str = ""                  # a help-book topic, paged by manual.py
     verb: str = "inplace"            # inplace | tab | report
     kilix_only: bool = False         # hidden outside a Kilix session
     submenu: str = ""                # opens a drill-down list instead
     confirm: bool = False            # asks before running
+    helper: str = ""                 # a root helper run via sudo; hidden when absent
+    restart: bool = False            # a clean run re-execs the desktop
 
 
 @dataclass(frozen=True)
@@ -68,7 +77,11 @@ PROGRAMS = (
     # by category. The stack programs above stay a curated list; this place is
     # the uncurated rest of the computer.
     Item("Applications", submenu="applications"),
-    Item("Music", command="kilix-music", sibling="music"),
+    # The user's own desktop-folder launchers — the files a Create Launcher
+    # wizard writes — read from the same folders `kilix-launcher` reads, so
+    # a launcher made on any desktop is reachable from this one.
+    Item("Launchers", submenu="launchers"),
+    Item("Music", command="kilix-music", sibling="music", verb="tab"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
     Item("Voice Studio", submenu="voice"),
@@ -88,6 +101,9 @@ VOICE = (
     Item("Voice settings", command="kilix-settings", kilix=("settings",)),
     Item("Voice status", kilix=("voice", "status"), verb="report"),
     Item("Voice doctor", kilix=("voice", "doctor"), verb="report"),
+    # Orientation, not a tool: the speech widgets are host chrome, and a
+    # place full of settings and diagnostics needs one entry saying so.
+    Item("Where speak and dictate live", topic="voice"),
 )
 
 MACHINE = (
@@ -101,19 +117,44 @@ MACHINE = (
     Item("Disk", command="kilix-disk", sibling="disk"),
     Item("System facts", command="kilix-system", sibling="system"),
     Item("Volume", command="kilix-volume", sibling="volume"),
-    Item("Network", command="nmtui"),
+    # The canonical network place: links and saved connections, up and down.
+    Item("Network", command="kilix-network", sibling="network"),
+    # NetworkManager's own full-screen editor, kept for the surface the
+    # canonical tool deliberately leaves there — creating connections and
+    # entering secrets. An accepted external exception, presence-gated like
+    # every outside command.
+    Item("Connection editor", command="nmtui"),
     Item("Packages", command="kilix-package", sibling="package"),
 )
 
 SYSTEM = (
     Item("OS control", command="plebian-os", sibling="plebian_control"),
+    # The stack's help book — the topics Kilix 95's Help renders, with the
+    # recovery guide one Enter away rather than buried inside OS control.
+    Item("Manual", submenu="manual"),
+    # `passwd` behind the held-output wrapper: the change itself is
+    # interactive, the result is worth reading, and Home's security alert
+    # points here when the login password is still the shipped default.
+    Item("Change password", command="passwd", verb="report"),
     Item("Audio settings", command="kilix-volume", sibling="volume"),
     Item("Chrome settings", command="kilix-settings", kilix=("settings",)),
+    # The desk's own accent, tried on in place; the shared KILIX_TUI_FLAVOR
+    # setting is what makes a choice permanent (F-FLAVOR, in tango.py).
+    Item("Palette", submenu="palette"),
     Item("Screen size", kilix=("screen-size", "show"), verb="report"),
     Item("Stack status", kilix=("status",), verb="report"),
     Item("Voice status", kilix=("voice", "status"), verb="report"),
     Item("Voice doctor", kilix=("voice", "doctor"), verb="report"),
     Item("Update the stack", kilix=("update",), confirm=True),
+    # The same update, then a fresh desktop process on top of it — the only
+    # way the menu you come back to is drawn by the code the update just
+    # installed. Power stays the frozen three privileged argvs; this row is
+    # maintenance, so it lives here.
+    Item("Update and restart desktop", kilix=("update",), confirm=True,
+         restart=True),
+    Item("Reinstall dependencies", helper=DEPS_HELPER, verb="report",
+         confirm=True),
+    Item("Scripts", submenu="scripts"),
     Item("Screen sharing", kilix=("share",), verb="tab", kilix_only=True),
     # `kilix desktop <name>` opens its own page and returns at once, so these
     # run in place: launching them in a page of ours would leave a dead tab
@@ -137,9 +178,14 @@ SESSION = (
     Item("Session logs", command="kilix-session-log", sibling="session_log"),
     Item("PTY sessions", kilix=("pty",), kilix_only=True),
     Item("Mux terminal", kilix=("mux",), kilix_only=True),
-    Item("Tmux manager", command="tmux-tui"),
+    # `kilix tmux` installs-and-runs the manager — the same command the
+    # catalog's Tmux Sessions entry launches — so the row still resolves on
+    # a machine that has never installed the binary.
+    Item("Tmux manager", command="tmux-tui", kilix=("tmux",)),
     # The streaming tiers: serve holds a session open, attach drives it,
-    # view watches without a keyboard.
+    # view watches without a keyboard. Deliberately the host's own verbs,
+    # never a catalog app: they must work on a machine whose catalog has
+    # installed nothing.
     Item("Serve this session", kilix=("serve",), kilix_only=True),
     Item("Attach to a session", kilix=("attach",), kilix_only=True),
     Item("Watch a session", kilix=("view",), kilix_only=True),
@@ -228,15 +274,128 @@ def screensavers() -> list[str]:
     return names
 
 
+def helper_ready(path: str) -> bool:
+    """Whether a root helper is installed where the OS deploys it.
+
+    `sudo` must exist too: the helpers are root-only by design, and a row
+    that cannot possibly run is noise, not an offer.
+    """
+    return bool(shutil.which("sudo")) and os.access(path, os.X_OK)
+
+
+def script_dirs() -> list[str]:
+    """The stack's scripts/ directories, gated on presence like the
+    reference desktop's System menu."""
+    dirs = [os.path.expanduser(os.path.join("~", "pleb", "scripts"))]
+    kilix_home = os.environ.get("KILIX_HOME", "")
+    if kilix_home:
+        dirs.append(os.path.join(kilix_home, "scripts"))
+    return dirs
+
+
+def script_rows(dirs: list[str] | None = None) -> list[dict]:
+    """Executable *.sh under the pleb/kilix scripts directories — the same
+    files the reference desktop's System ▸ Scripts submenu offers. One
+    source for the desk's Scripts place and the launcher catalog alike."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for base in (script_dirs() if dirs is None else dirs):
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            if not name.endswith(".sh") or name in seen:
+                continue
+            path = os.path.join(base, name)
+            if not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            seen.add(name)
+            out.append({"kind": "script", "label": name, "detail": "script",
+                        "argv": [path], "verb": "inplace"})
+    return out
+
+
+def launcher_dirs() -> list[str]:
+    """The user's desktop-launcher folders: override first, then the roots
+    Kilix 95 and the host's bundled desktop actually write. One list for the
+    desk's Launchers place and the launcher catalog alike."""
+    override = os.environ.get("KILIX_DESKTOP_DIR")
+    if override:
+        return [override]
+    base = os.environ.get("GPU_TERMINAL_HOME") or os.path.expanduser(
+        "~/.local/gpu_terminal")
+    return [os.path.join(base, "kilix-95", "data", "desktop"),
+            os.path.join(base, "kilix", "data", "desktop")]
+
+
+def user_launchers() -> list[dict]:
+    """The user's own desktop-folder launchers, parsed like any `.desktop`.
+
+    The parser is the shared `kilix_tui.xdgapps` one, so a launcher a wizard
+    wrote renders here exactly as it renders in every other catalog. A file
+    present in more than one folder keeps its first (Kilix 95) reading, and a
+    machine with no folders is a state, not a fault.
+    """
+    from kilix_tui import xdgapps
+    out: list[dict] = []
+    seen: set[str] = set()
+    for directory in launcher_dirs():
+        try:
+            entries = xdgapps.entries_in(directory)
+        except Exception:
+            continue
+        for entry in entries:
+            if entry["id"] in seen:
+                continue
+            seen.add(entry["id"])
+            out.append(entry)
+    return out
+
+
+def _catalog_file(path: str) -> list[dict] | None:
+    """One catalog file read as the launcher's rows (`KILIX_TUI_CATALOG`).
+
+    Either shape answers: a list is a saved `kilix install --json` reply,
+    kept as it is; a kilix-content document (`{"content": [...]}`) is shaped
+    the way the launcher shapes it. Installed state is a fact only the
+    launcher can check, so a raw catalog honestly answers False. A file that
+    does not read or parse is None — the same degradation as no launcher.
+    """
+    import json
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    rows = data.get("content") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return [{"id": str(row.get("id", "")),
+             "label": str(row.get("label") or row.get("id", "")),
+             "kind": str(row.get("kind", "")),
+             "description": str(row.get("description", "")),
+             "installed": False}
+            for row in rows if isinstance(row, dict)]
+
+
 def installable() -> list[dict] | None:
     """Everything `kilix install` offers, as it reports it.
 
     The desktop asks the launcher rather than reading the catalog itself. There
     is one list in this system and one thing that knows how to install from it;
     a second reader here would be a second catalogue to keep true.
+
+    `KILIX_TUI_CATALOG` substitutes the whole answer with a file — for tests
+    and for development against a catalog that is not installed yet. It
+    replaces the one list rather than adding a second: every place still
+    reads this function, whichever way it was answered.
     """
     import json
     import subprocess
+    override = os.environ.get("KILIX_TUI_CATALOG")
+    if override:
+        return _catalog_file(override)
     launcher = kilix_command()
     if launcher is None:
         return None
@@ -297,10 +456,16 @@ def resolve(item: Item) -> Plan | None:
         root = os.path.realpath(ROOT) + os.sep
         if path.startswith(root) and os.path.isfile(path):
             return Plan((sys.executable, path), item.verb)
+    if item.topic:
+        # The help book ships with the desktop, so this never misses: the
+        # book and the desk are the same checkout by construction.
+        return Plan((sys.executable, manual.PATH, item.topic), item.verb)
     if item.kilix:
         launcher = kilix_command()
         if launcher:
             return Plan((*launcher, *item.kilix), item.verb)
+    if item.helper and helper_ready(item.helper):
+        return Plan(("sudo", item.helper), item.verb)
     return None
 
 

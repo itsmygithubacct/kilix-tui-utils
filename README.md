@@ -17,6 +17,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-disk` | Filesystem usage and an interruptible directory scan |
 | `kilix-system` | Static machine facts (`--print`) and a combined CPU, memory, disk, network, and process health report (`--json`) |
 | `kilix-volume` | Clickable output mixer, plus `--compact` slider and `--settings` mute card |
+| `kilix-network` | Links and saved NetworkManager connections — Enter brings one up, `d` (confirmed) takes one down; read-only without nmcli |
 | `kilix-file` | File manager — navigate and open, never delete or move |
 | `kilix-system-center` | Focused machine center over CPU, memory, thermal, disk, network, audio, camera, package, and VM tools |
 | `kilix-settings-center` | Shared Kilix settings, display, audio, voice, and default-desktop center |
@@ -31,7 +32,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-weather` | Forecast from Open-Meteo |
 | `kilix-cameras` | Camera views and stream profiles for kilix-rtsp — view a camera, mosaic a group, `n` writes a profile to `cameras.conf` |
 | `kilix-calculator` | Calculator (also scriptable: `kilix-calculator '2+2'`) |
-| `kilix-music` | Player driving kilix-amp over its control socket |
+| `kilix-music` | [File and live EnCodec player](tools/music/README.md) controlling the shared Amp backend |
 | `kilix-character-map` | Search Unicode names/codepoints and copy with OSC 52 |
 | `kilix-notepad` | Portable UTF-8 editor with atomic saves and guarded discard |
 | `kilix-find-files` | Bounded filename/glob search that does not follow directory symlinks |
@@ -141,7 +142,7 @@ applications and launches each through `kilix app run ID`. The row is generic:
 new catalog apps appear in TUI panes and in Kilix Land's shared Programs
 computer without another desktop-specific edit.
 
-Three more Programs surfaces follow the same discipline. **Run a command**
+Four more Programs surfaces follow the same discipline. **Run a command**
 (also `!` from anywhere) opens a one-line prompt on the summary row; what you
 type is split like a shell would split it but never given to one — argv only,
 into a Kilix page when remote control is live and in place otherwise, with
@@ -152,12 +153,55 @@ a byte-identical mirror of the host SDK's `kilix_sdk.xdgapps` kept by
 `tools/sync_xdgapps.py` and pinned by a parity test, so no desktop or
 catalog tool can disagree with this list), bucketed by
 category; terminal apps launch like any tool, graphical ones are contained in
-a `kilix run` page. And **Games** launches on Enter when the installed
+a `kilix run` page. **Launchers** lists the user's own desktop-folder
+`.desktop` files — the ones a Create Launcher wizard writes on any desktop —
+read from the same folders `kilix-launcher` reads
+(`kilix_desk.registry.launcher_dirs`), under the same containment. And
+**Games** lists the games from that same host response — a game added to the
+catalog is listed and playable here with no desktop release — with the SDK's
+availability toggles as the on/off hint. Enter launches when the installed
 launcher knows `kilix games play` — probed from its own usage line, cached per
 visit — while `t` keeps the availability toggle one key away; older launchers
-keep Enter as the toggle, so the list is never a dead end.
+keep Enter as the toggle (or the install, for a game the toggle table does not
+know), so the list is never a dead end.
 
-Six sections: Home (status), Programs, Machine,
+That is the contract as the catalog grows: **there is no second list.** Every
+place that offers installable content reads the one cached
+`kilix install --json` answer (or the shared Programs registry), fetched once
+per visit and re-asked on `r`, so a new catalog entry needs a kilix-content
+publish and the kilix pin that ships it — never a desktop release.
+`KILIX_TUI_CATALOG` can point that one answer at a catalog file, for tests and
+for development against a catalog that is not installed yet; it substitutes
+the list, it never adds one. A test audits the real catalog through that
+override: every row must be installable from Software, and every app and game
+must resolve to its `kilix app run` / `kilix games play` launch.
+
+Home also carries the desk's one piece of durable state: rows pinned with
+`p` from any plain entry, and the last few launches, kept in one small JSON
+record (`$XDG_STATE_HOME/kilix-tui/desk.json`; `KILIX_TUI_STATE` relocates
+it) written atomically and only on change. `src/kilix_desk/durable.py`
+records the decision to break the desk's read-only purity exactly this far
+and no further — confirmed actions never become one-Enter rows, and there is
+no last-place restore: Home stays the fixed landing.
+
+The desk's accent is a choice. System ▸ **Palette** tries on one of four
+Tango flavors — sky blue (the default), chameleon green, plum, amber — for
+the running session, and `KILIX_TUI_FLAVOR` in the shared `settings.conf`
+(the same file every `theme.setting` knob reads, with the environment as the
+fallback) makes one permanent. A flavor swaps only the structural/selection
+ramp in `src/kilix_desk/tango.py`, in both the text and pixel renderings;
+red stays reserved for power and refusal in every flavor.
+
+Left alone, the desk saves the screen. When `kilix-tui` is the whole session
+(`KILIX_TUI_SESSION=1`), ten quiet minutes hand the terminal to
+`kilix screensaver` — the same launch the Screensavers place offers — and
+any key is the way back. `KILIX_TUI_SAVER_MINUTES` changes the span (`0`
+switches it off; off is also the default in a pane or over ssh, where taking
+the terminal would interrupt the surrounding session), and `KILIX_TUI_SAVER`
+names a favourite saver. An idle start is nobody's launch: it never becomes
+a Home recents row.
+
+Six sections: Home (status, pinned and recent launches), Programs, Machine,
 System, Session, and Power — the last being the point: it closes the stack's
 no-desktop-provider power gap with confirmed `systemctl`/`loginctl` actions
 shared verbatim with `plebian-os` (`src/kilix_tui/privileged.py` is the one list
@@ -235,6 +279,16 @@ monitors, so the suite has one visual and navigation language over SSH, in
 `tmux`, and inside Kilix. Memory, Temperatures, and the desktop retain optional
 framebuffer renderings behind `--graphics`.
 
+**The network boundary, decided.** Machine ▸ Network lands on `kilix-network`:
+the canonical shell over what every link is doing and the saved NetworkManager
+connections — up on Enter, down only after a confirmation, because the link
+being cut is often the one carrying the keystroke. Creating connections and
+entering secrets deliberately stay in `nmtui`, kept one row below as the
+presence-gated **Connection editor**: a password prompt belongs to
+NetworkManager's own agent, and a reimplementation of it here would be a
+second thing to get wrong. Without NetworkManager the tool degrades to a
+read-only `/sys/class/net` view rather than an error.
+
 ## Pane Center
 
 `kilix-panes` (also installed as the compatible `kilix-switch`) replaces the
@@ -258,6 +312,14 @@ live registry supplies `idle`, `waiting`, or active state. A recognized agent
 without an explicit signal stays `agent`; it is never optimistically called
 idle. Shells, SSH sessions, and other foreground programs are labelled
 separately.
+
+For live OMP panes, a clean assistant stop becomes idle only after a short
+stability window. OMP 18.3.2 can automatically retry a provider error after a
+backoff (five minutes by default, potentially longer for an opted-in quota-reset
+wait), but writes the failed assistant row without persisting its
+`auto_retry_start` event. Therefore a transcript ending in provider `error`
+remains conservatively `working`; a finite idle debounce would expose the pane
+during a retry backoff. Deliberate aborts still use the short stability window.
 
 The same snapshot is a scriptable `kilix panes` interface:
 

@@ -3,11 +3,13 @@
 Three agents store conversations three different ways, so most of these build a
 small transcript in each layout and assert the recovery state read back out of
 it. The rest pin the properties that make this safe to put behind a menu: it
-never resumes a session another process still owns, it never pipes anything
-into a shell without a yes, and the install commands it would run are exactly
-the ones its vendors document.
+never resumes a session another process still owns, it never runs an
+installer without a yes, and the installer it would run is the pinned vendor
+script.
 """
 import ast
+from dataclasses import replace
+import hashlib
 from contextlib import redirect_stdout
 import importlib.util
 import io
@@ -23,8 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kilix_rollout import (  # noqa: E402
-    claude, codex, config, installer, kimi, launch, liveness, manage, menu,
-    pacing, providers,
+    claude, codex, config, grok, installer, kimi, launch, liveness, manage, menu,
+    omp, pacing, providers,
 )
 from kilix_rollout.model import Session  # noqa: E402
 
@@ -283,6 +285,296 @@ class KimiTests(unittest.TestCase):
             self.assertEqual(kimi.discover(root=temporary), [])
 
 
+class GrokTests(unittest.TestCase):
+    """Readable by key for kilix-needle's agents job: resume lists and the
+    working / waiting / idle a pane's live grok is in."""
+
+    def build(self, root, events, *, cwd="/tmp/grok project", sid="01a0-grok"):
+        from urllib.parse import quote
+        directory = os.path.join(root, "sessions", quote(cwd, safe=""), sid)
+        os.makedirs(directory)
+        write_lines(os.path.join(directory, "events.jsonl"), [
+            event if isinstance(event, dict) else {"type": event}
+            for event in events
+        ])
+        write_lines(os.path.join(directory, "chat_history.jsonl"), [
+            {"type": "system", "content": "sys"},
+            {"type": "user", "content": [{"type": "text", "text": "<ctx>"}],
+             "synthetic_reason": "meta"},
+            {"type": "user", "content": [{"type": "text", "text": "fix the tests"}]}])
+        return directory
+
+    def test_turn_and_question_events_decide_the_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            cases = {("turn_started", "turn_ended"): "idle",
+                     ("turn_ended", "turn_started", "tool_started"): "working",
+                     (): "unknown"}
+            for index, (events, want) in enumerate(cases.items()):
+                folder = self.build(root, list(events), sid=f"s{index}")
+                self.assertEqual(grok.activity(folder), want, events)
+
+    def test_only_an_open_question_is_waiting(self):
+        with tempfile.TemporaryDirectory() as root:
+            question = {"type": "tool_started", "tool_name": "ask_user_question"}
+            permission = {"type": "permission_requested", "tool_name": "read_file"}
+            folder = self.build(root, ["turn_started", permission, question])
+            self.assertEqual(grok.activity(folder), "waiting")
+            write_lines(os.path.join(folder, "events.jsonl"), [
+                {"type": "turn_started"}, question,
+                {"type": "tool_completed", "tool_name": "ask_user_question"},
+            ])
+            self.assertEqual(grok.activity(folder), "working")
+
+    def test_real_permission_transcript_waits_until_it_is_resolved(self):
+        with tempfile.TemporaryDirectory() as root:
+            requested = "2026-09-09T17:27:56.130Z"
+            then = grok._timestamp(requested)
+            folder = self.build(root, [
+                {"ts": "2026-09-09T17:27:55.900Z", "type": "tool_started",
+                 "tool_name": "bash"},
+                {"ts": requested, "type": "permission_requested", "tool_name": "bash"},
+            ])
+            self.assertEqual(grok.activity(folder, now=then + 9), "waiting")
+            with open(os.path.join(folder, "events.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"ts": "2026-09-09T17:28:10.052Z",
+                                         "type": "permission_resolved", "tool_name": "bash",
+                                         "decision": "allow", "wait_ms": 13922}) + "\n")
+            self.assertEqual(grok.activity(folder, now=then + 14), "working")
+
+    def test_permission_without_a_timestamp_is_already_waiting(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = self.build(root, [{"type": "permission_requested",
+                                        "tool_name": "bash"}])
+            self.assertEqual(grok.activity(folder, now=0), "waiting")
+
+    def test_planner_and_boundaries_beyond_the_last_400_records_are_found(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = self.build(root, ["turn_ended"] + ["phase_changed"] * 500
+                                + ["goal_planner_fired"])
+            self.assertEqual(grok.activity(folder), "working")
+            write_lines(os.path.join(folder, "events.jsonl"), [
+                {"type": "turn_started"}, *({"type": "phase_changed"} for _ in range(500))])
+            self.assertEqual(grok.activity(folder), "working")
+
+    def test_a_just_ended_turn_is_not_a_transient_idle(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = self.build(root, [{"type": "turn_ended",
+                                        "ts": "2026-09-27T12:00:00Z"}])
+            ended = grok._timestamp("2026-09-27T12:00:00Z")
+            self.assertEqual(grok.activity(folder, now=ended + 1), "working")
+            self.assertEqual(grok.activity(folder, now=ended + 6), "idle")
+
+    def test_discover_reads_cwd_title_and_liveness(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.build(root, ["turn_started"])
+            proc = os.path.join(root, "proc")
+            found = grok.discover(root=root, proc_root=proc)
+            self.assertEqual((found[0].cwd, found[0].title, found[0].state),
+                             ("/tmp/grok project", "fix the tests", "cut-off"))
+            os.makedirs(os.path.join(proc, "4242"))
+            with open(os.path.join(root, "active_sessions.json"), "w") as handle:
+                json.dump([{"session_id": "01a0-grok", "pid": 4242, "cwd": "/tmp/grok project"},
+                           {"session_id": "gone", "pid": 99999, "cwd": "/x"}], handle)
+            self.assertEqual(grok.active(root, proc_root=proc),
+                             {"01a0-grok": (4242, "/tmp/grok project")})
+            found = grok.discover(root=root, proc_root=proc)
+            self.assertEqual((found[0].state, found[0].pids, found[0].live_status),
+                             ("live", (4242,), "working"))
+
+    def test_active_registry_matches_pid_start_and_uses_its_latest_entry(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "proc")
+            os.makedirs(os.path.join(proc, "4242"))
+            with open(os.path.join(proc, "stat"), "w") as handle:
+                handle.write("btime 1000\n")
+            fields = ["4242", "(grok)", "S"] + ["0"] * 49
+            fields[21] = "100"
+            with open(os.path.join(proc, "4242", "stat"), "w") as handle:
+                handle.write(" ".join(fields) + "\n")
+            opened = "1970-01-01T00:16:42Z"
+            with open(os.path.join(root, "active_sessions.json"), "w") as handle:
+                json.dump([
+                    {"session_id": "old", "pid": 4242, "cwd": "/old",
+                     "opened_at": opened},
+                    {"session_id": "new", "pid": 4242, "cwd": "/new",
+                     "opened_at": "1970-01-01T00:16:43Z"},
+                ], handle)
+            with mock.patch.object(os, "sysconf", return_value=100):
+                self.assertEqual(grok.active(root, proc_root=proc),
+                                 {"new": (4242, "/new")})
+            fields[21] = "500"
+            with open(os.path.join(proc, "4242", "stat"), "w") as handle:
+                handle.write(" ".join(fields) + "\n")
+            with mock.patch.object(os, "sysconf", return_value=100):
+                self.assertEqual(grok.active(root, proc_root=proc), {})
+
+    def test_process_start_time_adds_boot_time(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "7"))
+            with open(os.path.join(root, "stat"), "w") as handle:
+                handle.write("cpu 1 2 3\nbtime 1000\n")
+            fields = ["7", "(a process)", "S"] + ["0"] * 49
+            fields[21] = "250"
+            with open(os.path.join(root, "7", "stat"), "w") as handle:
+                handle.write(" ".join(fields) + "\n")
+            with mock.patch.object(os, "sysconf", return_value=100):
+                self.assertEqual(liveness.start_time(7, proc_root=root), 1002.5)
+
+    def test_resume_argv(self):
+        self.assertEqual(grok.resume_argv(sample("grok")), ["grok", "--resume", "abc123"])
+        self.assertEqual(grok.resume_argv(sample("grok"), yolo=True),
+                         ["grok", "--always-approve", "--resume", "abc123"])
+
+
+class OmpTests(unittest.TestCase):
+    def build(self, root, messages, *, cwd="/tmp/qwen", sid="01a0-omp", name="t_01a0-omp.jsonl"):
+        directory = os.path.join(root, "sessions", omp.folder_for(cwd))
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name)
+        write_lines(path, [{"type": "title", "title": "Check torch"},
+                           {"type": "session", "id": sid, "cwd": cwd},
+                           *[{"type": "message", "message": m} for m in messages]])
+        return path
+
+    def test_the_newest_message_decides_the_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            done = {"role": "assistant", "stopReason": "stop", "content": [{"type": "text"}]}
+            tool = {"role": "assistant", "stopReason": "toolUse", "content": [{"type": "toolCall"}]}
+            stopped_tool = {"role": "assistant", "stopReason": "stop",
+                            "content": [{"type": "toolCall"}]}
+            cases = [([{"role": "user"}, done], "idle"), ([{"role": "user"}], "working"),
+                     ([tool], "unknown"), ([stopped_tool], "unknown"),
+                     ([tool, {"role": "toolResult"}], "working"),
+                     ([{"role": "assistant", "stopReason": "aborted"}], "idle"),
+                     ([{"role": "assistant", "stopReason": "error"}], "working"),
+                     ([], "unknown")]
+            for index, (messages, want) in enumerate(cases):
+                path = self.build(root, messages, name=f"t{index}.jsonl", sid=f"s{index}")
+                self.assertEqual(omp.activity(path, now=os.stat(path).st_mtime + 1), want, messages)
+
+    def test_idle_must_be_stable_for_300_milliseconds(self):
+        with tempfile.TemporaryDirectory() as root:
+            stamp = "2026-09-27T10:48:50.483Z"
+            changed = omp._timestamp(stamp)
+            directory = os.path.join(root, "sessions", omp.folder_for("/tmp/qwen"))
+            os.makedirs(directory)
+            path = os.path.join(directory, "stable.jsonl")
+            write_lines(path, [{"type": "session", "id": "stable", "cwd": "/tmp/qwen"},
+                               {"type": "message", "timestamp": stamp,
+                                "message": {"role": "assistant", "stopReason": "aborted"}}])
+            self.assertEqual(omp.activity(path, now=changed + 0.05), "working")
+            self.assertEqual(omp.activity(path, now=changed + 0.299), "working")
+            self.assertEqual(omp.activity(path, now=changed + 0.301), "idle")
+
+    def test_async_developer_and_custom_messages_restart_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            done = {"role": "assistant", "stopReason": "stop", "content": []}
+            path = self.build(root, [done, {"role": "developer"}])
+            self.assertEqual(omp.activity(path), "working")
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "custom_message",
+                                         "customType": "async-result"}) + "\n")
+            # Make the prior completed turn old enough that the idle debounce
+            # cannot mask whether custom_message itself was recognized.
+            old = 1_000_000
+            os.utime(path, (old, old))
+            self.assertEqual(omp.activity(path, now=old + 60), "working")
+
+    def test_a_custom_message_alone_restarts_work(self):                      # KX-R13-41 T2
+        with tempfile.TemporaryDirectory() as root:
+            done = {"role": "assistant", "stopReason": "stop", "content": []}
+            path = self.build(root, [done])
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "custom_message",
+                                         "customType": "async-result"}) + "\n")
+            old = 1_000_000
+            os.utime(path, (old, old))
+            self.assertEqual(omp.activity(path, now=old + 60), "working")
+
+    def test_provider_error_cannot_read_idle_during_retry_backoff(self):
+        with tempfile.TemporaryDirectory() as root:
+            stamp = "2026-09-27T10:48:50.483Z"
+            path = self.build(root, [{"role": "assistant", "stopReason": "error"}])
+            self.assertEqual(omp.activity(path, now=omp._timestamp(stamp) + 3600), "working")
+
+    def test_discover_and_the_newest_session_in_a_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.build(root, [{"role": "user"}])
+            found = omp.discover(root=root)
+            self.assertEqual((found[0].session_id, found[0].cwd, found[0].title, found[0].state),
+                             ("01a0-omp", "/tmp/qwen", "Check torch", "cut-off"))
+            self.assertEqual(omp.newest_in("/tmp/qwen", root=root).session_id, "01a0-omp")
+            self.assertIsNone(omp.newest_in("/tmp/qwen", root=root, after=found[0].updated + 60))
+            self.assertIsNone(omp.newest_in("/elsewhere", root=root))
+
+    def test_folder_layout_strips_the_home_prefix(self):
+        with mock.patch.object(os.path, "expanduser", return_value="/home/tester"):
+            self.assertEqual(omp.folder_for("/home/tester/qwen"), "-qwen")
+            self.assertEqual(omp.folder_for("/tmp/qwen"), "-tmp-qwen")
+
+    def test_terminal_state_selects_the_owning_session_and_honors_start_time(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.build(root, [{"role": "user"}])
+            os.utime(path, (2000, 2000))
+            terminal = os.path.join(root, "terminal-sessions")
+            os.makedirs(terminal)
+            with open(os.path.join(terminal, "pts-9"), "w") as handle:
+                handle.write(f"/tmp/qwen\n{path}\nfresh\n")
+            descriptors = os.path.join(root, "proc", "91", "fd")
+            os.makedirs(descriptors)
+            os.symlink("/dev/pts/9", os.path.join(descriptors, "0"))
+            found = omp.session_for_pid(91, root=root,
+                                        proc_root=os.path.join(root, "proc"), after=1999)
+            self.assertEqual(found.session_id, "01a0-omp")
+            self.assertIsNone(omp.session_for_pid(
+                91, root=root, proc_root=os.path.join(root, "proc"), after=2001))
+
+    def test_terminal_state_rejects_outside_paths_and_cwd_mismatches(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "proc")
+            descriptors = os.path.join(proc, "91", "fd")
+            os.makedirs(descriptors)
+            os.symlink("/dev/pts/9", os.path.join(descriptors, "0"))
+            terminal = os.path.join(root, "terminal-sessions")
+            os.makedirs(terminal)
+            outside = os.path.join(root, "evil.jsonl")
+            write_lines(outside, [{"type": "session", "id": "evil", "cwd": "/tmp/qwen"}])
+            marker = os.path.join(terminal, "pts-9")
+            with open(marker, "w") as handle:
+                handle.write(f"/tmp/qwen\n{outside}\nfresh\n")
+            self.assertIsNone(omp.session_for_pid(91, root=root, proc_root=proc))
+            inside = self.build(root, [{"role": "user"}], cwd="/different")
+            with open(marker, "w") as handle:
+                handle.write(f"/tmp/qwen\n{inside}\nfresh\n")
+            self.assertIsNone(omp.session_for_pid(91, root=root, proc_root=proc))
+
+    def test_terminal_marker_older_than_the_process_does_not_count(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "proc")
+            descriptors = os.path.join(proc, "91", "fd")
+            os.makedirs(descriptors)
+            os.symlink("/dev/pts/9", os.path.join(descriptors, "0"))
+            terminal = os.path.join(root, "terminal-sessions")
+            os.makedirs(terminal)
+            marker = os.path.join(terminal, "pts-9")
+            with open(marker, "w") as handle:
+                handle.write("/tmp/qwen\n/missing.jsonl\n")
+            os.utime(marker, (1000, 1000))
+            self.assertFalse(omp.has_terminal_marker(
+                91, root=root, proc_root=proc, after=1001))
+            self.assertTrue(omp.has_terminal_marker(
+                91, root=root, proc_root=proc, after=999))
+
+    def test_resume_argv(self):
+        self.assertEqual(omp.resume_argv(sample("omp"), yolo=True, model_name="qwen3.8-max"),
+                         ["omp", "--model", "qwen3.8-max", "--auto-approve", "--resume=abc123"])
+
+
+class ReadableOnlyByKeyTests(unittest.TestCase):
+    def test_grok_and_omp_are_not_installed_or_offered_by_the_menu(self):
+        self.assertEqual({p.key for p in providers.PROVIDERS}, {"claude", "codex", "kimi"})
+
+
 # ── resume commands and pacing ───────────────────────────────────────────────
 
 def sample(provider_key, *, state="idle", cwd="/tmp"):
@@ -417,19 +709,70 @@ class ResumeTests(unittest.TestCase):
 
 class ManagementTests(unittest.TestCase):
     def test_install_commands_match_the_vendor_documentation(self):
-        """Pinned so any change to what gets piped into a shell shows in a diff."""
+        """Pinned so a changed vendor script cannot run until the digest moves."""
         documented = {
-            "claude": ("curl -fsSL https://claude.ai/install.sh | bash",
+            "claude": ("https://claude.ai/install.sh",
+                       "3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944",
+                       "bash",
                        "https://code.claude.com/docs/en/quickstart"),
-            "codex": ("curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+            "codex": ("https://chatgpt.com/codex/install.sh",
+                      "150e3cf675682efeaac115aa3747add3f27887896d04ce6d0b56478d8b428bf6",
+                      "sh",
                       "https://developers.openai.com/codex/cli/"),
-            "kimi": ("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+            "kimi": ("https://code.kimi.com/kimi-code/install.sh",
+                     "270a86f2d2304529b6d8a3783fca9534874ebaeecb6cfcc1aebcdb6ce20ae1d7",
+                     "bash",
                      "https://moonshotai.github.io/kimi-code/"),
         }
         for item in providers.PROVIDERS:
-            command, source = documented[item.key]
-            self.assertEqual(item.install_shell, command)
+            url, digest, interpreter, source = documented[item.key]
+            self.assertEqual(item.install_url, url)
+            self.assertEqual(item.install_sha256, digest)
+            self.assertEqual(item.install_interpreter, interpreter)
             self.assertEqual(item.install_source, source)
+            self.assertNotIn("|", item.install_shell)
+
+    def test_install_runs_the_pinned_file_and_refuses_a_different_body(self):
+        item = providers.provider("claude")
+        calls = []
+
+        class Result:
+            returncode = 0
+
+        with mock.patch.object(manage, "fetch_pinned", return_value=b"#!/bin/bash\necho pinned\n"):
+            code = manage.run_install(
+                item,
+                runner=lambda argv, **kwargs: calls.append(list(argv)) or Result())
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0][0], "bash")
+        self.assertTrue(calls[0][1].endswith(".sh"))
+        self.assertNotIn("-c", calls[0])
+
+        with mock.patch.object(manage, "fetch_pinned", side_effect=RuntimeError("digest")):
+            with self.assertRaises(RuntimeError):
+                manage.run_install(item, runner=lambda *args, **kwargs: calls.append(["ran"]))
+        self.assertNotIn(["ran"], calls)
+
+    def test_installer_bytes_must_match_the_pin_before_execution(self):
+        payload = b"#!/bin/sh\necho pinned\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "install.sh"
+            source.write_bytes(payload)
+            item = replace(providers.provider("codex"),
+                           install_url=source.as_uri(), install_sha256=digest)
+            executed = []
+
+            def run(argv, **kwargs):
+                executed.append(Path(argv[1]).read_bytes())
+                return mock.Mock(returncode=0)
+
+            self.assertEqual(manage.run_install(item, runner=run), 0)
+            self.assertEqual(executed, [payload])
+            source.write_bytes(payload + b"echo changed\n")
+            with self.assertRaisesRegex(RuntimeError, "does not match pin"):
+                manage.run_install(item, runner=run)
+            self.assertEqual(executed, [payload])
 
     def test_updates_delegate_to_each_agent_rather_than_reinstalling(self):
         for item in providers.PROVIDERS:
@@ -1135,6 +1478,8 @@ class LiteralParityTests(unittest.TestCase):
         second.session_id = CODEX_ID
         second.title = "recover beta"
         state = tool.State()
+        # A suite's isolated PATH intentionally has no installed agents.
+        state.pane = tool.PANES.index("sessions")
         state.sessions = [first, second]
         state.view = tool.VIEWS.index("all")
         state.agent = 0

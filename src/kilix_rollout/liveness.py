@@ -71,6 +71,19 @@ def start_ticks(pid: int, *, proc_root: str = "/proc") -> str | None:
     return fields[19] if len(fields) > 19 else None
 
 
+def start_time(pid: int, *, proc_root: str = "/proc") -> float:
+    """The process start as a Unix time; 0.0 when it cannot be read."""
+    ticks = start_ticks(pid, proc_root=proc_root)
+    if ticks is None or not ticks.isdigit():
+        return 0.0
+    try:
+        with open(os.path.join(proc_root, "stat"), encoding="utf-8") as handle:
+            boot = next(float(line.split()[1]) for line in handle if line.startswith("btime "))
+        return boot + int(ticks) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, StopIteration):
+        return 0.0
+
+
 def registry_owners(directory: str, *, proc_root: str = "/proc") -> dict[str, tuple[int, ...]]:
     """Map session IDs to live PIDs from a directory of <pid>.json descriptors.
 

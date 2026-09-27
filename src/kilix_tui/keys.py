@@ -43,6 +43,7 @@ BINDINGS: tuple[tuple[str, str, str], ...] = (
     ("?", "show these keys", "? keys"),
     ("q", "quit", "q quit"),
     ("t", "on a game row: turn it on or off for the stack", ""),
+    ("p", "pin the selected entry to Home, or unpin it", ""),
     ("1 – 6", "jump straight to a section", ""),
     ("PgUp PgDn", "move a page at a time", ""),
     ("g  G", "first entry, last entry", ""),

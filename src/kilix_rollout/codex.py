@@ -17,6 +17,17 @@ _TURN_STARTED = frozenset({"task_started", "turn_started"})
 _TURN_COMPLETE = frozenset({
     "task_complete", "turn_complete", "turn_completed",
 })
+_APPROVAL_REQUESTED = frozenset({
+    "exec_approval_request", "apply_patch_approval_request",
+})
+_APPROVAL_RESOLVED = frozenset({
+    # Rollouts do not append a separate approval-response event. An accepted
+    # request is followed by its operation; a denied/aborted request is
+    # eventually closed by the turn boundary.
+    "exec_command_begin", "exec_command_end",
+    "patch_apply_begin", "patch_apply_end",
+    "turn_aborted", "task_aborted",
+}) | _TURN_STARTED | _TURN_COMPLETE
 
 
 def home() -> str:
@@ -85,10 +96,16 @@ def _inspect(
     prompt = ""
     agent_message = ""
     turn_event = ""
+    pending_tool = ""
+    approval_decided = False
     for record in jsonl.tail_records_matching(
         path,
         (
             b'"turn_context"', b'"event_msg"',
+            b'"exec_approval_request"', b'"apply_patch_approval_request"',
+            b'"exec_command_begin"', b'"exec_command_end"',
+            b'"patch_apply_begin"', b'"patch_apply_end"',
+            b'"turn_aborted"', b'"task_aborted"',
             b'"role":"user"', b'"role": "user"',
             b'"role":"assistant"', b'"role": "assistant"',
         ),
@@ -103,6 +120,12 @@ def _inspect(
                 cwd = value
         elif kind == "event_msg":
             event = payload.get("type")
+            if not approval_decided and event in _APPROVAL_REQUESTED:
+                pending_tool = "command approval" if event == "exec_approval_request" \
+                    else "file-change approval"
+                approval_decided = True
+            elif not approval_decided and event in _APPROVAL_RESOLVED:
+                approval_decided = True
             if not turn_event and event in (_TURN_STARTED | _TURN_COMPLETE):
                 turn_event = str(event)
             if not prompt and event == "user_message":
@@ -124,6 +147,7 @@ def _inspect(
         "prompt": prompt,
         "agent_message": agent_message,
         "turn_event": turn_event,
+        "pending_tool": pending_tool,
     }
 
 
@@ -187,6 +211,7 @@ def _session_record(
         "idle"
     )
     live_status = (
+        "waiting" if owners and details["pending_tool"] else
         "idle" if owners and event in _TURN_COMPLETE else
         "working" if owners and event in _TURN_STARTED else
         "unknown" if owners else
@@ -210,6 +235,7 @@ def _session_record(
         last_user_message=str(details["prompt"]),
         last_agent_message=str(details["agent_message"]),
         last_turn_event=event,
+        pending_tool=str(details["pending_tool"]),
         version=str(meta.get("cli_version") or ""),
         entrypoint=str(meta.get("source") or ""),
         archived=archived,

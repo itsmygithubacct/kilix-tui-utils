@@ -14,6 +14,7 @@ from __future__ import annotations
 import curses
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -132,6 +133,29 @@ def help_overlay(surface: Any, *, mouse: bool = False, extra: str = "") -> None:
                   note=extra or "any key closes this")
 
 
+class IdleWatch:
+    """Decides when an untouched loop has earned its idle action (F-SAVER).
+
+    Kept apart from `run` so the arithmetic is testable with a fake clock:
+    the loop only calls `touch()` on real input and asks `due()` on its
+    timeout wake-ups. `after` is seconds; None, zero or negative means the
+    watch never fires.
+    """
+
+    def __init__(self, after: float | None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.after = after if after and after > 0 else None
+        self.clock = clock
+        self.last = clock()
+
+    def touch(self) -> None:
+        self.last = self.clock()
+
+    def due(self) -> bool:
+        return (self.after is not None
+                and self.clock() - self.last >= self.after)
+
+
 def run(
     render: Callable[[Any, Any], None],
     state: Any,
@@ -141,6 +165,8 @@ def run(
     on_tick: Callable[[Any], None] | None = None,
     mouse: bool = False,
     help_key: bool = True,
+    idle_after: float | None = None,
+    on_idle: Callable[[Any], None] | None = None,
 ) -> int:
     """Run a tool interactively until it quits.
 
@@ -152,6 +178,11 @@ def run(
     `help_key` puts `?` on every tool from here, so seventeen tools do not each
     implement the same overlay. Tools that read typed text — a calculator, a
     filter box — set it False and keep `?` as an ordinary character.
+
+    `idle_after` seconds without a key call `on_idle(state)` — the desktop
+    starts a screensaver with it — and the clock starts over when it returns,
+    which is the user coming back. The action may take the terminal; the loop
+    repaints on the next pass either way.
     """
     showing_help = False
     started = False
@@ -172,8 +203,11 @@ def run(
                 curses.mousemask(curses.ALL_MOUSE_EVENTS)
             except Exception:
                 pass
+        idle = IdleWatch(idle_after if on_idle is not None else None)
         if tick_ms:
             stdscr.timeout(tick_ms)
+        elif idle.after is not None:
+            stdscr.timeout(1000)         # wake just often enough to check
         while True:
             stdscr.erase()
             render(stdscr, state)
@@ -182,9 +216,13 @@ def run(
             stdscr.refresh()
             key = stdscr.getch()
             if key == -1:
-                if on_tick is not None:
+                if idle.due():
+                    on_idle(state)
+                    idle.touch()         # returning input restarts the clock
+                elif on_tick is not None:
                     on_tick(state)
                 continue
+            idle.touch()
             if key == curses.KEY_RESIZE:
                 continue
             if showing_help:

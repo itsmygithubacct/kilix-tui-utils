@@ -1,9 +1,8 @@
 """The three coding agents, as one list.
 
-Install commands are quoted from each vendor's own documentation rather than
-invented here, and updates go through the agent's own updater so it stays the
-authority on how it upgrades itself. The `source` URL is shown next to the
-command before anything runs, so an install is never an opaque pipe to a shell.
+Install commands are the vendor's own script, downloaded and checked against
+the sha256 pinned here on 2026-09-25, then executed as a file. Updates go
+through the agent's own updater. The source URL is shown before anything runs.
 """
 from __future__ import annotations
 
@@ -19,6 +18,9 @@ class Provider:
     key: str
     label: str
     command: str
+    install_url: str
+    install_sha256: str
+    install_interpreter: str
     install_shell: str
     install_source: str
     update_argv: tuple[str, ...]
@@ -31,7 +33,10 @@ PROVIDERS: tuple[Provider, ...] = (
         key="claude",
         label="Claude Code",
         command="claude",
-        install_shell="curl -fsSL https://claude.ai/install.sh | bash",
+        install_url="https://claude.ai/install.sh",
+        install_sha256="3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944",
+        install_interpreter="bash",
+        install_shell="bash https://claude.ai/install.sh (sha256 3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944)",
         install_source="https://code.claude.com/docs/en/quickstart",
         update_argv=("claude", "update"),
         discover=claude.discover,
@@ -41,7 +46,10 @@ PROVIDERS: tuple[Provider, ...] = (
         key="codex",
         label="Codex",
         command="codex",
-        install_shell="curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        install_url="https://chatgpt.com/codex/install.sh",
+        install_sha256="150e3cf675682efeaac115aa3747add3f27887896d04ce6d0b56478d8b428bf6",
+        install_interpreter="sh",
+        install_shell="sh https://chatgpt.com/codex/install.sh (sha256 150e3cf675682efeaac115aa3747add3f27887896d04ce6d0b56478d8b428bf6)",
         install_source="https://developers.openai.com/codex/cli/",
         update_argv=("codex", "update"),
         discover=codex.discover,
@@ -51,7 +59,10 @@ PROVIDERS: tuple[Provider, ...] = (
         key="kimi",
         label="Kimi Code",
         command="kimi",
-        install_shell="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        install_url="https://code.kimi.com/kimi-code/install.sh",
+        install_sha256="270a86f2d2304529b6d8a3783fca9534874ebaeecb6cfcc1aebcdb6ce20ae1d7",
+        install_interpreter="bash",
+        install_shell="bash https://code.kimi.com/kimi-code/install.sh (sha256 270a86f2d2304529b6d8a3783fca9534874ebaeecb6cfcc1aebcdb6ce20ae1d7)",
         install_source="https://moonshotai.github.io/kimi-code/",
         update_argv=("kimi", "upgrade"),
         discover=kimi.discover,

@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402, I001
 
 TOOLS = [
-    "calculator", "cpu", "disk", "system", "volume",
+    "calculator", "cpu", "disk", "system", "volume", "network",
     "file", "launcher", "package", "session_log", "weather", "music",
     "plebian_control", "rollout_resume", "switcher", "cameras",
     "character_map", "find_files", "notepad",
@@ -185,6 +185,29 @@ class SafetyTests(unittest.TestCase):
                 name = getattr(node.func, "attr", getattr(node.func, "id", ""))
                 self.assertNotIn(name, forbidden,
                                  f"file manager must not call {name}()")
+
+    def test_file_manager_records_the_read_only_parity_answer(self):
+        # F-FILEOPS/F-RECYCLE, decided: read-only is the answer, and the
+        # module says so where the next reader will look.
+        module = load("file")
+        for phrase in ("F-FILEOPS", "F-RECYCLE", "read-only",
+                       "Applications"):
+            self.assertIn(phrase, module.__doc__)
+
+    def test_file_manager_write_keys_answer_with_the_referral(self):
+        module = load("file")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = module.State(tmp)
+            for key in sorted(module.WRITE_KEYS):
+                state.message = ""
+                self.assertTrue(module.handle(key, state), key)
+                self.assertEqual(state.message, module.READ_ONLY_ANSWER, key)
+            # While the filter is typing those letters are text, not answers.
+            state.message = ""
+            module.handle(ord("/"), state)
+            module.handle(ord("d"), state)
+            self.assertEqual(state.message, "")
+            self.assertEqual(state.filter.text, "d")
 
     def test_weather_uses_no_ip_geolocation_and_no_api_key(self):
         source = (ROOT / "tools/weather/main.py").read_text()
@@ -691,6 +714,62 @@ class SharedShellTests(unittest.TestCase):
                 0,
             )
         self.assertEqual(updates, [state])
+
+    def test_the_idle_watch_is_due_only_after_the_quiet_span(self):
+        now = [0.0]
+        watch = app.IdleWatch(600, clock=lambda: now[0])
+        self.assertFalse(watch.due())
+        now[0] = 599.0
+        self.assertFalse(watch.due())
+        now[0] = 600.0
+        self.assertTrue(watch.due())
+        watch.touch()                    # a key: the clock starts over
+        self.assertFalse(watch.due())
+        now[0] = 1200.0
+        self.assertTrue(watch.due())
+
+    def test_no_span_means_the_watch_never_fires(self):
+        for after in (None, 0, -5):
+            watch = app.IdleWatch(after, clock=lambda: 1e9)
+            self.assertFalse(watch.due(), after)
+
+    def test_an_idle_loop_fires_the_action_and_keeps_running(self):
+        fired = []
+        timeouts = []
+        state = object()
+
+        class Screen:
+            keys = iter((-1, ord("q")))
+
+            def keypad(self, _enabled):
+                pass
+
+            def timeout(self, milliseconds):
+                timeouts.append(milliseconds)
+
+            def erase(self):
+                pass
+
+            def refresh(self):
+                pass
+
+            def getch(self):
+                return next(self.keys)
+
+        with mock.patch.object(
+            app.curses, "wrapper", side_effect=lambda loop: loop(Screen())
+        ), mock.patch.object(app.curses, "curs_set"):
+            self.assertEqual(
+                app.run(
+                    lambda _surface, _state: None,
+                    state,
+                    idle_after=1e-9,
+                    on_idle=fired.append,
+                ),
+                0,
+            )
+        self.assertEqual(fired, [state])     # once, then the q quits as ever
+        self.assertEqual(timeouts, [1000])   # the loop wakes to check idleness
 
     def test_every_tool_title_that_draws_a_frame_has_a_tip(self):
         titles = set()

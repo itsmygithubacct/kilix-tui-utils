@@ -4,6 +4,14 @@ Navigation and inspection only: no delete, no move, no overwrite. On an OS whose
 desktop is a terminal this is reachable from a menu, and a destructive operation
 one keystroke from a menu is how people lose data. Opening a file hands it to
 `kilix run` or $EDITOR rather than interpreting it here.
+
+F-FILEOPS and F-RECYCLE, recorded: read-only is the answer, not a gap. A
+trash-and-restore surface belongs to a file manager that owns one; this
+tool's whole safety story is that nothing in it can lose data, and a test
+holds it to that. The keys other managers spend on writing answer with the
+referral instead of silence — any full file manager the machine installs is
+discovered under Programs ▸ Applications and launches from there. Parity by
+referral, not by reimplementation.
 """
 from __future__ import annotations
 
@@ -74,6 +82,15 @@ class State:
         _opened, self.message = openers.open_document(path)
 
 
+# What other file managers spend these keys on — delete, move, cut/copy —
+# this one answers with the recorded decision above. Saying why a key does
+# nothing beats ignoring it: silence reads as breakage.
+WRITE_KEYS = frozenset({ord("d"), ord("D"), ord("m"), ord("M"),
+                        ord("x"), ord("X"), ord("c"), ord("C"), 330})  # 330: Del
+READ_ONLY_ANSWER = ("read-only by design — installed file managers are under "
+                    "Programs › Applications")
+
+
 def render(surface, state: State) -> None:
     rows = state.view()
     state.selected = max(0, min(state.selected, max(0, len(rows) - 1)))
@@ -109,6 +126,32 @@ def render(surface, state: State) -> None:
                   shell.tango.attr("accent"))
 
 
+def handle(key: int, s: State) -> bool:
+    if s.filter.typing:
+        s.filter.handle(key)
+        return True
+    if keymap.is_quit(key):
+        return False
+    if s.filter.handle(key):          # `/` opens it
+        return True
+    if step := keymap.direction(key):
+        rows = s.view()
+        if rows:
+            s.selected = max(0, min(len(rows) - 1, s.selected + step))
+    elif key in keymap.SELECT:
+        s.enter()
+    elif key in (263, 127, 8):
+        parent = os.path.dirname(s.cwd)
+        if parent != s.cwd:
+            s.cwd, s.selected = parent, 0
+            s.refresh()
+    elif keymap.is_refresh(key):
+        s.refresh()
+    elif key in WRITE_KEYS:
+        s.message = READ_ONLY_ANSWER
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--open" in argv:
@@ -127,30 +170,6 @@ def main(argv: list[str] | None = None) -> int:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(app.render_to_text(render, state) + "\n")
         return 0
-
-    def handle(key: int, s: State) -> bool:
-        if s.filter.typing:
-            s.filter.handle(key)
-            return True
-        if keymap.is_quit(key):
-            return False
-        if s.filter.handle(key):          # `/` opens it
-            return True
-        if step := keymap.direction(key):
-            rows = s.view()
-            if rows:
-                s.selected = max(0, min(len(rows) - 1, s.selected + step))
-        elif key in keymap.SELECT:
-            s.enter()
-        elif key in (263, 127, 8):
-            parent = os.path.dirname(s.cwd)
-            if parent != s.cwd:
-                s.cwd, s.selected = parent, 0
-                s.refresh()
-        elif keymap.is_refresh(key):
-            s.refresh()
-        return True
-
     return app.run(render, state, handle=handle)
 
 

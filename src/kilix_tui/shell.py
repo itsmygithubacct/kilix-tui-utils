@@ -39,6 +39,7 @@ TIPS: dict[str, str] = {
     "Pane Center": "coding-session state and pane text update without leaving this view",
     "System": "--print gives the same facts as plain text for scripts",
     "Volume": "this sets the sink Kilix itself uses, not just this pane",
+    "Network": "Enter and d act on saved connections — new ones are made in nmtui",
     "Volume settings": "mute applies immediately; Enter opens every output",
     "Weather": "forecast comes from Open-Meteo; r refetches it",
     "Cameras": "views come from kilix-rtsp; n writes a new stream profile",

@@ -33,52 +33,15 @@ sys.path.insert(0, os.path.join(
 
 from kilix_desk import registry                              # noqa: E402
 from kilix_desk.desk import report_argv                      # noqa: E402
+from kilix_desk.registry import (                            # noqa: E402
+    launcher_dirs, script_dirs, script_rows)
 from kilix_tui import app, keys as keymap, shell, xdgapps    # noqa: E402
 
 RUN_ROW = "Run a command…"
 
-
-def launcher_dirs() -> list[str]:
-    """The user's desktop-launcher folder: override first, then the roots
-    Kilix 95 and the host's bundled desktop actually write."""
-    override = os.environ.get("KILIX_DESKTOP_DIR")
-    if override:
-        return [override]
-    base = os.environ.get("GPU_TERMINAL_HOME") or os.path.expanduser(
-        "~/.local/gpu_terminal")
-    return [os.path.join(base, "kilix-95", "data", "desktop"),
-            os.path.join(base, "kilix", "data", "desktop")]
-
-
-def script_dirs() -> list[str]:
-    """The stack's scripts/ directories, gated on presence like the
-    reference desktop's System menu."""
-    dirs = [os.path.expanduser(os.path.join("~", "pleb", "scripts"))]
-    kilix_home = os.environ.get("KILIX_HOME", "")
-    if kilix_home:
-        dirs.append(os.path.join(kilix_home, "scripts"))
-    return dirs
-
-
-def script_rows(dirs: list[str] | None = None) -> list[dict]:
-    """Executable *.sh under the pleb/kilix scripts directories — the same
-    files the reference desktop's System ▸ Scripts submenu offers."""
-    out: list[dict] = []
-    seen: set[str] = set()
-    for base in (script_dirs() if dirs is None else dirs):
-        if not os.path.isdir(base):
-            continue
-        for name in sorted(os.listdir(base)):
-            if not name.endswith(".sh") or name in seen:
-                continue
-            path = os.path.join(base, name)
-            if not os.path.isfile(path) or not os.access(path, os.X_OK):
-                continue
-            seen.add(name)
-            out.append({"kind": "script", "label": name, "detail": "script",
-                        "argv": [path], "verb": "inplace"})
-    return out
-
+# The desktop-folder and scripts listings live in `kilix_desk.registry`
+# (shared with the desk's Launchers and System ▸ Scripts places);
+# `launcher_dirs`/`script_dirs`/`script_rows` are imported above.
 
 # ── the laptop rows ─────────────────────────────────────────────────────────
 
@@ -169,15 +132,10 @@ def rows() -> list[dict]:
             row = _app_row(entry, bucket.lower(), kilix)
             if row is not None:
                 out.append(row)
-    seen_launchers = set()
-    for directory in launcher_dirs():
-        for entry in xdgapps.entries_in(directory):
-            if entry["id"] in seen_launchers:
-                continue
-            seen_launchers.add(entry["id"])
-            row = _app_row(entry, "launcher", kilix)
-            if row is not None:
-                out.append(row)
+    for entry in registry.user_launchers():
+        row = _app_row(entry, "launcher", kilix)
+        if row is not None:
+            out.append(row)
     out.extend(script_rows())
     out.extend(laptop_rows(kilix))
     return out

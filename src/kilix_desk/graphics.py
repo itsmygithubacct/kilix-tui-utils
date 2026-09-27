@@ -501,6 +501,14 @@ class DesktopRenderer:
         label = font_for(10 * scale, bold=True)
         value = font_for(24 * scale, bold=True)
         detail = font_for(12 * scale)
+        if state.alerts:
+            note = font_for(12 * scale, bold=True)
+            note_h = note.height + max(4, int(6 * scale))
+            for line in state.alerts:
+                draw.text((left + 4, top, right - 4, top + note_h),
+                          f"! {line}", note, tango.RED_BRIGHT)
+                top += note_h
+            top += max(4, int(8 * scale))
         rows = state.status
         headline = [(k, v) for k, v in rows
                     if k in ("release", "provider", "uptime")]
