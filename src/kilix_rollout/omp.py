@@ -16,6 +16,8 @@ installs or resumes from its own menu (see providers.py).
 from __future__ import annotations
 
 import os
+import time
+from datetime import datetime
 
 from . import jsonl, model
 from .model import Session
@@ -32,7 +34,26 @@ def folder_for(cwd: str) -> str:
     return relative.replace("/", "-") or "-"
 
 
-def activity(path: str) -> str:
+def _timestamp(value: object) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _stable_idle(path: str, record: dict, now: float | None) -> str:
+    changed = _timestamp(record.get("timestamp"))
+    if not changed:
+        try:
+            changed = os.stat(path).st_mtime
+        except OSError:
+            return "unknown"
+    return "idle" if (time.time() if now is None else now) - changed >= 0.3 else "working"
+
+
+def activity(path: str, *, now: float | None = None) -> str:
     """`working` or `idle` from the newest message; `unknown` when ambiguous."""
     for record in jsonl.tail_records(path, limit=200):
         kind = record.get("type")
@@ -49,10 +70,10 @@ def activity(path: str) -> str:
                      if isinstance(part, dict) and part.get("type") == "toolCall"]
             reason = message.get("stopReason")
             if reason in ("aborted", "error"):
-                return "idle"
+                return _stable_idle(path, record, now)
             if calls or reason == "toolUse":
                 return "unknown"
-            return "idle" if reason == "stop" else "working"
+            return _stable_idle(path, record, now) if reason == "stop" else "working"
         if role in ("user", "developer", "toolResult", "bashExecution"):
             return "working"
     return "unknown"
@@ -153,6 +174,26 @@ def session_for_pid(pid: int, *, root: str = "", proc_root: str = "/proc",
     return Session(provider="omp", session_id=session_id, path=path, cwd=cwd,
                    title=jsonl.condense(title, 120), updated=updated,
                    state="cut-off" if activity(path) != "idle" else "idle")
+
+
+def has_terminal_marker(pid: int, *, root: str = "", proc_root: str = "/proc",
+                        after: float = 0.0) -> bool:
+    """Whether this tty has an omp breadcrumb created since the process began.
+
+    The target may not exist yet: omp writes the breadcrumb before lazily
+    creating a first-turn session file.  Its presence forbids cwd fallback,
+    including when malformed or pointing outside the sessions directory.
+    """
+    if pid <= 0:
+        return False
+    base = root or home()
+    try:
+        terminal_path = os.readlink(os.path.join(proc_root, str(pid), "fd", "0"))
+        terminal = terminal_path.removeprefix("/dev/").replace(os.sep, "-")
+        marker = os.path.join(base, "terminal-sessions", terminal)
+        return not after or os.stat(marker).st_mtime >= after
+    except OSError:
+        return False
 
 
 def resume_argv(session: Session, *, yolo: bool = False, model_name: str = "") -> list[str]:

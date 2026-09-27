@@ -73,7 +73,8 @@ def activity(session_dir: str, *, now: float | None = None) -> str:
     `unknown` when the log says nothing yet."""
     path = os.path.join(session_dir, "events.jsonl")
     kinds = ("turn_started", "turn_ended", "tool_started", "tool_completed",
-             "first_token", "loop_started", "goal_planner_fired", "interjected")
+             "first_token", "loop_started", "goal_planner_fired", "interjected",
+             "permission_requested", "permission_resolved", "permission_pending")
     needles = tuple(
         marker
         for kind in kinds
@@ -81,6 +82,12 @@ def activity(session_dir: str, *, now: float | None = None) -> str:
     )
     for record in jsonl.tail_records_matching(path, needles):
         kind = record.get("type")
+        if kind == "permission_resolved":
+            return "working"
+        if kind in ("permission_requested", "permission_pending"):
+            requested = _timestamp(record.get("ts"))
+            age = (time.time() if now is None else now) - requested if requested else 1.0
+            return "waiting" if age >= 1.0 else "working"
         if kind == "tool_started" and record.get("tool_name") == "ask_user_question":
             return "waiting"
         if kind in ("turn_started", "tool_started", "tool_completed", "first_token",

@@ -483,7 +483,11 @@ class Inspector:
                 found = omp.session_for_pid(
                     process.pid, proc_root=self.proc_root, after=started
                 ) if started else None
-                if found is None and started and pane.cwd not in ambiguous_omp_cwds:
+                marked = omp.has_terminal_marker(
+                    process.pid, proc_root=self.proc_root, after=started
+                ) if started else False
+                if (found is None and not marked and started
+                        and pane.cwd not in ambiguous_omp_cwds):
                     found = omp.newest_in(pane.cwd, after=started)
                 if found is not None:
                     return _minimal_session(

@@ -247,6 +247,18 @@ class GrokAndOmpStateTests(unittest.TestCase):
             newest.assert_not_called()
             self.assertEqual([item.activity for item in got.panes], ["agent", "agent"])
 
+    def test_a_fresh_omp_breadcrumb_never_falls_back_to_another_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}), \
+                    mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
+                    mock.patch.object(omp, "session_for_pid", return_value=None), \
+                    mock.patch.object(omp, "has_terminal_marker", return_value=True), \
+                    mock.patch.object(omp, "newest_in") as newest:
+                got = self.inspect(["omp", "--model", "qwen3.8-max"], temporary)
+            newest.assert_not_called()
+            self.assertEqual(got.activity, "agent")
+
     def test_outer_claude_owns_a_pane_with_an_omp_child(self):
         nested = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{
             "id": 9, "pid": 70, "title": "claude", "cwd": "/tmp/project",

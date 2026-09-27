@@ -325,6 +325,22 @@ class GrokTests(unittest.TestCase):
             ])
             self.assertEqual(grok.activity(folder), "working")
 
+    def test_real_permission_transcript_waits_until_it_is_resolved(self):
+        with tempfile.TemporaryDirectory() as root:
+            requested = "2026-09-09T17:27:56.130Z"
+            then = grok._timestamp(requested)
+            folder = self.build(root, [
+                {"ts": "2026-09-09T17:27:55.900Z", "type": "tool_started",
+                 "tool_name": "bash"},
+                {"ts": requested, "type": "permission_requested", "tool_name": "bash"},
+            ])
+            self.assertEqual(grok.activity(folder, now=then + 9), "waiting")
+            with open(os.path.join(folder, "events.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"ts": "2026-09-09T17:28:10.052Z",
+                                         "type": "permission_resolved", "tool_name": "bash",
+                                         "decision": "allow", "wait_ms": 13922}) + "\n")
+            self.assertEqual(grok.activity(folder, now=then + 14), "working")
+
     def test_planner_and_boundaries_beyond_the_last_400_records_are_found(self):
         with tempfile.TemporaryDirectory() as root:
             folder = self.build(root, ["turn_ended"] + ["phase_changed"] * 500
@@ -428,7 +444,21 @@ class OmpTests(unittest.TestCase):
                      ([], "unknown")]
             for index, (messages, want) in enumerate(cases):
                 path = self.build(root, messages, name=f"t{index}.jsonl", sid=f"s{index}")
-                self.assertEqual(omp.activity(path), want, messages)
+                self.assertEqual(omp.activity(path, now=os.stat(path).st_mtime + 1), want, messages)
+
+    def test_idle_must_be_stable_for_300_milliseconds(self):
+        with tempfile.TemporaryDirectory() as root:
+            stamp = "2026-09-27T10:48:50.483Z"
+            changed = omp._timestamp(stamp)
+            directory = os.path.join(root, "sessions", omp.folder_for("/tmp/qwen"))
+            os.makedirs(directory)
+            path = os.path.join(directory, "stable.jsonl")
+            write_lines(path, [{"type": "session", "id": "stable", "cwd": "/tmp/qwen"},
+                               {"type": "message", "timestamp": stamp,
+                                "message": {"role": "assistant", "stopReason": "aborted"}}])
+            self.assertEqual(omp.activity(path, now=changed + 0.05), "working")
+            self.assertEqual(omp.activity(path, now=changed + 0.299), "working")
+            self.assertEqual(omp.activity(path, now=changed + 0.301), "idle")
 
     def test_async_developer_and_custom_messages_restart_work(self):
         with tempfile.TemporaryDirectory() as root:
@@ -471,6 +501,25 @@ class OmpTests(unittest.TestCase):
             self.assertEqual(found.session_id, "01a0-omp")
             self.assertIsNone(omp.session_for_pid(
                 91, root=root, proc_root=os.path.join(root, "proc"), after=2001))
+
+    def test_terminal_state_rejects_outside_paths_and_cwd_mismatches(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "proc")
+            descriptors = os.path.join(proc, "91", "fd")
+            os.makedirs(descriptors)
+            os.symlink("/dev/pts/9", os.path.join(descriptors, "0"))
+            terminal = os.path.join(root, "terminal-sessions")
+            os.makedirs(terminal)
+            outside = os.path.join(root, "evil.jsonl")
+            write_lines(outside, [{"type": "session", "id": "evil", "cwd": "/tmp/qwen"}])
+            marker = os.path.join(terminal, "pts-9")
+            with open(marker, "w") as handle:
+                handle.write(f"/tmp/qwen\n{outside}\nfresh\n")
+            self.assertIsNone(omp.session_for_pid(91, root=root, proc_root=proc))
+            inside = self.build(root, [{"role": "user"}], cwd="/different")
+            with open(marker, "w") as handle:
+                handle.write(f"/tmp/qwen\n{inside}\nfresh\n")
+            self.assertIsNone(omp.session_for_pid(91, root=root, proc_root=proc))
 
     def test_resume_argv(self):
         self.assertEqual(omp.resume_argv(sample("omp"), yolo=True, model_name="qwen3.8-max"),
@@ -1385,6 +1434,8 @@ class LiteralParityTests(unittest.TestCase):
         second.session_id = CODEX_ID
         second.title = "recover beta"
         state = tool.State()
+        # A suite's isolated PATH intentionally has no installed agents.
+        state.pane = tool.PANES.index("sessions")
         state.sessions = [first, second]
         state.view = tool.VIEWS.index("all")
         state.agent = 0
