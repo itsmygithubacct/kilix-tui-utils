@@ -480,6 +480,17 @@ class OmpTests(unittest.TestCase):
             os.utime(path, (old, old))
             self.assertEqual(omp.activity(path, now=old + 60), "working")
 
+    def test_a_custom_message_alone_restarts_work(self):                      # KX-R13-41 T2
+        with tempfile.TemporaryDirectory() as root:
+            done = {"role": "assistant", "stopReason": "stop", "content": []}
+            path = self.build(root, [done])
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "custom_message",
+                                         "customType": "async-result"}) + "\n")
+            old = 1_000_000
+            os.utime(path, (old, old))
+            self.assertEqual(omp.activity(path, now=old + 60), "working")
+
     def test_provider_error_cannot_read_idle_during_retry_backoff(self):
         with tempfile.TemporaryDirectory() as root:
             stamp = "2026-09-27T10:48:50.483Z"
