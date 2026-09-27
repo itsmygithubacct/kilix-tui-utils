@@ -792,6 +792,9 @@ class CatalogAuditTests(unittest.TestCase):
     KILIX = ["/opt/kilix/kilix"]
     LAUNCH_PLACES = {"app": ["Programs", "Catalog apps"],
                      "game": ["Programs", "Games"]}
+    # Converters are installed through Software and invoked by their consumers
+    # with explicit inputs; they are not standalone desktop applications.
+    INSTALL_ONLY_KINDS = {"tool"}
 
     def setUp(self):
         patcher = mock.patch.dict(
@@ -829,10 +832,17 @@ class CatalogAuditTests(unittest.TestCase):
 
     def test_every_kind_has_a_decided_launch_place(self):
         unexpected = ({row["kind"] for row in self.rows}
-                      - set(self.LAUNCH_PLACES))
+                      - set(self.LAUNCH_PLACES) - self.INSTALL_ONLY_KINDS)
         self.assertFalse(
             unexpected,
             f"new catalog kind(s) {sorted(unexpected)} need a place decision")
+
+    def test_consumer_tools_are_not_desktop_launches(self):
+        for place in self.LAUNCH_PLACES.values():
+            labels = {entry.label for entry in self._entries(place)}
+            for row in self.rows:
+                if row["kind"] in self.INSTALL_ONLY_KINDS:
+                    self.assertNotIn(row["label"], labels)
 
     def test_every_app_and_game_launch_resolves_in_its_place(self):
         expect = {
