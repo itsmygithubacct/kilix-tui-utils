@@ -1,5 +1,9 @@
 """Synthetic regression inputs for the cited-record adapter."""
 import unittest
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from kilix_rollout.records import adapt_record
 
