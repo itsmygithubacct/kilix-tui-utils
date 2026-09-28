@@ -4,6 +4,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,16 @@ class ConfigTests(unittest.TestCase):
 
     def test_missing_file_is_an_empty_menu_not_an_error(self):
         self.assertEqual(cameras.load(self.path), ([], []))
+
+    def test_unreadable_config_is_visible_and_survives_reload(self):
+        with mock.patch.object(cameras, "load", side_effect=PermissionError(
+                13, "Permission denied")), \
+                mock.patch.object(cameras, "kilix_rtsp_command", return_value=None):
+            state = cameras.State()
+            self.assertIn("Permission denied", state.status)
+            self.assertIn("Cannot read", state.status)
+            cameras.handle(ord("r"), state)
+            self.assertIn("Permission denied", state.status)
 
     def test_load_reads_names_and_tiers_but_never_urls(self):
         self.write()

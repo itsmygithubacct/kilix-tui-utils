@@ -107,7 +107,7 @@ def load(path: str) -> tuple[list[Camera], list[Group]]:
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             lines = handle.read().splitlines()
-    except OSError:
+    except FileNotFoundError:
         return [], []
     cameras: list[Camera] = []
     groups: list[Group] = []
@@ -235,7 +235,12 @@ class State:
         self.reload()
 
     def reload(self) -> None:
-        self.cameras, self.groups = load(config_path())
+        self.status = ""
+        try:
+            self.cameras, self.groups = load(config_path())
+        except OSError as error:
+            self.cameras, self.groups = [], []
+            self.status = f"Cannot read {config_path()}: {error.strerror or error}"
         self.command = kilix_rtsp_command()
 
     def rows(self) -> list[Row]:
@@ -276,7 +281,8 @@ def _view(state: State, row: Row) -> None:
     curses.endwin()
     try:
         code = subprocess.call(list(row.argv))
-    except OSError:
+    except OSError as error:
+        print(f"Could not start the camera viewer: {error}", file=sys.stderr)
         code = 126
     if code:
         try:
@@ -395,7 +401,6 @@ def handle(key: int, state: State) -> bool:
         return False
     if keymap.is_refresh(key):
         state.reload()
-        state.status = ""
         return True
     if key in (ord("n"), ord("N")):
         _new_profile(state)
