@@ -801,6 +801,9 @@ def _cmd_dump(ns: argparse.Namespace) -> int:
     return 0
 
 
+SUBMIT_DELAY = 0.15
+
+
 def _cmd_send(ns: argparse.Namespace) -> int:
     snapshot = _live()
     item = snapshot.resolve(ns.target)
@@ -817,14 +820,19 @@ def _cmd_send(ns: argparse.Namespace) -> int:
         raise ValueError("provide TEXT or pipe text on stdin")
     if ns.enter:
         if value.endswith("\r\n"):
-            value = value[:-2] + "\r"
-        elif value.endswith("\n"):
-            value = value[:-1] + "\r"
-        elif not value.endswith("\r"):
-            value += "\r"
-    if not value:
+            value = value[:-2]
+        elif value.endswith(("\n", "\r")):
+            value = value[:-1]
+    elif not value:
         raise ValueError("the message is empty")
-    size = kitty_rc.send_text(item.pane, value)
+    # Enter goes as its own write after a pause: a coding-agent TUI with
+    # bracketed paste takes text and a trailing CR in one write as pasted
+    # text, and leaves the prompt unsubmitted.
+    size = kitty_rc.send_text(item.pane, value) if value else 0
+    if ns.enter:
+        if value:
+            time.sleep(SUBMIT_DELAY)
+        size += kitty_rc.send_text(item.pane, "\r")
     result = {
         "schema": "kilix.panes.send/v1",
         "accepted": True,
@@ -1051,13 +1059,14 @@ def _cmd_close(ns: argparse.Namespace) -> int:
         if ns.json:
             _json({"closed": "page", "page_id": page_id})
         else:
-            print(page_id)
+            print(f"closed page {page_id} {item.pane.page_title!r}")
         return 0
     kitty_rc.close_pane(item.pane.id)
     if ns.json:
         _json({"closed": "pane", "pane_id": item.pane.id})
     else:
-        print(item.pane.id)
+        # Say what went, so an agent has nothing left to check afterwards.
+        print(f"closed pane {item.pane.id} {item.pane.title!r}")
     return 0
 
 
@@ -1069,6 +1078,10 @@ def main(argv: list[str] | None = None) -> int:
         argv and argv[0] in ("--json", "-j", "--lines", "-n", "--help", "-h")
     ):
         return cli(argv)
+    if not argv and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # No terminal to draw on: an agent or a script asked, so answer with
+        # the list rather than refuse.
+        return cli(["list"])
     return _tui(argv)
 
 

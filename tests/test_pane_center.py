@@ -357,8 +357,40 @@ class SnapshotTests(unittest.TestCase):
              redirect_stdout(output):
             self.assertEqual(
                 tool.cli(["send", "9", "--enter", "hello"]), 0)
-        send.assert_called_once_with(tree().panes[0], "hello\r")
-        self.assertIn("accepted 6 bytes and Enter", output.getvalue())
+        self.assertEqual(send.call_args_list, [
+            mock.call(tree().panes[0], "hello"),
+            mock.call(tree().panes[0], "\r")])
+        self.assertIn("accepted 12 bytes and Enter", output.getvalue())
+
+    def test_cli_send_enter_alone_sends_one_carriage_return(self):
+        tool = load_tool()
+        with mock.patch.object(tool, "_live", return_value=snapshot()), \
+             mock.patch.object(kitty_rc, "send_text", return_value=1) as send, \
+             mock.patch.object(tool.sys.stdin, "isatty", return_value=True), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(tool.cli(["send", "9", "--enter"]), 0)
+        send.assert_called_once_with(tree().panes[0], "\r")
+
+    def test_cli_close_says_what_it_closed(self):
+        tool = load_tool()
+        output = io.StringIO()
+        pane = tree().panes[0]
+        with mock.patch.object(tool, "_live", return_value=snapshot()), \
+             mock.patch.object(kitty_rc, "close_pane") as close, \
+             redirect_stdout(output):
+            self.assertEqual(tool.cli(["close", "9"]), 0)
+        close.assert_called_once_with(pane.id)
+        self.assertEqual(output.getvalue(),
+                         f"closed pane {pane.id} {pane.title!r}\n")
+
+    def test_bare_command_without_a_terminal_lists_instead_of_refusing(self):
+        tool = load_tool()
+        with mock.patch.object(tool.sys.stdin, "isatty", return_value=False), \
+             mock.patch.object(tool, "cli", return_value=0) as cli, \
+             mock.patch.object(tool, "_tui") as tui:
+            self.assertEqual(tool.main([]), 0)
+        cli.assert_called_once_with(["list"])
+        tui.assert_not_called()
 
 
 if __name__ == "__main__":
