@@ -80,6 +80,39 @@ class NotepadTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "hello λ")
             self.assertFalse(state.dirty)
 
+    def test_failed_load_never_overwrites_original_even_after_editing(self):
+        module = load("notepad")
+        for payload in (b"\xffinvalid UTF-8", b"x" * (module.MAX_DOCUMENT_BYTES + 1)):
+            with self.subTest(size=len(payload)), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "original.txt"
+                path.write_bytes(payload)
+                state = module.State(str(path))
+                self.assertFalse(state.save())
+                state.insert("replacement")
+                self.assertFalse(state.save())
+                self.assertEqual(path.read_bytes(), payload)
+                alternate = Path(directory) / "new.txt"
+                self.assertTrue(state.save(str(alternate)))
+                self.assertEqual(alternate.read_text(), "replacement")
+                self.assertFalse(state.save(str(path)))
+                self.assertEqual(path.read_bytes(), payload)
+
+    def test_missing_file_can_be_created_and_successful_reload_unblocks_save(self):
+        module = load("notepad")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "new.txt"
+            state = module.State(str(path))
+            state.insert("new")
+            self.assertTrue(state.save())
+            path.write_bytes(b"\xff")
+            state.load()
+            self.assertFalse(state.save())
+            path.write_text("restored", encoding="utf-8")
+            state.load()
+            state.insert("ok")
+            self.assertTrue(state.save())
+            self.assertEqual(path.read_text(), "resoktored")
+
     def test_unsaved_quit_requires_the_chord_twice(self):
         module = load("notepad")
         state = module.State()

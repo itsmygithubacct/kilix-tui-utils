@@ -26,6 +26,7 @@ class State:
         self.column = 0
         self.scroll = 0
         self.dirty = False
+        self.failed_load_path = None
         self.message = ""
         self.naming = False
         self.name_entry = self.path
@@ -40,9 +41,15 @@ class State:
             if len(payload) > MAX_DOCUMENT_BYTES:
                 raise ValueError(f"document exceeds {MAX_DOCUMENT_BYTES:,} bytes")
             text = payload.decode("utf-8")
+        except FileNotFoundError:
+            self.failed_load_path = None
+            self.message = "new document"
+            return
         except (OSError, UnicodeError, ValueError) as error:
+            self.failed_load_path = self.path
             self.message = f"cannot open: {error}"
             return
+        self.failed_load_path = None
         self.lines = text.split("\n") or [""]
         self.message = f"opened {os.path.basename(self.path)}"
 
@@ -88,6 +95,9 @@ class State:
             self.naming = True
             self.name_entry = ""
             self.message = "Save as:"
+            return False
+        if self.path == self.failed_load_path:
+            self.message = "cannot save: this document was not loaded; save to a different file"
             return False
         directory = os.path.dirname(self.path) or os.getcwd()
         basename = os.path.basename(self.path)
