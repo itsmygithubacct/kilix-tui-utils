@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import curses
 import os
 import stat
 import sys
@@ -97,6 +98,8 @@ class State:
             self.message = "Save as:"
             return False
         if self.path == self.failed_load_path:
+            self.naming = True
+            self.name_entry = ""
             self.message = "cannot save: this document was not loaded; save to a different file"
             return False
         directory = os.path.dirname(self.path) or os.getcwd()
@@ -134,6 +137,7 @@ class State:
                 except OSError:
                     pass
         self.dirty = False
+        self.naming = False
         self.quit_armed = False
         self.message = f"saved {os.path.basename(self.path)}"
         return True
@@ -185,7 +189,15 @@ def render(surface, state: State) -> None:
             )
 
 
-def handle(key: int, state: State) -> bool:
+def handle(key: int | str, state: State) -> bool:
+    # Keep Unicode text distinct from integer curses key codes (which overlap
+    # Unicode codepoints). ASCII controls retain the existing bindings.
+    if isinstance(key, str) and len(key) == 1 and ord(key) < 128:
+        key = ord(key)
+    if isinstance(key, str):
+        text = key if len(key) == 1 and key.isprintable() else ""
+    else:
+        text = chr(key) if keymap.is_text(key) else ""
     if state.naming:
         if key == keymap.ESCAPE:
             state.naming = False
@@ -195,8 +207,8 @@ def handle(key: int, state: State) -> bool:
             state.save(state.name_entry)
         elif key in keymap.BACKSPACE:
             state.name_entry = state.name_entry[:-1]
-        elif keymap.is_text(key):
-            state.name_entry += chr(key)
+        elif text:
+            state.name_entry += text
         return True
     if key == CTRL_S:
         state.save()
@@ -206,17 +218,17 @@ def handle(key: int, state: State) -> bool:
             state.message = "unsaved changes — Ctrl-Q again to discard"
             return True
         return False
-    elif key in keymap.UP:
+    elif key == curses.KEY_UP:
         state.move_vertical(-1)
-    elif key in keymap.DOWN:
+    elif key == curses.KEY_DOWN:
         state.move_vertical(1)
-    elif key in keymap.LEFT:
+    elif key == curses.KEY_LEFT:
         if state.column:
             state.column -= 1
         elif state.row:
             state.row -= 1
             state.column = len(state.lines[state.row])
-    elif key in keymap.RIGHT:
+    elif key == curses.KEY_RIGHT:
         if state.column < len(state.lines[state.row]):
             state.column += 1
         elif state.row + 1 < len(state.lines):
@@ -228,8 +240,8 @@ def handle(key: int, state: State) -> bool:
         state.backspace()
     elif key == ord("\t"):
         state.insert("    ")
-    elif keymap.is_text(key):
-        state.insert(chr(key))
+    elif text:
+        state.insert(text)
     return True
 
 
@@ -247,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         with open(options.screenshot, "w", encoding="utf-8") as out:
             out.write(app.render_to_text(render, state) + "\n")
         return 0
-    return app.run(render, state, handle=handle, help_key=False)
+    return app.run(render, state, handle=handle, help_key=False, unicode_input=True)
 
 
 if __name__ == "__main__":

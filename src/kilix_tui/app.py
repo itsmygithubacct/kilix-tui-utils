@@ -160,11 +160,12 @@ def run(
     render: Callable[[Any, Any], None],
     state: Any,
     *,
-    handle: Callable[[int, Any], bool] | None = None,
+    handle: Callable[[int | str, Any], bool] | None = None,
     tick_ms: int | None = None,
     on_tick: Callable[[Any], None] | None = None,
     mouse: bool = False,
     help_key: bool = True,
+    unicode_input: bool = False,
     idle_after: float | None = None,
     on_idle: Callable[[Any], None] | None = None,
 ) -> int:
@@ -178,6 +179,10 @@ def run(
     `help_key` puts `?` on every tool from here, so seventeen tools do not each
     implement the same overlay. Tools that read typed text — a calculator, a
     filter box — set it False and keep `?` as an ordinary character.
+
+    `unicode_input` uses wide-character input. ASCII stays integer-valued for
+    shared bindings; non-ASCII text reaches `handle` as a string, distinct
+    from integer curses special keys. Other tools retain byte input.
 
     `idle_after` seconds without a key call `on_idle(state)` — the desktop
     starts a screensaver with it — and the clock starts over when it returns,
@@ -214,7 +219,15 @@ def run(
             if showing_help:
                 help_overlay(stdscr, mouse=mouse)
             stdscr.refresh()
-            key = stdscr.getch()
+            if unicode_input:
+                try:
+                    key = stdscr.get_wch()
+                except curses.error:
+                    key = -1       # wide input raises on a timeout
+                if isinstance(key, str) and ord(key) < 128:
+                    key = ord(key)
+            else:
+                key = stdscr.getch()
             if key == -1:
                 if idle.due():
                     on_idle(state)
