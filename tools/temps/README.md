@@ -64,10 +64,11 @@ kilix-temps --text           # explicitly select the default text TUI
 `--graphics` exits with a useful dependency error instead of silently falling
 back. `--no-color` applies to the text dashboard.
 
-Temperatures default to Fahrenheit. A territory-qualified locale that normally
-uses Celsius, such as `en_GB.UTF-8` or `de_DE.UTF-8`, automatically selects
-Celsius instead. Override that choice at startup with `--fahrenheit` or
-`--celsius`, or press `u` while the dashboard is running. This affects display
+Temperatures use the shared `KILIX_TEMPERATURE_UNIT` preference in
+`settings.conf`, defaulting to Fahrenheit independently of locale. Change it
+with `kilix settings --set temperature_unit=celsius` or `temperature_unit=fahrenheit`,
+in the settings TUI, or in Kilix95 Settings. Override it for one dashboard
+invocation with `--fahrenheit` or `--celsius`, or press `u` while running. This affects display
 only: sensor input, alert calculations, threshold arguments, JSON, and CSV
 remain in Celsius.
 

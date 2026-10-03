@@ -1,15 +1,33 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+import tempfile
 
 from kilix_temps.units import (
     TemperatureUnit,
     locale_temperature_unit,
     unit_for_locale,
+    preferred_temperature_unit,
 )
 
 
 class TemperatureUnitTests(unittest.TestCase):
+    def test_shared_unit_wins_over_environment_and_locale(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / 'settings.conf'
+            env = {'GPU_TERMINAL_SETTINGS_FILE': str(path),
+                   'KILIX_TEMPERATURE_UNIT': 'celsius', 'LANG': 'en_GB.UTF-8'}
+            self.assertIs(preferred_temperature_unit(env), TemperatureUnit.CELSIUS)
+            path.write_text('# preserved\nKILIX_TEMPERATURE_UNIT=fahrenheit\n')
+            self.assertIs(preferred_temperature_unit(env), TemperatureUnit.FAHRENHEIT)
+            path.write_text('KILIX_TEMPERATURE_UNIT=fahrenheit\nKILIX_TEMPERATURE_UNIT=celsius\n')
+            self.assertIs(preferred_temperature_unit(env), TemperatureUnit.CELSIUS)
+            path.write_text('KILIX_TEMPERATURE_UNIT=invalid\n')
+            self.assertIs(preferred_temperature_unit(env), TemperatureUnit.FAHRENHEIT)
+            path.write_text('# older file has no unit\n')
+            self.assertIs(preferred_temperature_unit(env), TemperatureUnit.FAHRENHEIT)
+
     def test_absolute_and_delta_conversions_are_distinct(self) -> None:
         unit = TemperatureUnit.FAHRENHEIT
         self.assertAlmostEqual(unit.absolute(0.0), 32.0)

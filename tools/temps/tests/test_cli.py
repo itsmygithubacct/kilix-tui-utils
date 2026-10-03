@@ -4,6 +4,8 @@ from contextlib import redirect_stdout
 import io
 import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -14,7 +16,8 @@ class CliUnitTests(unittest.TestCase):
     @staticmethod
     def _demo_frame(locale_name: str, *arguments: str) -> str:
         output = io.StringIO()
-        with patch.dict(os.environ, {"LANG": locale_name}, clear=True):
+        with tempfile.TemporaryDirectory() as scratch, patch.dict(os.environ, {
+                "LANG": locale_name, "GPU_TERMINAL_SETTINGS_FILE": str(Path(scratch)/'missing.conf')}, clear=True):
             with redirect_stdout(output):
                 result = main(
                     [
@@ -31,9 +34,9 @@ class CliUnitTests(unittest.TestCase):
             raise AssertionError(f"kilix-temps exited with {result}")
         return output.getvalue()
 
-    def test_locale_selects_human_readable_unit(self) -> None:
+    def test_fahrenheit_default_is_independent_of_locale(self) -> None:
         self.assertIn("°F", self._demo_frame("C.UTF-8"))
-        self.assertIn("°C", self._demo_frame("en_GB.UTF-8"))
+        self.assertIn("°F", self._demo_frame("en_GB.UTF-8"))
 
     def test_explicit_unit_overrides_locale(self) -> None:
         self.assertIn(

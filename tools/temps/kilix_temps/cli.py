@@ -16,7 +16,7 @@ from .graphics import (
 from .model import ThresholdConfig, ThermalModel
 from .render import FrameOptions, Renderer, strip_ansi
 from .sensors import DemoBackend, FanSensor, Sample, SensorBackend, TemperatureSensor
-from .units import TemperatureUnit, locale_temperature_unit
+from .units import TemperatureUnit, preferred_temperature_unit
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -203,7 +203,7 @@ def _print_list(
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    temperature_unit = args.temperature_unit or locale_temperature_unit()
+    temperature_unit = args.temperature_unit or preferred_temperature_unit()
     thresholds = _validate(parser, args)
     backend = _backend(args)
     model, sample, temperatures, fans = _model_and_sample(
