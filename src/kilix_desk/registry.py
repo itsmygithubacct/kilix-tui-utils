@@ -55,6 +55,7 @@ class Plan:
 PROGRAMS = (
     Item("Coding agents", command="kilix-rollout-resume",
          sibling="rollout_resume"),
+    Item("Help Search", command="kilix-help-search", sibling="help_search"),
     Item("Model store", command="kilix-bonsai", kilix=("bonsai",), verb="tab"),
     Item("Region painter", kilix=("mask",), verb="tab"),
     Item("PDF Conversion",

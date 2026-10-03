@@ -26,6 +26,7 @@ TOOLS=(
     "launcher:kilix-launcher"
     "package:kilix-package"
     "rollout_resume:kilix-rollout-resume"
+    "help_search:kilix-help-search"
     "session_log:kilix-session-log"
     "switcher:kilix-switch"
     "switcher:kilix-panes"
