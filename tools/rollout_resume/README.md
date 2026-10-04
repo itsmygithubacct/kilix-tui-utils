@@ -22,6 +22,11 @@ Use `--projects-dir` for a non-default Claude projects directory,
 to include the sibling Codex `archived_sessions` tree. `--all-time` disables
 the modification-time window.
 
+Source options work before or after the command. Wrappers and callers may
+repeat an option with the same value; conflicting values are an error.
+`list --help`, `resume --help`, and other command help forms show usage
+without discovering sessions or starting an agent.
+
 `--json` emits the provider-neutral record directly. `--envelope` emits the
 stable success/error shape used by the retired tools:
 
@@ -51,6 +56,15 @@ provider-specific executable override (`--claude`, `--codex`, or `--kimi`).
 Claude also supports `--fork`, `--permission-mode`, `--model`, and `--prompt`
 for single or batch restores. `--yolo` enables the provider's own unsafe flag;
 `--no-yolo` overrides a shared unsafe default.
+
+Detached launches wait up to five seconds for a child-process acknowledgment,
+including a short check for immediate failure. An early nonzero exit is an
+error even if tmux created a session. JSON includes `status_file` and
+`startup`; batch results retain these fields too. The private status file
+updates to `exited` with the child's exit code. It stores no prompt, command
+arguments, environment or terminal output. Process startup establishes
+neither an interactive ready state nor completion; check the resumed task's
+own result before claiming success.
 
 Batch launches share a private, cross-process pacing record and cannot be
 configured below 30 seconds. A real batch requires confirmation or `--yes`.

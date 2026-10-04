@@ -661,7 +661,8 @@ class ResumeTests(unittest.TestCase):
         self.assertTrue(first.startswith("codex_"))
         self.assertEqual(launch.tmux_name(item, {first}), f"{first}_2")
 
-    def test_batch_restore_waits_between_launches(self):
+    @mock.patch.object(launch.child_status, "wait_started", return_value={"stage": "started"})
+    def test_batch_restore_waits_between_launches(self, _started):
         waits = []
 
         class Runner:
@@ -682,7 +683,8 @@ class ResumeTests(unittest.TestCase):
         self.assertTrue(all(result["ok"] for result in results))
         self.assertAlmostEqual(sum(waits), 30.0, places=3)
 
-    def test_a_failed_launch_does_not_make_the_next_one_wait(self):
+    @mock.patch.object(launch.child_status, "wait_started", return_value={"stage": "started"})
+    def test_a_failed_launch_does_not_make_the_next_one_wait(self, _started):
         waits = []
 
         def runner(argv, **kwargs):
@@ -873,6 +875,42 @@ class YoloSettingTests(unittest.TestCase):
 
 
 class PortedFeatureTests(unittest.TestCase):
+    def test_wrapper_and_caller_can_repeat_the_same_source_option(self):
+        tool = load_tool()
+        with mock.patch.object(tool.providers, "discover", return_value=[]) as discover, redirect_stdout(io.StringIO()):
+            code = tool.main(["list", "--sessions-dir", "/tmp/private-sessions", "--all-time",
+                              "--agent", "codex", "--sessions-dir", "/tmp/private-sessions",
+                              "--agent", "codex", "--all-time", "--query", "saved-task", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(discover.call_args.kwargs["roots"], {"codex_sessions":"/tmp/private-sessions"})
+        self.assertEqual(discover.call_args.kwargs["since"], 0)
+
+    def test_conflicting_source_options_refuse_before_discovery(self):
+        tool = load_tool()
+        with mock.patch.object(tool.providers, "discover") as discover:
+            with self.assertRaisesRegex(RuntimeError, "conflicting values for --sessions-dir"):
+                tool.main(["list", "--sessions-dir", "/tmp/one", "--sessions-dir", "/tmp/two"])
+        discover.assert_not_called()
+
+    def test_subcommand_help_with_wrapper_options_does_not_discover_or_resume(self):
+        tool = load_tool()
+        for command in ("list", "resume", "restore", "install", "doctor"):
+            output = io.StringIO()
+            with self.subTest(command=command), \
+                 mock.patch.object(tool.providers, "discover") as discover, \
+                 mock.patch.object(tool.launch, "start_detached") as launch_child, redirect_stdout(output):
+                code = tool.main([command, "--help", "--agent", "codex", "--sessions-dir", "/tmp/private-sessions"])
+            self.assertEqual(code, 0)
+            self.assertIn("Commands:", output.getvalue())
+            discover.assert_not_called()
+            launch_child.assert_not_called()
+
+    def test_option_value_equal_to_option_name_remains_literal(self):
+        tool = load_tool()
+        arguments = ["--query", "--query", "list"]
+        self.assertEqual(tool._take_value(arguments, "--query"), "--query")
+        self.assertEqual(arguments, ["list"])
+
     def test_private_unified_configuration_merges_updates(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "settings" / "config.json"
@@ -1650,7 +1688,8 @@ class SafetyTests(unittest.TestCase):
                         found.add(first.value)
         return found
 
-    def test_launching_only_ever_shells_out_to_tmux(self):
+    @mock.patch.object(launch.child_status, "wait_started", return_value={"stage": "started"})
+    def test_launching_only_ever_shells_out_to_tmux(self, _started):
         """Recovery must not become an arbitrary command runner."""
         source = (ROOT / "src/kilix_rollout/launch.py").read_text()
         self.assertNotIn("shell=True", source)

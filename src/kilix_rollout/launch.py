@@ -20,8 +20,10 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
+from pathlib import Path
 
-from . import config
+from . import config, child_status
 from .model import Session
 from .providers import Provider, provider
 
@@ -334,6 +336,7 @@ def start_detached(
     no_log: bool = False,
     pacer=None,
     on_wait=None,
+    startup_status: dict | None = None,
     runner=subprocess.run,
 ) -> str:
     """Start one session in a detached tmux session and return its name."""
@@ -349,6 +352,21 @@ def start_detached(
         session, chosen_name, yolo=yolo, cwd=cwd, executable=executable,
         fork=fork, permission_mode=permission_mode, model=model, prompt=prompt,
         tb=tb, no_log=no_log)
+
+    # Keep a receipt even if the provider exits before tmux returns success.
+    status_home = config.app_home() / "child-status"
+    status_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt = Path(tempfile.mkdtemp(prefix="resume-", dir=status_home)) / "status.json"
+    command = resume_command(session, yolo=yolo, executable=executable, fork=fork,
+                             permission_mode=permission_mode, model=model, prompt=prompt)
+    monitor = [sys.executable, str(Path(child_status.__file__).resolve()),
+               str(receipt), "--", *command]
+    if tb:
+        argv[argv.index("--cmd") + 1] = shlex.join(monitor)
+    else:
+        argv[-len(command):] = monitor
+    if startup_status is not None:
+        startup_status.update(status_file=str(receipt))
 
     def create():
         try:
@@ -378,6 +396,11 @@ def start_detached(
     else:
         with pacer.slot(session.session_id, on_wait=on_wait):
             create()
+    if startup_status is not None:
+        startup_status.update(tmux_name=chosen_name)
+    state = child_status.wait_started(receipt)
+    if startup_status is not None:
+        startup_status.update(startup=state)
     return chosen_name
 
 
@@ -404,8 +427,8 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
     """Start several sessions, waiting `gap` seconds between each launch.
 
     The wait happens *before* each launch after the first, and only when the
-    previous one actually started — a failed launch consumed no quota, so the
-    next one should not be made to pay for it.
+    previous tmux session was created. A provider that exits immediately may
+    still have made a request, so its next launch also observes the gap.
     """
     results: list[dict[str, object]] = []
     executables = executables or {}
@@ -420,6 +443,7 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
                 step = min(1.0, remaining)
                 sleeper(step)
                 remaining -= step
+        startup_status = {}
         try:
             claude_options = {
                 "fork": fork if session.provider == "claude" else False,
@@ -434,6 +458,7 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
                                           session.provider, ""),
                                       force_live=force_live,
                                       tb=tb, no_log=no_log, runner=runner,
+                                      startup_status=startup_status,
                                       **claude_options)
             else:
                 callback = (
@@ -445,16 +470,20 @@ def restore_all(sessions, *, gap: float = LAUNCH_GAP, yolo: bool = False,
                     executable=executables.get(session.provider, ""),
                     force_live=force_live,
                     tb=tb, no_log=no_log, pacer=pacer, on_wait=callback,
+                    startup_status=startup_status,
                     **claude_options)
         except RuntimeError as error:
-            result = {"session": session, "ok": False, "detail": str(error)}
+            if startup_status.get("tmux_name"):
+                taken.add(startup_status["tmux_name"])
+                started += 1
+            result = {"session": session, "ok": False, "detail": str(error), **startup_status}
             results.append(result)
             if on_result is not None:
                 on_result(result, len(results), len(sessions))
             continue
         taken.add(name)
         started += 1
-        result = {"session": session, "ok": True, "detail": name}
+        result = {"session": session, "ok": True, "detail": name, **startup_status}
         results.append(result)
         if on_result is not None:
             on_result(result, len(results), len(sessions))

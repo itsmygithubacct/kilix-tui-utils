@@ -996,6 +996,7 @@ def _cmd_restore(
             "session": _session_dict(result["session"]),
             "ok": result["ok"],
             "detail": result["detail"],
+            **{key: result[key] for key in ("status_file", "startup", "tmux_name") if key in result},
         } for result in results], indent=2))
     else:
         for result in results:
@@ -1020,18 +1021,30 @@ def _take_value(
     default=None,
     convert=str,
 ):
-    matches = [(arguments.index(name), name) for name in names if name in arguments]
+    matches = []
+    index = 0
+    while index < len(arguments):
+        name = arguments[index]
+        if name not in names:
+            index += 1
+            continue
+        if index + 1 >= len(arguments):
+            raise RuntimeError(f"{name} requires a value")
+        matches.append((index, name, arguments[index + 1]))
+        index += 2
     if not matches:
         return default
-    index, name = min(matches)
-    if index + 1 >= len(arguments):
-        raise RuntimeError(f"{name} requires a value")
-    raw = arguments[index + 1]
-    del arguments[index:index + 2]
-    try:
-        return convert(raw)
-    except (TypeError, ValueError):
-        raise RuntimeError(f"invalid value for {name}: {raw}") from None
+    values = []
+    for _index, name, raw in matches:
+        try:
+            values.append(convert(raw))
+        except (TypeError, ValueError):
+            raise RuntimeError(f"invalid value for {name}: {raw}") from None
+    if any(value != values[0] for value in values[1:]):
+        raise RuntimeError(f"conflicting values for {names[0]}; provide one value")
+    for index, _name, _raw in reversed(matches):
+        del arguments[index:index + 2]
+    return values[0]
 
 
 def _configured_program(value: str, label: str) -> str:
@@ -1216,6 +1229,9 @@ def _print_help() -> None:
         "Safety:    --yolo, --no-yolo; JSON: --json, --envelope\n"
         "Agents:    " + ", ".join(item.key for item in providers.PROVIDERS)
     )
+    print("\nExamples: list --query NAME --all-time --json; resume ID --detached --json\n"
+          "Resume preserves the saved directory unless --cwd explicitly overrides it.\n"
+          "Detached JSON includes status_file and startup (process created, not agent readiness).")
 
 
 def _backend_options(arguments: list[str]) -> tuple[str, bool]:
@@ -1327,7 +1343,10 @@ def main(argv: list[str]) -> int:
         since = parse_duration(since_text)
 
     command = arguments.pop(0) if arguments else ""
-    if command in ("-h", "--help", "help"):
+    command_help = (arguments in (["-h"], ["--help"]) and command in {
+        "list", "ls", "show", "resume", "restore", "doctor", "configure", "prune",
+        "status", "install", "update", "install-launcher", "uninstall-launcher", "sync-menu", "tui"})
+    if command in ("-h", "--help", "help") or command_help:
         _print_help()
         return 0
     if command in ("--version", "version"):
@@ -1492,14 +1511,15 @@ def main(argv: list[str]) -> int:
                           "for the shared rate-limit guard", file=sys.stderr)
                     announced = True
 
+            startup_status = {}
             created = launch.start_detached(
                 chosen, name=name, cwd=cwd, yolo=yolo, executable=executable,
                 force_live=force_live, fork=fork,
                 permission_mode=permission_mode, model=agent_model,
                 prompt=prompt, tb=tb, no_log=no_log,
-                pacer=pacer, on_wait=report_wait)
+                pacer=pacer, on_wait=report_wait, startup_status=startup_status)
             if as_json:
-                print(json.dumps({"created": True, **plan}, indent=2))
+                print(json.dumps({"created": True, **plan, **startup_status}, indent=2))
             else:
                 print(f"Resumed {chosen.short_id} as tmux session "
                       f"'{created}' in {plan['cwd']}")
