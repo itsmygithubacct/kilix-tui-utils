@@ -872,6 +872,71 @@ class ClaudeRecords(unittest.TestCase):
             got = pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree_for(pane)).panes[0]
         self.assertEqual(got.activity, "agent")
 
+    def snapshot_of(self, *panes, parse=False):
+        """Activities of panes given as (window id, [(pid, argv)]); with `parse` the listing goes through kitty_rc.parse()."""
+        tree = tree_for(*[(wid, procs, str(self.home.cwd)) for wid, procs in panes])
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+            return [pane.activity for pane in pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree).panes]
+
+    def test_a_pid_listed_twice_certifies_none_of_its_entries_in_either_order(self):
+        """One pid in two panes with different argv: the live process matches only one of them, and the
+        other must not borrow its certification (the first would be named from the second's observation)."""
+        old, new = ["claude", "--resume", uuid(1)], ["claude", "--resume", uuid(2)]
+        pid = self.claude(argv=new)
+        self.record(pid, status="busy")
+        self.assertEqual(self.snapshot_of((9, [(pid, new)])), ["working"])               # alone, the live one is named
+        for panes in (((9, [(pid, old)]), (10, [(pid, new)])), ((10, [(pid, new)]), (9, [(pid, old)]))):
+            self.assertEqual(self.snapshot_of(*panes), ["agent", "agent"], panes)
+        same = (((9, [(pid, new)]), (10, [(pid, new)])))
+        self.assertEqual(self.snapshot_of(*same), ["agent", "agent"])                      # even identical entries: a contradictory census
+        self.assertEqual(self.snapshot_of((9, [(pid, new), (pid, new)])), ["agent"])        # twice in one pane
+
+    def test_claude_by_pid_itself_refuses_a_duplicated_candidate_pid(self):
+        """Callers other than the snapshot get the same rule."""
+        old, new = ["claude", "--resume", uuid(1)], ["claude", "--resume", uuid(2)]
+        pid = self.claude(argv=new)
+        self.record(pid)
+        inspector = pane_center.Inspector(proc_root=str(self.home.proc))
+        process = lambda argv: kitty_rc.Process(pid=pid, argv=tuple(argv), cwd=str(self.home.cwd))      # noqa: E731
+        self.assertIn(pid, inspector._claude_by_pid([process(new)]))
+        for pair in ([process(old), process(new)], [process(new), process(old)], [process(new), process(new)]):
+            self.assertEqual(inspector._claude_by_pid(pair), {})
+
+    def test_a_pid_listed_by_a_pane_that_would_not_be_certified_still_blocks_the_other(self):
+        pid = self.claude()
+        self.record(pid, status="busy")
+        self.assertEqual(self.snapshot_of((9, [(pid, ["claude"])]), (10, [(pid, ["less", "notes.txt"])])), ["agent", "running"])
+        self.assertEqual(self.snapshot_of((10, [(pid, ["less", "notes.txt"])]), (9, [(pid, ["claude"])])), ["running", "agent"])
+
+    def test_the_duplicate_rule_holds_through_the_public_listing_parser(self):
+        old, new = ["claude", "--resume", uuid(1)], ["claude", "--resume", uuid(2)]
+        pid = self.claude(argv=new)
+        self.record(pid, status="waiting")
+        raw = [{"id": 1, "is_focused": True, "tabs": [{"id": 2, "title": "w", "is_active": True, "windows": [
+            {"id": wid, "pid": 70 + wid, "title": f"p{wid}", "cwd": str(self.home.cwd),
+             "env": {"KITTY_PTY_BROKER_SESSION": SESSION},
+             "foreground_processes": [{"pid": pid, "cmdline": argv, "cwd": str(self.home.cwd)}]}
+            for wid, argv in ((9, old), (10, new))]}]}]
+        for windows in (raw[0]["tabs"][0]["windows"], raw[0]["tabs"][0]["windows"][::-1]):
+            raw[0]["tabs"][0]["windows"] = list(windows)
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+                got = pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(kitty_rc.parse(raw)).panes
+            self.assertEqual([pane.activity for pane in got], ["agent", "agent"])
+
+    def test_conflicting_duplicate_home_or_config_entries_make_the_context_unknown(self):
+        pid = self.claude()
+        self.record(pid)
+        elsewhere = self.home.root / "elsewhere"
+        for lines in (f"CLAUDE_CONFIG_DIR={self.config}\0CLAUDE_CONFIG_DIR={elsewhere}\0",
+                      f"CLAUDE_CONFIG_DIR={elsewhere}\0CLAUDE_CONFIG_DIR={self.config}\0",
+                      f"HOME=/a\0CLAUDE_CONFIG_DIR={self.config}\0HOME=/b\0"):
+            (self.home.proc / str(pid) / "environ").write_bytes(lines.encode())
+            self.assertIsNone(pane_center._live_environment(pid, proc_root=str(self.home.proc)))
+            self.assertEqual(self.activity(pid), "agent", lines)
+        (self.home.proc / str(pid) / "environ").write_bytes(
+            f"CLAUDE_CONFIG_DIR={self.config}\0HOME=/a\0CLAUDE_CONFIG_DIR={self.config}\0HOME=/a\0OTHER=1\0OTHER=2\0".encode())
+        self.assertEqual(self.activity(pid), "idle")                       # identical repeats and unrelated names are harmless
+
     def test_a_process_that_mentions_two_agents_is_never_named(self):
         argv = ["claude", "/srv/codex/notes"]
         pid = self.claude(argv=argv)

@@ -382,7 +382,11 @@ def _live_environment(pid: int, *, proc_root: str) -> dict[str, str] | None:
         for entry in raw.split(b"\0"):
             name, separator, value = entry.partition(b"=")
             if separator and name:
-                found[name.decode("utf-8")] = value.decode("utf-8")
+                key, text = name.decode("utf-8"), value.decode("utf-8")
+                # Which of two different values a program honours is its own business: the context is unknown.
+                if key in ("HOME", "CLAUDE_CONFIG_DIR") and found.get(key, text) != text:
+                    return None
+                found[key] = text
     except UnicodeDecodeError:
         return None
     return found
@@ -510,6 +514,11 @@ class Inspector:
         once more, so a process that changed while a later pane was inspected is dropped. What remains
         is the window that any observer has between its last read and the use of its answer.
         """
+        # A pid listed more than once (in two panes, or twice in one) is a contradictory census: whichever
+        # entry is observed, the observation would be lent to the other. Every such candidate is refused.
+        processes = list(processes)
+        listed = [process.pid for process in processes]
+        processes = [process for process in processes if listed.count(process.pid) == 1]
         certified = {}
         for process in processes:
             result = self._certify(process)
@@ -557,8 +566,10 @@ class Inspector:
 
     def snapshot(self, tree: kitty_rc.Tree) -> Snapshot:
         brokers, broker_available, warning = _broker_statuses()
+        census = [process.pid for pane in tree.panes for process in pane.processes if process.pid > 0]
         claude_by_pid = self._claude_by_pid([
-            process for process in (_certifiable(pane) for pane in tree.panes) if process is not None])
+            process for process in (_certifiable(pane) for pane in tree.panes)
+            if process is not None and census.count(process.pid) == 1])
         page_index = {
             page.id: page.index for page in tree.pages
         }

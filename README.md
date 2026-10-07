@@ -441,8 +441,28 @@ a process that changed while a later pane was inspected is dropped.
   A malformed file (float, string, boolean or out-of-range numbers, nesting too deep,
   not UTF-8, too large) is that row refused, never an error for the other panes.
 
-Anything else is `agent`. What remains, and cannot be removed by any reader, is the
-window between the last read and the moment the answer is used.
+- the pid is listed **once** in the whole pane census. A pid that appears in two panes,
+  or twice in one, is a contradictory listing: every entry carrying it is `agent`, so
+  the observation of one entry is never lent to another with a different command line.
+- the environment does not carry two *different* values for `HOME` or
+  `CLAUDE_CONFIG_DIR` (which one a program honours is unknown); identical repeats are
+  harmless.
+
+Anything else is `agent`.
+
+**What the ambiguity guard is, exactly.** It is a textual rule, not semantic detection:
+a process "mentions" an agent when one **path component** of one of its arguments (the
+argument split on `/`) is exactly one of the names above, or begins with `name-` or
+`name.`, compared case-insensitively. It does not parse shell strings, aliases, scripts
+or wrappers: `sh -c 'exec codex'` is a single argument with no such component, and an
+alias or a differently named binary is invisible to it. A pane can therefore still be
+named while an agent it cannot recognise runs beside Claude; the guard narrows the
+doubt, it does not remove it. Only the hosts listed above are exempt.
+
+**What cannot be removed.** Every check above reads the process and the registry at some
+moment. A process or row can change after the last read and before the answer is used
+(or before a person acts on it); no reader can close that window, and this one narrows
+it by re-reading every certified pane once more at the end of the snapshot.
 
 ### Creating panes
 
