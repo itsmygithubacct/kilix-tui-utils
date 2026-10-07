@@ -1,6 +1,7 @@
 """Codex rollout discovery, including active and archived sessions."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -14,9 +15,12 @@ _UUID = re.compile(
     re.I,
 )
 _TURN_STARTED = frozenset({"task_started", "turn_started"})
+_TURN_ABORTED = frozenset({"turn_aborted", "task_aborted"})
+# A turn ends by completing or by being aborted (Esc): the rollout records `task_started`
+# then `turn_aborted` with no `task_complete`, and the next prompt starts a new turn.
 _TURN_COMPLETE = frozenset({
     "task_complete", "turn_complete", "turn_completed",
-})
+}) | _TURN_ABORTED
 _APPROVAL_REQUESTED = frozenset({
     "exec_approval_request", "apply_patch_approval_request",
 })
@@ -26,7 +30,6 @@ _APPROVAL_RESOLVED = frozenset({
     # eventually closed by the turn boundary.
     "exec_command_begin", "exec_command_end",
     "patch_apply_begin", "patch_apply_end",
-    "turn_aborted", "task_aborted",
 }) | _TURN_STARTED | _TURN_COMPLETE
 
 
@@ -337,3 +340,178 @@ def resume_argv(session: Session, *, yolo: bool = False) -> list[str]:
         argv.append("--yolo")
     argv.extend(("resume", session.session_id))
     return argv
+
+
+# ---------------------------------------------------------------------------
+# Which rollout a live Codex process owns, without an open descriptor.
+#
+# Codex 0.160 appends to its rollout by opening and closing it per write, so
+# `/proc/<pid>/fd` shows no `rollout-*.jsonl` (it holds `logs_*.sqlite` and a lock
+# only). That descriptor stays the first choice (`liveness.open_by`). Without it, an
+# instance (one per pane) is matched to a rollout only by evidence that cannot name
+# two sessions, and anything else gives no session at all:
+#
+#   1. its own command line names the session: `codex resume <uuid>`;
+#   2. the session's first record (`session_meta`) carries the working directory
+#      and a timestamp; Codex writes it within about two seconds of starting, so a
+#      rollout whose `session_meta.timestamp` falls in [start - START_BEFORE,
+#      start + START_WINDOW] of exactly one live instance with that same working
+#      directory, which is not a subagent thread, and whose `originator` is the
+#      kind of process the instance is (`codex-tui`, or `codex_exec` for a
+#      `codex exec` command line), belongs to that instance.
+#
+# A working directory is refused wholesale (every instance in it gets no session)
+# when any rollout created since its earliest instance started cannot be attributed
+# to exactly one instance by that rule: a second session started later in the same
+# process (`/new`), another Codex run in that directory, two instances starting
+# together. A newer session in the same process would make the first rollout's
+# events stale, which is the one thing that must not be reported as a state.
+# Not used: `logs_*.sqlite` (it tags log rows with `pid:<n>:<uuid>` and a thread,
+# but an idle session logs no thread-tagged rows), and "the newest rollout".
+START_BEFORE = 2.0
+START_WINDOW = 30.0
+MAX_CANDIDATES = 400
+_META_CACHE: dict[str, dict | None] = {}
+
+
+@dataclass(frozen=True)
+class Instance:
+    """One live Codex (a pane's processes): what identifies its session."""
+
+    key: object
+    start: float            # earliest process start, Unix time
+    cwd: str                # the process's own working directory
+    resume_id: str = ""     # `codex resume <uuid>` on its command line
+    home: str = ""          # CODEX_HOME of the process, "" for the default
+    pids: tuple[int, ...] = ()
+    exec_run: bool = False  # `codex exec ...`: a non-interactive run, not the TUI
+
+
+def originator(exec_run: bool) -> str:
+    """What `session_meta.originator` says for that kind of process."""
+    return "codex_exec" if exec_run else "codex-tui"
+
+
+def resume_id(argv) -> str:
+    """The session UUID named by `codex resume <uuid>`, or ""."""
+    args = [str(value) for value in argv]
+    for index, value in enumerate(args):
+        if value == "resume":
+            for later in args[index + 1:]:
+                if later.startswith("-"):
+                    continue
+                match = _UUID.fullmatch(later.strip())
+                return match.group(1).lower() if match else ""
+    return ""
+
+
+def _real(path: str) -> str:
+    try:
+        return os.path.realpath(path) if path else ""
+    except OSError:
+        return path
+
+
+def _is_subagent(meta: dict) -> bool:
+    return isinstance(meta.get("source"), dict) or meta.get("thread_source") == "subagent"
+
+
+def _candidate_meta(path: str) -> dict | None:
+    """The first record's payload with its timestamp, cached (it never changes)."""
+    if path not in _META_CACHE:
+        meta = _first_meta(path)
+        stamp = _timestamp(meta.get("timestamp")) if meta else None
+        _META_CACHE[path] = ({**meta, "_ts": stamp} if meta and stamp is not None else None)
+        if len(_META_CACHE) > 4096:
+            _META_CACHE.clear()
+    return _META_CACHE[path]
+
+
+def _day_directories(sessions: Path, earliest: float, now: float) -> list[Path]:
+    """The `sessions/YYYY/MM/DD` folders from the day before `earliest` to the day after `now`."""
+    found = []
+    for index in range(int(earliest // 86400) - 1, int(now // 86400) + 2):
+        candidate = sessions / datetime.fromtimestamp(index * 86400, timezone.utc).strftime("%Y/%m/%d")
+        if candidate.is_dir():
+            found.append(candidate)
+    return found
+
+
+def _by_id(sessions: Path, identity: str) -> str:
+    """The one rollout file for a session id, or "" when there are none or several."""
+    try:
+        matches = [str(path) for path in sessions.glob(f"*/*/*/rollout-*{identity}.jsonl")]
+    except OSError:
+        return ""
+    return matches[0] if len(matches) == 1 else ""
+
+
+def resolve_instances(
+    instances,
+    *,
+    now: float | None = None,
+    skip: frozenset = frozenset(),
+) -> dict[object, str]:
+    """Map instance keys to the rollout each provably owns; the rest get no entry.
+
+    `skip` holds paths already claimed by an open descriptor.
+    """
+    import time as _time
+
+    now = _time.time() if now is None else now
+    result: dict[object, str] = {}
+    by_home: dict[str, list[Instance]] = {}
+    for instance in instances:
+        if instance.start > 0 and instance.cwd:
+            by_home.setdefault(instance.home or home(), []).append(instance)
+    for codex_home, group in by_home.items():
+        sessions = Path(codex_home).expanduser() / "sessions"
+        earliest = min(item.start for item in group)
+        candidates: list[tuple[str, float, str, str]] = []
+        for directory in _day_directories(sessions, earliest, now):
+            try:
+                names = sorted(directory.iterdir())
+            except OSError:
+                continue
+            for path in names:
+                if not path.name.startswith("rollout-") or str(path) in skip:
+                    continue
+                try:
+                    modified = path.stat().st_mtime
+                except OSError:
+                    continue
+                if modified < earliest - START_BEFORE:
+                    continue
+                meta = _candidate_meta(str(path))
+                if meta is None or _is_subagent(meta) or meta["_ts"] < earliest - START_BEFORE:
+                    continue
+                candidates.append((str(path), meta["_ts"], _real(str(meta.get("cwd") or "")),
+                                   str(meta.get("originator") or "")))
+        if len(candidates) > MAX_CANDIDATES:
+            continue                                  # too many to reason about: no session
+        for cwd in {_real(item.cwd) for item in group}:
+            for exec_run in (False, True):
+                here = [item for item in group if _real(item.cwd) == cwd and item.exec_run == exec_run]
+                if not here:
+                    continue
+                kind = originator(exec_run)
+                mine = [item for item in candidates if item[2] == cwd and item[3] == kind]
+                attributed: dict[object, list[str]] = {item.key: [] for item in here}
+                refused = False
+                for path, stamp, _cwd, _kind in mine:
+                    owners = [item for item in here
+                              if item.start - START_BEFORE <= stamp <= item.start + START_WINDOW]
+                    if len(owners) != 1:
+                        refused = True                # nobody's, or two instances' rollout
+                        break
+                    attributed[owners[0].key].append(path)
+                if refused:
+                    continue
+                for item in here:
+                    if item.resume_id:
+                        named = _by_id(sessions, item.resume_id)
+                        if named and not attributed[item.key] and named not in skip:
+                            result[item.key] = named
+                    elif len(attributed[item.key]) == 1:
+                        result[item.key] = attributed[item.key][0]
+    return result

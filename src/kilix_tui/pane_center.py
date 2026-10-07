@@ -304,6 +304,62 @@ def _argument_session(process: kitty_rc.Process) -> str:
     return ""
 
 
+def _proc_link(proc_root: str, pid: int, name: str) -> str:
+    try:
+        return os.readlink(os.path.join(proc_root, str(pid), name))
+    except OSError:
+        return ""
+
+
+def _proc_environ(proc_root: str, pid: int, key: str) -> str:
+    """One variable of a process's own environment (same user only), or ""."""
+    try:
+        with open(os.path.join(proc_root, str(pid), "environ"), "rb") as handle:
+            data = handle.read(1 << 17)
+    except OSError:
+        return ""
+    prefix = key.encode() + b"="
+    for entry in data.split(b"\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix):].decode("utf-8", "replace")
+    return ""
+
+
+def _codex_args(argv) -> list[str]:
+    """The arguments after the codex executable (the node wrapper's script counts as it)."""
+    args = [str(value) for value in argv]
+    for index, value in enumerate(args):
+        if (os.path.basename(value) or value).casefold() == "codex":
+            return args[index + 1:]
+    return []
+
+
+def _codex_exec(argv) -> bool:
+    """`codex exec ...`: a non-interactive run, whose rollouts say originator `codex_exec`."""
+    return "exec" in _codex_args(argv)
+
+
+def _codex_unclear(argv) -> bool:
+    """`resume`/`fork` without a session id (a picker, `--last`): the session is not the one
+    started with the process, so no rollout is matched by time."""
+    args = _codex_args(argv)
+    return ("resume" in args or "fork" in args) and not codex.resume_id(argv)
+
+
+def _codex_directory(argv, cwd: str) -> str:
+    """The directory the session is rooted in: `-C DIR` / `--cd DIR` relative to the process's own."""
+    args = _codex_args(argv)
+    for index, value in enumerate(args):
+        directory = ""
+        if value in ("-C", "--cd") and index + 1 < len(args):
+            directory = args[index + 1]
+        elif value.startswith("--cd="):
+            directory = value[5:]
+        if directory:
+            return os.path.normpath(directory if os.path.isabs(directory) else os.path.join(cwd, directory))
+    return cwd
+
+
 def _open_files(pid: int, *, proc_root: str) -> tuple[str, ...]:
     if pid <= 0:
         return ()
@@ -358,6 +414,10 @@ def _minimal_session(
 def _activity(session: Session | None, pane: kitty_rc.Pane) -> str:
     if session is not None:
         status = session.live_status.strip().casefold().replace("_", "-")
+        if session.provider == "claude":
+            # Claude's registry status has its own vocabulary (`shell` is idle with
+            # background work running); only what it defines is mapped.
+            return claude.ACTIVITY.get(status, "agent")
         if status in {"idle", "ready"}:
             return "idle"
         if status in {"working", "active", "busy", "running"}:
@@ -394,6 +454,8 @@ class Inspector:
         self._codex_cache: dict[
             tuple[str, int, int, tuple[int, ...]], Session
         ] = {}
+        # pane id -> rollout path, for Codex panes that hold no rollout open (set per snapshot)
+        self._codex_matched: dict[int, str] = {}
 
     def _codex_for(self, pane: kitty_rc.Pane) -> Session | None:
         owners: dict[str, set[int]] = {}
@@ -405,7 +467,7 @@ class Inspector:
                 if name.startswith("rollout-") and name.endswith(".jsonl"):
                     owners.setdefault(path, set()).add(process.pid)
         if not owners:
-            return None
+            return self._codex_by_start(pane)
         candidates = []
         for path, pids in owners.items():
             try:
@@ -428,6 +490,42 @@ class Inspector:
             }
             self._codex_cache = keep
         return max(candidates, key=lambda item: item.updated) if candidates else None
+
+    def _codex_by_start(self, pane: kitty_rc.Pane) -> Session | None:
+        """The session matched to this pane's Codex by start time and directory, if provable."""
+        path = self._codex_matched.get(pane.id)
+        if not path:
+            return None
+        pids = tuple(p.pid for p in pane.processes if _process_agent(p) == "codex" and p.pid > 0)
+        return codex.session_from_path(path, pids=pids)
+
+    def _match_codex(self, panes) -> dict[int, str]:
+        """Pane id -> rollout for every Codex pane without an open rollout (see `codex.resolve_instances`)."""
+        instances, claimed = [], set()
+        for pane in panes:
+            members = [p for p in pane.processes if _process_agent(p) == "codex" and p.pid > 0]
+            if not members:
+                continue
+            held = [path for p in members for path in _open_files(p.pid, proc_root=self.proc_root)
+                    if os.path.basename(path).startswith("rollout-") and path.endswith(".jsonl")]
+            if held:
+                claimed.update(os.path.realpath(path) for path in held)
+                continue
+            starts = [(liveness.start_time(p.pid, proc_root=self.proc_root), p) for p in members]
+            starts = [item for item in starts if item[0] > 0]
+            if not starts:
+                continue
+            first = min(starts, key=lambda item: item[0])
+            argv = [value for _, p in starts for value in p.argv]
+            if _codex_unclear(argv):
+                continue
+            cwd = _codex_directory(argv, _proc_link(self.proc_root, first[1].pid, "cwd") or first[1].cwd)
+            instances.append(codex.Instance(
+                key=pane.id, start=first[0], cwd=cwd,
+                resume_id=next((codex.resume_id(p.argv) for _, p in starts if codex.resume_id(p.argv)), ""),
+                home=_proc_environ(self.proc_root, first[1].pid, "CODEX_HOME"),
+                pids=tuple(p.pid for _, p in starts), exec_run=_codex_exec(argv)))
+        return codex.resolve_instances(instances, skip=frozenset(claimed)) if instances else {}
 
     def _claude_by_pid(self) -> dict[int, tuple[str, dict[str, object]]]:
         registry = os.path.join(claude.home(), "sessions")
@@ -513,6 +611,7 @@ class Inspector:
     def snapshot(self, tree: kitty_rc.Tree) -> Snapshot:
         brokers, broker_available, warning = _broker_statuses()
         claude_by_pid = self._claude_by_pid()
+        self._codex_matched = self._match_codex(tree.panes)
         page_index = {
             page.id: page.index for page in tree.pages
         }

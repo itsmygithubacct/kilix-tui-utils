@@ -30,6 +30,18 @@ _WRAPPED = re.compile(
 _COMMAND = re.compile(r"<command-(name|message|args)>(.*?)</command-\1>", re.S)
 
 
+
+# The registry's `status` (a descriptor file per running process) read as Kilix's
+# activity. Claude Code defines it as one of busy | shell | idle | waiting (with an
+# optional `waitingFor`); `shell` is what it reports for a session that is idle at its
+# prompt while a background shell, monitor or task is still running (its own code
+# derives it as `status === "idle" && <background work> ? "shell" : status`). So an
+# idle session with "1 monitor" in its status line is `shell`, and is idle. Anything
+# else, including a status this table does not know, is not mapped: it stays an
+# unreadable agent.
+ACTIVITY = {"idle": "idle", "shell": "idle", "busy": "working", "waiting": "waiting"}
+
+
 def home() -> str:
     return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
         os.path.expanduser("~"), ".claude")
