@@ -1,8 +1,7 @@
-"""Agent state from structured evidence: Codex rollouts without an open descriptor, Claude registry states.
+"""Agent state from structured evidence: an exactly held Codex rollout, Claude registry states.
 
 Synthetic shapes only: fake /proc and fake CODEX_HOME trees under a temporary directory, no real session
-content. The reader must name a rollout only when nothing else could be that process's session; anything
-uncertain stays `agent`.
+content. A state is named only by evidence that is exact and current; anything else stays `agent`.
 """
 from __future__ import annotations
 
@@ -83,159 +82,6 @@ class Home:
         os.utime(path, (stamp + 60, stamp + 60))
         return path
 
-    def instance(self, key=1, *, start=START, argv=None, **kwargs):
-        return codex.Instance(key=key, start=start, cwd=str(self.cwd), home=str(self.codex_home),
-                              pids=(key,), **kwargs)
-
-    def resolve(self, *instances, skip=frozenset()):
-        return codex.resolve_instances(instances, now=START + 600, skip=skip)
-
-
-class CodexOwnership(unittest.TestCase):
-    def setUp(self):
-        self.home = Home(self)
-        codex._META_CACHE.clear()
-
-    def test_one_rollout_just_after_the_start_is_that_instances_session(self):
-        path = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(path)})
-
-    def test_the_window_edges(self):
-        for delta, owned in ((-2.0, True), (-2.5, False), (0.0, True), (30.0, True), (31.0, False), (300.0, False)):
-            codex._META_CACHE.clear()
-            home = Home(self)
-            path = home.rollout(1, stamp=START + delta)
-            got = home.resolve(home.instance())
-            self.assertEqual(got, {1: str(path)} if owned else {}, delta)
-
-    def test_a_rollout_in_another_directory_is_not_a_candidate_and_does_not_refuse(self):
-        other = self.home.root / "elsewhere"
-        other.mkdir()
-        self.home.rollout(2, stamp=START + 1, cwd=other)
-        mine = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(mine)})
-
-    def test_a_later_session_in_the_same_directory_refuses_the_directory(self):
-        """A /new in the same process, or another Codex run there: the first rollout would be stale."""
-        self.home.rollout(1, stamp=START + 2)
-        self.home.rollout(2, stamp=START + 400)
-        self.assertEqual(self.home.resolve(self.home.instance()), {})
-
-    def test_a_rollout_before_the_instance_started_is_history_not_a_candidate(self):
-        self.home.rollout(9, stamp=START - 600)
-        mine = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(mine)})
-
-    def test_two_instances_starting_together_get_no_session(self):
-        self.home.rollout(1, stamp=START + 2)
-        self.home.rollout(2, stamp=START + 3)
-        got = self.home.resolve(self.home.instance(1), self.home.instance(2, start=START + 1))
-        self.assertEqual(got, {})
-
-    def test_one_rollout_inside_two_instances_windows_is_nobodys(self):
-        self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance(1), self.home.instance(2, start=START + 1)), {})
-
-    def test_two_sessions_started_in_one_instances_window_are_unclear(self):
-        """A /new within seconds of the start: which of the two is the process's now?"""
-        self.home.rollout(1, stamp=START + 2)
-        self.home.rollout(2, stamp=START + 5)
-        self.assertEqual(self.home.resolve(self.home.instance()), {})
-
-    def test_two_instances_started_apart_each_get_their_own_rollout(self):
-        first = self.home.rollout(1, stamp=START + 2)
-        second = self.home.rollout(2, stamp=START + 1000 + 2)
-        got = self.home.resolve(self.home.instance(1), self.home.instance(2, start=START + 1000))
-        self.assertEqual(got, {1: str(first), 2: str(second)})
-
-    def test_subagent_threads_do_not_count_either_way(self):
-        self.home.rollout(5, stamp=START + 2, source={"subagent": {"thread_spawn": {}}}, thread_source="subagent")
-        self.home.rollout(6, stamp=START + 500, thread_source="subagent")
-        mine = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(mine)})
-
-    def test_noninteractive_runs_do_not_refuse_a_tui_but_match_an_exec_instance(self):
-        self.home.rollout(7, stamp=START + 400, originator="codex_exec", source="exec")
-        mine = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(mine)})
-        # and the reverse: a `codex exec` instance matches only the exec rollout
-        run = self.home.instance(3, start=START + 398, exec_run=True)
-        self.assertEqual(self.home.resolve(run), {3: str(self.home.codex_home / "sessions" / datetime.fromtimestamp(
-            START + 400, timezone.utc).strftime("%Y/%m/%d") / f"rollout-{datetime.fromtimestamp(START + 400, timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}-{uuid(7)}.jsonl")})
-
-    def test_a_resume_id_names_the_rollout_exactly(self):
-        old = self.home.rollout(4, stamp=START - 90000)
-        self.home.rollout(8, stamp=START - 700)             # another old session in the same directory
-        got = self.home.resolve(self.home.instance(resume_id=uuid(4)))
-        self.assertEqual(got, {1: str(old)})
-
-    def test_a_resume_id_with_no_file_or_two_files_names_nothing(self):
-        self.assertEqual(self.home.resolve(self.home.instance(resume_id=uuid(4))), {})
-        self.home.rollout(4, stamp=START - 90000)
-        self.home.rollout(4, stamp=START - 80000, name=f"rollout-2020-01-01T00-00-00-{uuid(4)}.jsonl")
-        self.assertEqual(self.home.resolve(self.home.instance(resume_id=uuid(4))), {})
-
-    def test_a_resumed_instance_that_also_wrote_a_new_rollout_is_unclear(self):
-        self.home.rollout(4, stamp=START - 90000)
-        self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance(resume_id=uuid(4))), {})
-
-    def test_a_rollout_held_open_by_another_pane_is_not_claimed(self):
-        path = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance(), skip=frozenset({str(path)})), {})
-
-    def test_too_many_candidates_give_no_session(self):
-        other = self.home.root / "elsewhere"
-        other.mkdir()
-        for number in range(10, 16):
-            self.home.rollout(number, stamp=START + 2, cwd=other)
-        mine = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(mine)})
-        with mock.patch.object(codex, "MAX_CANDIDATES", 5):
-            self.assertEqual(self.home.resolve(self.home.instance()), {})
-
-    def test_an_unreadable_or_headless_rollout_is_ignored(self):
-        folder = self.home.codex_home / "sessions" / datetime.fromtimestamp(START, timezone.utc).strftime("%Y/%m/%d")
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / "rollout-garbage.jsonl").write_text("not json\n")
-        (folder / "rollout-empty.jsonl").write_text("")
-        os.utime(folder / "rollout-garbage.jsonl", (START + 60, START + 60))
-        mine = self.home.rollout(1, stamp=START + 2)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(mine)})
-
-    def test_a_symlinked_working_directory_is_the_same_directory(self):
-        link = self.home.root / "link"
-        link.symlink_to(self.home.cwd)
-        mine = self.home.rollout(1, stamp=START + 2, cwd=link)
-        self.assertEqual(self.home.resolve(self.home.instance()), {1: str(mine)})
-
-    def test_sessions_are_found_across_the_utc_day_boundary(self):
-        midnight = (START // 86400 + 1) * 86400
-        mine = self.home.rollout(1, stamp=midnight + 1)
-        got = codex.resolve_instances([self.home.instance(start=midnight - 5)], now=midnight + 600)
-        self.assertEqual(got, {1: str(mine)})
-
-    def test_resume_id_parsing(self):
-        for argv, expected in ((["codex", "resume", uuid(3)], uuid(3)), (["node", "/x/codex", "resume", "--yolo", uuid(3).upper()], uuid(3)),
-                               (["codex", "resume"], ""), (["codex", "resume", "--last"], ""), (["codex", "resume", "latest"], ""),
-                               (["codex", "--yolo"], ""), (["codex", uuid(3)], "")):
-            self.assertEqual(codex.resume_id(argv), expected, argv)
-
-
-class CodexCommandLines(unittest.TestCase):
-    def test_exec_resume_and_chdir_are_read_from_the_command_line(self):
-        self.assertTrue(pane_center._codex_exec(["node", "/x/codex", "--model", "m", "exec", "do it"]))
-        self.assertFalse(pane_center._codex_exec(["node", "/x/codex", "--yolo"]))
-        self.assertTrue(pane_center._codex_unclear(["codex", "resume"]))
-        self.assertTrue(pane_center._codex_unclear(["codex", "resume", "--last"]))
-        self.assertTrue(pane_center._codex_unclear(["codex", "fork"]))
-        self.assertFalse(pane_center._codex_unclear(["codex", "resume", uuid(3)]))
-        self.assertFalse(pane_center._codex_unclear(["codex", "--yolo"]))
-        self.assertEqual(pane_center._codex_directory(["codex", "-C", "/srv/other"], "/srv/here"), "/srv/other")
-        self.assertEqual(pane_center._codex_directory(["codex", "--cd", "sub"], "/srv/here"), "/srv/here/sub")
-        self.assertEqual(pane_center._codex_directory(["codex", "--cd=/srv/o"], "/srv/here"), "/srv/o")
-        self.assertEqual(pane_center._codex_directory(["codex"], "/srv/here"), "/srv/here")
-
 
 class CodexStatesFromEvents(unittest.TestCase):
     def state(self, events, *, extra=(), pids=(11,)):
@@ -266,6 +112,71 @@ class CodexStatesFromEvents(unittest.TestCase):
         patch = [{"type": "event_msg", "payload": {"type": "apply_patch_approval_request"}}]
         self.assertEqual(self.state(("task_started",), extra=patch).live_status, "waiting")
 
+    def ev(self, kind, call_id=None):
+        payload = {"type": kind}
+        if call_id:
+            payload["call_id"] = call_id
+        return {"type": "event_msg", "payload": payload}
+
+    def test_a_partial_or_malformed_newest_record_is_unknown_never_an_older_idle(self):
+        home = Home(self)
+        for tail in ('{"type": "event_msg", "payload": {"type": "task_sta',       # torn mid-write
+                     '{"type": "event_msg", "payload": {"type": "task_started"',  # unterminated object
+                     "not json task_started\n",
+                     '{"type": "event_msg", "payload": {"type": "task_started"}}}\n',
+                     "[1, 2]\n"):
+            path = home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+            with open(path, "a") as handle:
+                handle.write(tail)
+            got = codex.session_from_path(str(path), pids=(11,))
+            self.assertEqual((got.live_status, got.last_turn_event), ("unknown", ""), tail)
+
+    def test_an_unreadable_older_record_that_is_not_a_turn_event_does_not_hide_the_state(self):
+        home = Home(self)
+        path = home.rollout(1, stamp=START + 2, events=("task_started",))
+        text = path.read_text().splitlines()
+        text.insert(2, "garbage with no markers")
+        path.write_text("\n".join(text) + "\n")
+        self.assertEqual(codex.session_from_path(str(path), pids=(11,)).live_status, "working")
+
+    def test_a_marker_bearing_unreadable_record_inside_the_open_turn_is_unknown(self):
+        home = Home(self)
+        path = home.rollout(1, stamp=START + 2, events=("task_started",))
+        with open(path, "a") as handle:
+            handle.write('{"type": "event_msg", "payload": {"type": "exec_approval_request", "call_id": "z"\n')
+            handle.write(json.dumps(self.ev("token_count")) + "\n")
+        self.assertEqual(codex.session_from_path(str(path), pids=(11,)).live_status, "unknown")
+
+    def test_approvals_are_tracked_by_call_id(self):
+        a, b = self.ev("exec_approval_request", "a"), self.ev("exec_approval_request", "b")
+        patch = self.ev("apply_patch_approval_request", "c")
+        cases = (
+            ([a, b], "waiting"),
+            ([a, b, self.ev("exec_command_begin", "a")], "waiting"),                      # b still pending
+            ([a, b, self.ev("exec_command_begin", "a"), self.ev("exec_command_begin", "b")], "working"),
+            ([a, self.ev("exec_command_begin", "other")], "waiting"),                      # unrelated command
+            ([a, self.ev("exec_command_end", "other"), self.ev("patch_apply_begin", "x")], "waiting"),
+            ([a, patch, self.ev("patch_apply_begin", "c")], "waiting"),
+            ([a, patch, self.ev("patch_apply_begin", "c"), self.ev("exec_command_end", "a")], "working"),
+            ([a, self.ev("exec_command_begin")], "waiting"),                               # a command with no id resolves nothing
+            ([{"type": "event_msg", "payload": {"type": "exec_approval_request", "approval_id": "q"}},
+              self.ev("exec_command_begin", "q")], "working"),                             # the serializer's approval id
+            ([{"type": "event_msg", "payload": {"type": "exec_approval_request", "approval_id": "q", "call_id": "r"}},
+              self.ev("exec_command_begin", "other")], "waiting"),
+        )
+        for extra, expected in cases:
+            with self.subTest(extra=[(e["payload"]["type"], e["payload"].get("call_id")) for e in extra]):
+                self.assertEqual(self.state(("task_started",), extra=extra).live_status, expected)
+
+    def test_an_approval_from_a_finished_turn_is_not_pending(self):
+        late = [self.ev("exec_approval_request", "a")]           # recorded after the turn ended: no open turn to wait in
+        self.assertEqual(self.state(("task_started", "task_complete"), extra=late).live_status, "idle")
+        self.assertEqual(self.state(("task_started", "turn_aborted"), extra=late).live_status, "idle")
+        old = [self.ev("exec_approval_request", "a")]
+        self.assertEqual(self.state(("task_started",), extra=old + [self.ev("task_complete")]).live_status, "idle")
+        got = self.state(("task_started", "task_complete", "task_started"), extra=[])
+        self.assertEqual(got.live_status, "working")
+
     def test_a_rollout_with_no_owner_is_not_live(self):
         self.assertEqual(self.state(("task_started",), pids=()).live_status, "")
 
@@ -278,11 +189,12 @@ def tree_for(*panes):
         for wid, procs, cwd in panes]}]}])
 
 
-class InspectorWithoutAnOpenRollout(unittest.TestCase):
+class InspectorHoldsOneRollout(unittest.TestCase):
+    """A Codex pane has a state only through the one rollout it holds open; anything else is `agent`."""
+
     def setUp(self):
         self.home = Home(self)
-        codex._META_CACHE.clear()
-        self.env = {"HOME": str(self.home.root)}
+        self.panes = {}
 
     def snapshot(self, tree):
         with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
@@ -290,117 +202,148 @@ class InspectorWithoutAnOpenRollout(unittest.TestCase):
                 mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home.codex_home)}):
             return pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree)
 
-    def codex_pane(self, wid=9, pid=100, start=START, events=("task_started", "task_complete")):
-        self.home.process(pid, ["node", "/usr/local/bin/codex", "--yolo"], start=start)
-        self.home.process(pid + 1, ["/opt/vendor/codex", "--yolo"], start=start, parent=pid)
-        return (wid, [(pid, ["node", "/usr/local/bin/codex", "--yolo"]), (pid + 1, ["/opt/vendor/codex", "--yolo"])],
-                str(self.home.cwd))
+    def codex_pane(self, wid=9, pid=100, start=START, argv=("/opt/vendor/codex", "--yolo")):
+        self.home.process(pid, list(argv), start=start)
+        return (wid, [(pid, list(argv))], str(self.home.cwd))
 
-    def test_idle_working_and_waiting_come_from_the_rollouts_events(self):
+    def hold(self, pid, path, fd=4):
+        os.symlink(path, self.home.proc / str(pid) / "fd" / str(fd))
+
+    def test_the_held_rollouts_events_name_idle_working_and_waiting(self):
+        request = {"type": "event_msg", "payload": {"type": "exec_approval_request", "call_id": "a"}}
         for events, extra, expected in ((("task_started", "task_complete"), (), "idle"),
                                         (("task_started",), (), "working"),
-                                        (("task_started",), [{"type": "event_msg", "payload": {"type": "exec_approval_request"}}], "waiting"),
+                                        (("task_started",), [request], "waiting"),
                                         (("task_started", "turn_aborted"), (), "idle")):
-            codex._META_CACHE.clear()
-            home = Home(self)
-            self.home = home
-            home.rollout(1, stamp=START + 2, events=events, extra=extra)
-            got = self.snapshot(tree_for(self.codex_pane())).panes[0]
+            self.home = Home(self)
+            path = self.home.rollout(1, stamp=START + 2, events=events, extra=extra)
+            pane = self.codex_pane()
+            self.hold(100, path)
+            got = self.snapshot(tree_for(pane)).panes[0]
             self.assertEqual((got.activity, got.coding.provider, got.coding.session_id), (expected, "codex", uuid(1)), events)
-            self.assertEqual(got.coding.pids, (100, 101))
 
-    def test_no_provable_rollout_stays_agent(self):
-        self.home.rollout(1, stamp=START + 2)
-        self.home.rollout(2, stamp=START + 900)
-        self.assertEqual(self.snapshot(tree_for(self.codex_pane())).panes[0].activity, "agent")
-        codex._META_CACHE.clear()
-        self.home = Home(self)
-        self.assertEqual(self.snapshot(tree_for(self.codex_pane())).panes[0].activity, "agent")   # no rollout at all
-
-    def test_an_open_descriptor_is_still_the_first_choice(self):
-        held = self.home.rollout(5, stamp=START - 7000, events=("task_started", "task_complete"))
-        other = self.home.rollout(1, stamp=START + 2, events=("task_started",))
-        pane = self.codex_pane()
-        os.symlink(held, self.home.proc / "101" / "fd" / "4")
-        got = self.snapshot(tree_for(pane)).panes[0]
-        self.assertEqual((got.activity, got.coding.session_id), ("idle", uuid(5)))
-        self.assertIsNotNone(other)
-
-    def test_two_panes_in_one_directory_started_apart_each_read_their_own_rollout(self):
+    def test_a_pane_that_holds_nothing_stays_agent_whatever_the_directory_holds(self):
+        """Time, directory, originator, argv and filename name no session; there is no such guess left."""
         self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
-        self.home.rollout(2, stamp=START + 2000 + 2, events=("task_started",))
-        first = self.codex_pane(9, 100, START)
-        second = self.codex_pane(10, 200, START + 2000)
-        got = self.snapshot(tree_for(first, second))
-        self.assertEqual([(p.activity, p.coding.session_id) for p in got.panes], [("idle", uuid(1)), ("working", uuid(2))])
+        for argv in (("codex", "--yolo"), ("codex", "resume", uuid(1)), ("codex", "-C", str(self.home.cwd)),
+                     ("codex", "exec", "go"), ("codex", "resume", "--last")):
+            self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+            got = self.snapshot(tree_for(self.codex_pane(argv=argv))).panes[0]
+            self.assertEqual((got.activity, got.coding.live_status), ("agent", "unknown"), argv)   # the id is a label only
 
-    def test_the_wrapper_that_started_first_sets_the_start_time(self):
-        """node starts the native binary a few seconds later: the pane's start is the earlier one."""
-        self.home.rollout(1, stamp=START + 12, events=("task_started", "task_complete"))
-        self.home.process(100, ["node", "/usr/local/bin/codex", "--yolo"], start=START + 10)
-        self.home.process(101, ["/opt/vendor/codex", "--yolo"], start=START + 20, parent=100)
-        pane = (9, [(100, ["node", "/usr/local/bin/codex", "--yolo"]), (101, ["/opt/vendor/codex", "--yolo"])], str(self.home.cwd))
-        self.assertEqual(self.snapshot(tree_for(pane)).panes[0].activity, "idle")
-
-    def test_two_panes_started_together_stay_agent(self):
-        self.home.rollout(1, stamp=START + 2)
-        self.home.rollout(2, stamp=START + 3)
-        got = self.snapshot(tree_for(self.codex_pane(9, 100, START), self.codex_pane(10, 200, START + 1)))
-        self.assertEqual([p.activity for p in got.panes], ["agent", "agent"])
-
-    def test_the_codex_home_of_the_process_is_used(self):
-        elsewhere = self.home.root / "other-home"
-        (elsewhere / "sessions").mkdir(parents=True)
+    def test_two_different_rollouts_held_by_one_pane_are_ambiguous(self):
+        first = self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+        second = self.home.rollout(2, stamp=START + 3, events=("task_started",))
         pane = self.codex_pane()
-        self.home.process(100, ["node", "/usr/local/bin/codex", "--yolo"], environ={"CODEX_HOME": str(elsewhere)})
-        moment = datetime.fromtimestamp(START + 2, timezone.utc)
-        folder = elsewhere / "sessions" / moment.strftime("%Y/%m/%d")
-        folder.mkdir(parents=True)
-        (folder / f"rollout-x-{uuid(3)}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (
-            {"type": "session_meta", "payload": {"id": uuid(3), "timestamp": moment.isoformat(), "cwd": str(self.home.cwd),
-                                                   "originator": "codex-tui", "source": "cli"}},
-            {"type": "event_msg", "payload": {"type": "task_started"}})))
-        os.utime(folder / f"rollout-x-{uuid(3)}.jsonl", (START + 60, START + 60))
+        self.hold(100, first, 4)
+        self.hold(100, second, 5)
+        self.assertEqual(self.snapshot(tree_for(pane)).panes[0].activity, "agent")
+
+    def test_the_same_rollout_held_twice_in_one_pane_is_still_one_session(self):
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
+        self.home.process(101, ["/opt/vendor/codex", "--yolo"], parent=100)
+        pane = (9, [(100, ["node", "/usr/local/bin/codex"]), (101, ["/opt/vendor/codex", "--yolo"])], str(self.home.cwd))
+        self.home.process(100, ["node", "/usr/local/bin/codex"])
+        self.hold(100, path, 4)
+        self.hold(101, path, 5)
         got = self.snapshot(tree_for(pane)).panes[0]
-        self.assertEqual((got.activity, got.coding.session_id), ("working", uuid(3)))
+        self.assertEqual((got.activity, got.coding.pids), ("working", (100, 101)))
 
-    def test_a_resume_command_line_names_the_session(self):
-        old = self.home.rollout(4, stamp=START - 40000, events=("task_started", "task_complete"))
-        self.home.process(100, ["node", "/usr/local/bin/codex", "resume", uuid(4)], start=START)
-        self.home.process(101, ["/opt/vendor/codex", "resume", uuid(4)], start=START, parent=100)
-        pane = (9, [(100, ["node", "/usr/local/bin/codex", "resume", uuid(4)]), (101, ["/opt/vendor/codex", "resume", uuid(4)])],
-                str(self.home.cwd))
+    def test_a_descriptor_claimed_by_two_panes_is_nobodys(self):
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
+        one, two = self.codex_pane(9, 100), self.codex_pane(10, 200)
+        self.hold(100, path)
+        self.hold(200, path)
+        self.assertEqual([p.activity for p in self.snapshot(tree_for(one, two)).panes], ["agent", "agent"])
+
+    def test_canonical_paths_are_compared(self):
+        """A symlinked alias of one rollout is that rollout (one session), and held by two panes it is still shared."""
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
+        alias = self.home.root / "rollout-alias.jsonl"
+        os.symlink(path, alias)
+        one, two = self.codex_pane(9, 100), self.codex_pane(10, 200)
+        self.hold(100, path)
+        self.hold(200, alias)
+        self.assertEqual([p.activity for p in self.snapshot(tree_for(one, two)).panes], ["agent", "agent"])
+        solo = self.codex_pane(11, 300)
+        self.hold(300, alias, 7)
+        self.hold(300, path, 8)
+        self.assertEqual(self.snapshot(tree_for(solo)).panes[0].activity, "working")
+
+    def test_only_a_codex_process_holding_a_rollout_names_it(self):
+        """`tail -f` or an editor on a rollout is not the session's owner."""
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
+        self.home.process(100, ["tail", "-f", str(path)])
+        self.hold(100, path)
+        pane = (9, [(100, ["tail", "-f", str(path)])], str(self.home.cwd))
         got = self.snapshot(tree_for(pane)).panes[0]
-        self.assertEqual((got.activity, got.coding.session_id, got.coding.path), ("idle", uuid(4), str(old)))
+        self.assertIsNone(got.coding)
+        self.assertNotEqual(got.activity, "idle")        # an ordinary foreground program: no agent state
+
+    def test_a_rollout_that_cannot_be_read_stays_agent(self):
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
+        pane = self.codex_pane()
+        self.hold(100, path)
+        path.unlink()
+        self.assertEqual(self.snapshot(tree_for(pane)).panes[0].activity, "agent")
+
+    def test_the_resolver_and_its_cache_are_gone(self):
+        for name in ("Instance", "resolve_instances", "resume_id", "_META_CACHE", "_candidates"):
+            self.assertFalse(hasattr(codex, name), name)
+        for name in ("_codex_by_start", "_match_codex", "_codex_unclear"):
+            self.assertFalse(hasattr(pane_center.Inspector, name) or hasattr(pane_center, name), name)
 
 
-class InspectorCommandLineRules(InspectorWithoutAnOpenRollout):
-    def pane_with(self, argv, wid=9, pid=100):
-        self.home.process(pid, argv, start=START)
-        return (wid, [(pid, argv)], str(self.home.cwd))
+class ClaudeRecords(unittest.TestCase):
+    """The registry names a live Claude only through a record whose start time is the process's."""
 
-    def test_a_resume_picker_or_last_is_never_matched_by_time(self):
-        self.home.rollout(1, stamp=START + 2)
-        for argv in (["codex", "resume"], ["codex", "resume", "--last"], ["codex", "fork"]):
-            got = self.snapshot(tree_for(self.pane_with(argv))).panes[0]
-            self.assertEqual(got.activity, "agent", argv)
+    def setUp(self):
+        self.home = Home(self)
+        self.claude = self.home.root / "claude"
+        (self.claude / "sessions").mkdir(parents=True)
 
-    def test_a_session_rooted_elsewhere_by_C_is_matched_in_that_directory(self):
-        other = self.home.root / "rooted"
-        other.mkdir()
-        mine = self.home.rollout(1, stamp=START + 2, cwd=other, events=("task_started",))
-        sibling = self.home.rollout(2, stamp=START + 3, events=("task_started", "task_complete"))
-        got = self.snapshot(tree_for(self.pane_with(["codex", "-C", str(other)]))).panes[0]
-        self.assertEqual((got.activity, got.coding.session_id), ("working", uuid(1)))
-        self.assertIsNotNone(mine) and self.assertIsNotNone(sibling)
+    def record(self, pid, *, session=None, start="", status="idle", name=None, **extra):
+        data = {"pid": pid, "sessionId": session or uuid(pid), "status": status, "cwd": str(self.home.cwd), **extra}
+        if start != "":
+            data["procStart"] = start
+        (self.claude / "sessions" / (name or f"{pid}.json")).write_text(json.dumps(data))
 
-    def test_an_exec_run_matches_only_exec_rollouts(self):
-        self.home.rollout(1, stamp=START + 2, originator="codex_exec", source="exec", events=("task_started",))
-        got = self.snapshot(tree_for(self.pane_with(["codex", "exec", "go"]))).panes[0]
-        self.assertEqual((got.activity, got.coding.session_id), ("working", uuid(1)))
-        codex._META_CACHE.clear()
-        got = self.snapshot(tree_for(self.pane_with(["codex", "--yolo"]))).panes[0]
+    def ticks(self, pid):
+        return liveness.start_ticks(pid, proc_root=str(self.home.proc))
+
+    def activity(self, pid=91):
+        tree = tree_for((9, [(pid, ["claude"])], str(self.home.cwd)))
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.claude), "HOME": str(self.home.root)}):
+            return pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree).panes[0]
+
+    def test_a_record_with_the_live_start_time_names_the_state(self):
+        self.home.process(91, ["claude"])
+        for status, expected in (("idle", "idle"), ("shell", "idle"), ("busy", "working"), ("waiting", "waiting")):
+            self.record(91, start=self.ticks(91), status=status)
+            self.assertEqual(self.activity().activity, expected, status)
+
+    def test_a_record_without_procstart_is_not_identity(self):
+        self.home.process(91, ["claude"])
+        self.record(91, status="busy")
+        got = self.activity()
         self.assertEqual(got.activity, "agent")
+
+    def test_a_record_for_another_start_time_is_a_reused_pid(self):
+        self.home.process(91, ["claude"])
+        self.record(91, start=str(int(self.ticks(91)) + 7), status="busy")
+        self.assertEqual(self.activity().activity, "agent")
+
+    def test_two_records_for_one_pid_and_start_are_ambiguous(self):
+        self.home.process(91, ["claude"])
+        self.record(91, session=uuid(1), start=self.ticks(91), status="idle", name="a.json")
+        self.record(91, session=uuid(2), start=self.ticks(91), status="busy", name="b.json")
+        self.assertEqual(self.activity().activity, "agent")
+
+    def test_a_malformed_status_is_agent(self):
+        self.home.process(91, ["claude"])
+        self.record(91, start=self.ticks(91), status="sleeping")
+        self.assertEqual(self.activity().activity, "agent")
 
 
 class ClaudeRegistryStates(unittest.TestCase):

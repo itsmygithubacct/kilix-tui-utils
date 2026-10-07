@@ -304,62 +304,6 @@ def _argument_session(process: kitty_rc.Process) -> str:
     return ""
 
 
-def _proc_link(proc_root: str, pid: int, name: str) -> str:
-    try:
-        return os.readlink(os.path.join(proc_root, str(pid), name))
-    except OSError:
-        return ""
-
-
-def _proc_environ(proc_root: str, pid: int, key: str) -> str:
-    """One variable of a process's own environment (same user only), or ""."""
-    try:
-        with open(os.path.join(proc_root, str(pid), "environ"), "rb") as handle:
-            data = handle.read(1 << 17)
-    except OSError:
-        return ""
-    prefix = key.encode() + b"="
-    for entry in data.split(b"\0"):
-        if entry.startswith(prefix):
-            return entry[len(prefix):].decode("utf-8", "replace")
-    return ""
-
-
-def _codex_args(argv) -> list[str]:
-    """The arguments after the codex executable (the node wrapper's script counts as it)."""
-    args = [str(value) for value in argv]
-    for index, value in enumerate(args):
-        if (os.path.basename(value) or value).casefold() == "codex":
-            return args[index + 1:]
-    return []
-
-
-def _codex_exec(argv) -> bool:
-    """`codex exec ...`: a non-interactive run, whose rollouts say originator `codex_exec`."""
-    return "exec" in _codex_args(argv)
-
-
-def _codex_unclear(argv) -> bool:
-    """`resume`/`fork` without a session id (a picker, `--last`): the session is not the one
-    started with the process, so no rollout is matched by time."""
-    args = _codex_args(argv)
-    return ("resume" in args or "fork" in args) and not codex.resume_id(argv)
-
-
-def _codex_directory(argv, cwd: str) -> str:
-    """The directory the session is rooted in: `-C DIR` / `--cd DIR` relative to the process's own."""
-    args = _codex_args(argv)
-    for index, value in enumerate(args):
-        directory = ""
-        if value in ("-C", "--cd") and index + 1 < len(args):
-            directory = args[index + 1]
-        elif value.startswith("--cd="):
-            directory = value[5:]
-        if directory:
-            return os.path.normpath(directory if os.path.isabs(directory) else os.path.join(cwd, directory))
-    return cwd
-
-
 def _open_files(pid: int, *, proc_root: str) -> tuple[str, ...]:
     if pid <= 0:
         return ()
@@ -454,10 +398,11 @@ class Inspector:
         self._codex_cache: dict[
             tuple[str, int, int, tuple[int, ...]], Session
         ] = {}
-        # pane id -> rollout path, for Codex panes that hold no rollout open (set per snapshot)
-        self._codex_matched: dict[int, str] = {}
+        # canonical rollout path -> the pane ids whose Codex holds it open (set per snapshot)
+        self._codex_held_by: dict[str, set[int]] = {}
 
-    def _codex_for(self, pane: kitty_rc.Pane) -> Session | None:
+    def _held(self, pane: kitty_rc.Pane) -> dict[str, set[int]]:
+        """Canonical rollout path -> the pane's Codex pids holding it open."""
         owners: dict[str, set[int]] = {}
         for process in pane.processes:
             if _process_agent(process) != "codex":
@@ -465,79 +410,65 @@ class Inspector:
             for path in _open_files(process.pid, proc_root=self.proc_root):
                 name = os.path.basename(path)
                 if name.startswith("rollout-") and name.endswith(".jsonl"):
-                    owners.setdefault(path, set()).add(process.pid)
-        if not owners:
-            return self._codex_by_start(pane)
-        candidates = []
-        for path, pids in owners.items():
-            try:
-                stat = os.stat(path)
-            except OSError:
-                continue
-            owner_tuple = tuple(sorted(pids))
-            key = (path, stat.st_mtime_ns, stat.st_size, owner_tuple)
-            session = self._codex_cache.get(key)
-            if session is None:
-                session = codex.session_from_path(path, pids=owner_tuple)
-                if session is None:
-                    continue
-                self._codex_cache[key] = session
-            candidates.append(session)
-        if len(self._codex_cache) > 128:
-            keep = {
-                key: value for key, value in self._codex_cache.items()
-                if any(key[0] == item.path for item in candidates)
-            }
-            self._codex_cache = keep
-        return max(candidates, key=lambda item: item.updated) if candidates else None
+                    owners.setdefault(os.path.realpath(path), set()).add(process.pid)
+        return owners
 
-    def _codex_by_start(self, pane: kitty_rc.Pane) -> Session | None:
-        """The session matched to this pane's Codex by start time and directory, if provable."""
-        path = self._codex_matched.get(pane.id)
-        if not path:
-            return None
-        pids = tuple(p.pid for p in pane.processes if _process_agent(p) == "codex" and p.pid > 0)
-        return codex.session_from_path(path, pids=pids)
-
-    def _match_codex(self, panes) -> dict[int, str]:
-        """Pane id -> rollout for every Codex pane without an open rollout (see `codex.resolve_instances`)."""
-        instances, claimed = [], set()
+    def _held_rollouts(self, panes) -> dict[str, set[int]]:
+        """Canonical rollout path -> the ids of the panes whose Codex holds it open."""
+        claimed: dict[str, set[int]] = {}
         for pane in panes:
-            members = [p for p in pane.processes if _process_agent(p) == "codex" and p.pid > 0]
-            if not members:
-                continue
-            held = [path for p in members for path in _open_files(p.pid, proc_root=self.proc_root)
-                    if os.path.basename(path).startswith("rollout-") and path.endswith(".jsonl")]
-            if held:
-                claimed.update(os.path.realpath(path) for path in held)
-                continue
-            starts = [(liveness.start_time(p.pid, proc_root=self.proc_root), p) for p in members]
-            starts = [item for item in starts if item[0] > 0]
-            if not starts:
-                continue
-            first = min(starts, key=lambda item: item[0])
-            argv = [value for _, p in starts for value in p.argv]
-            if _codex_unclear(argv):
-                continue
-            cwd = _codex_directory(argv, _proc_link(self.proc_root, first[1].pid, "cwd") or first[1].cwd)
-            instances.append(codex.Instance(
-                key=pane.id, start=first[0], cwd=cwd,
-                resume_id=next((codex.resume_id(p.argv) for _, p in starts if codex.resume_id(p.argv)), ""),
-                home=_proc_environ(self.proc_root, first[1].pid, "CODEX_HOME"),
-                pids=tuple(p.pid for _, p in starts), exec_run=_codex_exec(argv)))
-        return codex.resolve_instances(instances, skip=frozenset(claimed)) if instances else {}
+            for path in self._held(pane):
+                claimed.setdefault(path, set()).add(pane.id)
+        return claimed
+
+    def _codex_for(self, pane: kitty_rc.Pane) -> Session | None:
+        """The rollout this pane's Codex holds open, and only that.
+
+        Codex 0.160 usually holds none (it opens its rollout per write), and then nothing
+        names its session exactly: a rollout's directory, originator, timestamp or an id on
+        the command line say nothing of which session a process runs *now* (it can be switched
+        with /resume; the writer may have exited), so the pane stays an unreadable `agent`.
+        Two different rollouts held by one pane, or one held by two panes, are not exact either.
+        """
+        owners = self._held(pane)
+        if len(owners) != 1:
+            return None
+        (path, pids), = owners.items()
+        if self._codex_held_by.get(path, {pane.id}) != {pane.id}:
+            return None
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        owner_tuple = tuple(sorted(pids))
+        key = (path, stat.st_mtime_ns, stat.st_size, owner_tuple)
+        session = self._codex_cache.get(key)
+        if session is None:
+            session = codex.session_from_path(path, pids=owner_tuple)
+            if session is None:
+                return None
+            self._codex_cache[key] = session
+        if len(self._codex_cache) > 128:
+            self._codex_cache = {k: v for k, v in self._codex_cache.items() if k[0] == path}
+        return session
 
     def _claude_by_pid(self) -> dict[int, tuple[str, dict[str, object]]]:
+        """pid -> (session id, registry record) for registry records that name the live process.
+
+        A record counts only if its `procStart` equals the live process's start time (a missing one
+        cannot tell a stale descriptor from a reused pid), and a pid with more than one record is
+        dropped: which of them is current cannot be told.
+        """
         registry = os.path.join(claude.home(), "sessions")
         grouped = liveness.registry_records(
-            registry, proc_root=self.proc_root)
-        answer: dict[int, tuple[str, dict[str, object]]] = {}
+            registry, proc_root=self.proc_root, require_start=True)
+        found: dict[int, list[tuple[str, dict[str, object]]]] = {}
         for session_id, records in grouped.items():
             for record in records:
                 pid = _integer(record.get("pid"))
                 if pid:
-                    answer[pid] = (session_id, record)
-        return answer
+                    found.setdefault(pid, []).append((session_id, record))
+        return {pid: items[0] for pid, items in found.items() if len(items) == 1}
 
     def _coding_for(
         self,
@@ -611,7 +542,7 @@ class Inspector:
     def snapshot(self, tree: kitty_rc.Tree) -> Snapshot:
         brokers, broker_available, warning = _broker_statuses()
         claude_by_pid = self._claude_by_pid()
-        self._codex_matched = self._match_codex(tree.panes)
+        self._codex_held_by = self._held_rollouts(tree.panes)
         page_index = {
             page.id: page.index for page in tree.pages
         }

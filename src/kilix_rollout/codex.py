@@ -1,7 +1,6 @@
 """Codex rollout discovery, including active and archived sessions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -24,13 +23,13 @@ _TURN_COMPLETE = frozenset({
 _APPROVAL_REQUESTED = frozenset({
     "exec_approval_request", "apply_patch_approval_request",
 })
-_APPROVAL_RESOLVED = frozenset({
-    # Rollouts do not append a separate approval-response event. An accepted
-    # request is followed by its operation; a denied/aborted request is
-    # eventually closed by the turn boundary.
+# Rollouts do not append a separate approval-response event. An accepted request is followed by
+# its own operation, which carries the request's call id; a denied or interrupted one is closed
+# by the turn boundary.
+_APPROVAL_RESOLVED_BY_ID = frozenset({
     "exec_command_begin", "exec_command_end",
     "patch_apply_begin", "patch_apply_end",
-}) | _TURN_STARTED | _TURN_COMPLETE
+})
 
 
 def home() -> str:
@@ -89,31 +88,52 @@ def _first_meta(path: str) -> dict[str, object]:
     return {}
 
 
+MAX_TAIL_BYTES = 32 * 1024 * 1024    # how far back a state is searched for; further is unknown
+_MARKERS = (b"task_", b"turn_", b"approval", b"exec_command", b"patch_apply", b"event_msg")
+
+
+def _identities(payload: dict, *names: str) -> tuple[str, ...]:
+    found = []
+    for name in names:
+        value = payload.get(name)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value):
+            found.append(str(value))
+    return tuple(found)
+
+
 def _inspect(
     path: str,
     *,
     include_agent_message: bool = True,
 ) -> dict[str, object]:
-    """Return the latest cwd, messages, and explicit turn boundary."""
-    cwd = ""
-    prompt = ""
-    agent_message = ""
-    turn_event = ""
+    """Return the latest cwd, messages, turn boundary and pending approvals.
+
+    The state is only as certain as the newest record: a last line that is not a complete JSON
+    object (a write in progress, a torn or corrupt line), or any unreadable line that could be
+    a turn or approval event, makes the state `uncertain` (the caller reports unknown), never
+    the older boundary that happens to be readable. A pending approval is a request whose own
+    call id (or approval id) has not been resolved by a later command or patch event with the same id, inside
+    the turn that is still open; an unrelated command resolves nothing.
+    """
+    cwd = prompt = agent_message = turn_event = ""
+    uncertain = False
+    scanned = 0
+    first = True
+    requests: list[tuple[tuple[str, ...], str]] = []   # (ids, kind) newer than the open turn's start
+    resolved: set[str] = set()
     pending_tool = ""
-    approval_decided = False
-    for record in jsonl.tail_records_matching(
-        path,
-        (
-            b'"turn_context"', b'"event_msg"',
-            b'"exec_approval_request"', b'"apply_patch_approval_request"',
-            b'"exec_command_begin"', b'"exec_command_end"',
-            b'"patch_apply_begin"', b'"patch_apply_end"',
-            b'"turn_aborted"', b'"task_aborted"',
-            b'"role":"user"', b'"role": "user"',
-            b'"role":"assistant"', b'"role": "assistant"',
-        ),
-        None,
-    ):
+    for raw in jsonl.reverse_lines(path):
+        scanned += len(raw)
+        if scanned > MAX_TAIL_BYTES and not turn_event:
+            uncertain = True
+            break
+        record = jsonl.load(raw)
+        if record is None:
+            if first or any(marker in raw for marker in _MARKERS):
+                uncertain = True
+            first = False
+            continue
+        first = False
         kind = record.get("type")
         payload = record.get("payload")
         payload = payload if isinstance(payload, dict) else {}
@@ -123,14 +143,18 @@ def _inspect(
                 cwd = value
         elif kind == "event_msg":
             event = payload.get("type")
-            if not approval_decided and event in _APPROVAL_REQUESTED:
-                pending_tool = "command approval" if event == "exec_approval_request" \
-                    else "file-change approval"
-                approval_decided = True
-            elif not approval_decided and event in _APPROVAL_RESOLVED:
-                approval_decided = True
-            if not turn_event and event in (_TURN_STARTED | _TURN_COMPLETE):
-                turn_event = str(event)
+            if not turn_event:
+                if event in _APPROVAL_REQUESTED:
+                    requests.append((_identities(payload, "call_id", "approval_id"), str(event)))
+                elif event in _APPROVAL_RESOLVED_BY_ID:
+                    resolved.update(_identities(payload, "call_id"))
+                elif event in (_TURN_STARTED | _TURN_COMPLETE):
+                    turn_event = str(event)
+                    if event in _TURN_STARTED:
+                        open_requests = [item for item in requests if not resolved.intersection(item[0])]
+                        if open_requests:
+                            pending_tool = "command approval" if open_requests[-1][1] == "exec_approval_request" \
+                                else "file-change approval"
             if not prompt and event == "user_message":
                 prompt = _operator_message(
                     payload.get("message") or payload.get("text"))
@@ -145,12 +169,15 @@ def _inspect(
         if (cwd and prompt and turn_event
                 and (agent_message or not include_agent_message)):
             break
+    if uncertain:
+        turn_event, pending_tool = "", ""
     return {
         "cwd": cwd,
         "prompt": prompt,
         "agent_message": agent_message,
         "turn_event": turn_event,
         "pending_tool": pending_tool,
+        "uncertain": uncertain,
     }
 
 
@@ -341,177 +368,3 @@ def resume_argv(session: Session, *, yolo: bool = False) -> list[str]:
     argv.extend(("resume", session.session_id))
     return argv
 
-
-# ---------------------------------------------------------------------------
-# Which rollout a live Codex process owns, without an open descriptor.
-#
-# Codex 0.160 appends to its rollout by opening and closing it per write, so
-# `/proc/<pid>/fd` shows no `rollout-*.jsonl` (it holds `logs_*.sqlite` and a lock
-# only). That descriptor stays the first choice (`liveness.open_by`). Without it, an
-# instance (one per pane) is matched to a rollout only by evidence that cannot name
-# two sessions, and anything else gives no session at all:
-#
-#   1. its own command line names the session: `codex resume <uuid>`;
-#   2. the session's first record (`session_meta`) carries the working directory
-#      and a timestamp; Codex writes it within about two seconds of starting, so a
-#      rollout whose `session_meta.timestamp` falls in [start - START_BEFORE,
-#      start + START_WINDOW] of exactly one live instance with that same working
-#      directory, which is not a subagent thread, and whose `originator` is the
-#      kind of process the instance is (`codex-tui`, or `codex_exec` for a
-#      `codex exec` command line), belongs to that instance.
-#
-# A working directory is refused wholesale (every instance in it gets no session)
-# when any rollout created since its earliest instance started cannot be attributed
-# to exactly one instance by that rule: a second session started later in the same
-# process (`/new`), another Codex run in that directory, two instances starting
-# together. A newer session in the same process would make the first rollout's
-# events stale, which is the one thing that must not be reported as a state.
-# Not used: `logs_*.sqlite` (it tags log rows with `pid:<n>:<uuid>` and a thread,
-# but an idle session logs no thread-tagged rows), and "the newest rollout".
-START_BEFORE = 2.0
-START_WINDOW = 30.0
-MAX_CANDIDATES = 400
-_META_CACHE: dict[str, dict | None] = {}
-
-
-@dataclass(frozen=True)
-class Instance:
-    """One live Codex (a pane's processes): what identifies its session."""
-
-    key: object
-    start: float            # earliest process start, Unix time
-    cwd: str                # the process's own working directory
-    resume_id: str = ""     # `codex resume <uuid>` on its command line
-    home: str = ""          # CODEX_HOME of the process, "" for the default
-    pids: tuple[int, ...] = ()
-    exec_run: bool = False  # `codex exec ...`: a non-interactive run, not the TUI
-
-
-def originator(exec_run: bool) -> str:
-    """What `session_meta.originator` says for that kind of process."""
-    return "codex_exec" if exec_run else "codex-tui"
-
-
-def resume_id(argv) -> str:
-    """The session UUID named by `codex resume <uuid>`, or ""."""
-    args = [str(value) for value in argv]
-    for index, value in enumerate(args):
-        if value == "resume":
-            for later in args[index + 1:]:
-                if later.startswith("-"):
-                    continue
-                match = _UUID.fullmatch(later.strip())
-                return match.group(1).lower() if match else ""
-    return ""
-
-
-def _real(path: str) -> str:
-    try:
-        return os.path.realpath(path) if path else ""
-    except OSError:
-        return path
-
-
-def _is_subagent(meta: dict) -> bool:
-    return isinstance(meta.get("source"), dict) or meta.get("thread_source") == "subagent"
-
-
-def _candidate_meta(path: str) -> dict | None:
-    """The first record's payload with its timestamp, cached (it never changes)."""
-    if path not in _META_CACHE:
-        meta = _first_meta(path)
-        stamp = _timestamp(meta.get("timestamp")) if meta else None
-        _META_CACHE[path] = ({**meta, "_ts": stamp} if meta and stamp is not None else None)
-        if len(_META_CACHE) > 4096:
-            _META_CACHE.clear()
-    return _META_CACHE[path]
-
-
-def _day_directories(sessions: Path, earliest: float, now: float) -> list[Path]:
-    """The `sessions/YYYY/MM/DD` folders from the day before `earliest` to the day after `now`."""
-    found = []
-    for index in range(int(earliest // 86400) - 1, int(now // 86400) + 2):
-        candidate = sessions / datetime.fromtimestamp(index * 86400, timezone.utc).strftime("%Y/%m/%d")
-        if candidate.is_dir():
-            found.append(candidate)
-    return found
-
-
-def _by_id(sessions: Path, identity: str) -> str:
-    """The one rollout file for a session id, or "" when there are none or several."""
-    try:
-        matches = [str(path) for path in sessions.glob(f"*/*/*/rollout-*{identity}.jsonl")]
-    except OSError:
-        return ""
-    return matches[0] if len(matches) == 1 else ""
-
-
-def resolve_instances(
-    instances,
-    *,
-    now: float | None = None,
-    skip: frozenset = frozenset(),
-) -> dict[object, str]:
-    """Map instance keys to the rollout each provably owns; the rest get no entry.
-
-    `skip` holds paths already claimed by an open descriptor.
-    """
-    import time as _time
-
-    now = _time.time() if now is None else now
-    result: dict[object, str] = {}
-    by_home: dict[str, list[Instance]] = {}
-    for instance in instances:
-        if instance.start > 0 and instance.cwd:
-            by_home.setdefault(instance.home or home(), []).append(instance)
-    for codex_home, group in by_home.items():
-        sessions = Path(codex_home).expanduser() / "sessions"
-        earliest = min(item.start for item in group)
-        candidates: list[tuple[str, float, str, str]] = []
-        for directory in _day_directories(sessions, earliest, now):
-            try:
-                names = sorted(directory.iterdir())
-            except OSError:
-                continue
-            for path in names:
-                if not path.name.startswith("rollout-") or str(path) in skip:
-                    continue
-                try:
-                    modified = path.stat().st_mtime
-                except OSError:
-                    continue
-                if modified < earliest - START_BEFORE:
-                    continue
-                meta = _candidate_meta(str(path))
-                if meta is None or _is_subagent(meta) or meta["_ts"] < earliest - START_BEFORE:
-                    continue
-                candidates.append((str(path), meta["_ts"], _real(str(meta.get("cwd") or "")),
-                                   str(meta.get("originator") or "")))
-        if len(candidates) > MAX_CANDIDATES:
-            continue                                  # too many to reason about: no session
-        for cwd in {_real(item.cwd) for item in group}:
-            for exec_run in (False, True):
-                here = [item for item in group if _real(item.cwd) == cwd and item.exec_run == exec_run]
-                if not here:
-                    continue
-                kind = originator(exec_run)
-                mine = [item for item in candidates if item[2] == cwd and item[3] == kind]
-                attributed: dict[object, list[str]] = {item.key: [] for item in here}
-                refused = False
-                for path, stamp, _cwd, _kind in mine:
-                    owners = [item for item in here
-                              if item.start - START_BEFORE <= stamp <= item.start + START_WINDOW]
-                    if len(owners) != 1:
-                        refused = True                # nobody's, or two instances' rollout
-                        break
-                    attributed[owners[0].key].append(path)
-                if refused:
-                    continue
-                for item in here:
-                    if item.resume_id:
-                        named = _by_id(sessions, item.resume_id)
-                        if named and not attributed[item.key] and named not in skip:
-                            result[item.key] = named
-                    elif len(attributed[item.key]) == 1:
-                        result[item.key] = attributed[item.key][0]
-    return result

@@ -126,8 +126,14 @@ def registry_records(
     directory: str,
     *,
     proc_root: str = "/proc",
+    require_start: bool = False,
 ) -> dict[str, tuple[dict[str, object], ...]]:
-    """Return validated Claude registry metadata grouped by session ID."""
+    """Return validated Claude registry metadata grouped by session ID.
+
+    A descriptor is believed when its process exists and, if it records `procStart`, started
+    then. `require_start` also refuses a descriptor without one: with no start time it cannot
+    be told from a descriptor left behind for a pid that has since been reused.
+    """
     found: dict[str, list[dict[str, object]]] = {}
     try:
         names = sorted(os.listdir(directory))
@@ -154,6 +160,8 @@ def registry_records(
         recorded = record.get("procStart")
         if actual is None or (
                 recorded is not None and str(recorded) != actual):
+            continue
+        if require_start and recorded is None:
             continue
         found.setdefault(session_id.lower(), []).append({
             "pid": pid,
