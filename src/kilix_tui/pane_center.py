@@ -271,22 +271,66 @@ def _broker_statuses() -> tuple[dict[str, BrokerStatus], bool, str]:
     return found, True, ""
 
 
+# The programs a process can be taken for. A process counts as a POSSIBLE agent when any component of
+# any of its arguments, program included, is one of these names (or `name-…`/`name.…`): `claude`,
+# `…/@anthropic-ai/claude-code/cli.js`, `node codex`, `less claude`, `env claude`, `grep kimi`. One
+# function serves provider detection, the registry filter and the ambiguity guard.
+_AGENT_NAMES = {
+    "claude": "claude", "claude-code": "claude", "codex": "codex", "grok": "grok",
+    "omp": "omp", "kimi": "kimi", "kimi-code": "kimi",
+}
+# Programs that only host a command: their arguments are not themselves an agent. Multiplexers and remote
+# shells (the needle tmux hint handles `tmux … claude`), and `kitten run-shell … claude`, the launcher
+# Kilix starts every coding pane with, whose child (the agent itself) is listed as its own process.
+_HOSTS = frozenset({"tmux", "screen", "ssh", "mosh", "mosh-client", "kitten"})
+
+
+def _mentioned(argv) -> list[str]:
+    """The agents an argv mentions, in order of first mention; empty for a host program."""
+    argv = tuple(argv)
+    if not argv or os.path.basename(str(argv[0])).casefold() in _HOSTS:
+        return []
+    found: list[str] = []
+    for value in argv:
+        for part in str(value).replace("\\", "/").split("/"):
+            name = part.casefold()
+            provider = _AGENT_NAMES.get(name)
+            if provider is None:
+                for known, candidate in _AGENT_NAMES.items():
+                    if name.startswith((known + "-", known + ".")):
+                        provider = candidate
+                        break
+            if provider is not None and provider not in found:
+                found.append(provider)
+    return found
+
+
 def _process_agent(process: kitty_rc.Process) -> str:
-    names = {
-        (os.path.basename(value) or value).casefold()
-        for value in process.argv[:2]
-    }
-    if "codex" in names:
-        return "codex"
-    if "claude" in names:
-        return "claude"
-    if "kimi" in names or "kimi-code" in names:
-        return "kimi"
-    if "grok" in names:
-        return "grok"
-    if "omp" in names:
-        return "omp"
-    return ""
+    mentioned = _mentioned(process.argv)
+    return mentioned[0] if mentioned else ""
+
+
+def _claude_native(argv) -> bool:
+    """The one form accepted for a Claude state: the program itself, `argv[0]` named exactly `claude`.
+
+    `node …/cli.js`, `bun`, `env claude`, a differently spelled or aliased name are possible Claudes
+    (so they make a pane ambiguous) but never named: they read `agent`.
+    """
+    argv = tuple(argv)
+    return bool(argv) and os.path.basename(str(argv[0])) == "claude"
+
+
+def _certifiable(pane: kitty_rc.Pane):
+    """The one process of a pane that may be given a Claude state, or None.
+
+    Exactly one process may mention any agent at all, it may mention only Claude, and it must be native.
+    """
+    possible = [(process, _mentioned(process.argv)) for process in pane.processes]
+    possible = [(process, kinds) for process, kinds in possible if kinds]
+    if len(possible) != 1:
+        return None
+    process, kinds = possible[0]
+    return process if kinds == ["claude"] and _claude_native(process.argv) else None
 
 
 def _argument_session(process: kitty_rc.Process) -> str:
@@ -304,63 +348,44 @@ def _argument_session(process: kitty_rc.Process) -> str:
     return ""
 
 
+MAX_CMDLINE_BYTES = 1 << 20
+MAX_ENVIRON_BYTES = 4 << 20
+
+
 def _live_argv(pid: int, *, proc_root: str) -> tuple[str, ...] | None:
-    """The command line the process has NOW, from /proc/<pid>/cmdline; None if unreadable."""
+    """The command line the process has NOW, from /proc/<pid>/cmdline.
+
+    None if unreadable, not valid UTF-8, or longer than the bound: a prefix is never returned, so
+    two results can only be equal when both are the whole command line.
+    """
     if pid <= 0:
         return None
-    try:
-        with open(os.path.join(proc_root, str(pid), "cmdline"), "rb") as handle:
-            raw = handle.read(65536)
-    except OSError:
+    raw = liveness.read_bounded(os.path.join(proc_root, str(pid), "cmdline"), MAX_CMDLINE_BYTES)
+    if raw is None:
         return None
     parts = raw.split(b"\0")
     if parts and parts[-1] == b"":
         parts.pop()
-    return tuple(part.decode("utf-8", errors="surrogateescape") for part in parts) or None
+    try:
+        return tuple(part.decode("utf-8") for part in parts) or None
+    except UnicodeDecodeError:
+        return None
 
 
 def _live_environment(pid: int, *, proc_root: str) -> dict[str, str] | None:
-    """The environment the process started with; None if it cannot be read."""
-    try:
-        with open(os.path.join(proc_root, str(pid), "environ"), "rb") as handle:
-            raw = handle.read(1 << 20)
-    except OSError:
+    """The environment the process started with; None if unreadable, not UTF-8 or longer than the bound."""
+    raw = liveness.read_bounded(os.path.join(proc_root, str(pid), "environ"), MAX_ENVIRON_BYTES)
+    if raw is None:
         return None
     found: dict[str, str] = {}
-    for entry in raw.split(b"\0"):
-        name, separator, value = entry.partition(b"=")
-        if separator and name:
-            found[name.decode("utf-8", errors="surrogateescape")] = value.decode("utf-8", errors="surrogateescape")
+    try:
+        for entry in raw.split(b"\0"):
+            name, separator, value = entry.partition(b"=")
+            if separator and name:
+                found[name.decode("utf-8")] = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
     return found
-
-
-def _agent_names(argv) -> set[str]:
-    return {(os.path.basename(value) or value).casefold() for value in tuple(argv)[:2]}
-
-
-# The executable forms in which a process is accepted AS Claude Code for a state:
-#   claude ...                                    the launcher or native binary, argv[0] basename `claude`
-#   /path/to/claude ...                           the same by path
-#   node|nodejs|bun /path/to/claude ...           a JavaScript runtime whose script is a file named `claude`
-#   node|nodejs|bun .../@anthropic-ai/claude-code/cli.js|cli.mjs ...   the npm entrypoint
-# Never by an argument that merely mentions claude (`less claude`, `grep claude`).
-_JS_RUNTIMES = frozenset({"node", "nodejs", "bun"})
-
-
-def _claude_form(argv) -> bool:
-    argv = tuple(argv)
-    if not argv:
-        return False
-    if os.path.basename(argv[0]) == "claude":
-        return True
-    if os.path.basename(argv[0]) in _JS_RUNTIMES and len(argv) > 1 and not argv[1].startswith("-"):
-        script = argv[1]
-        if os.path.basename(script) == "claude":
-            return True
-        parts = script.split("/")
-        return (os.path.basename(script) in ("cli.js", "cli.mjs")
-                and len(parts) >= 3 and parts[-2] == "claude-code" and parts[-3] == "@anthropic-ai")
-    return False
 
 
 def _minimal_session(
@@ -427,20 +452,19 @@ class Inspector:
 
     def __init__(self, *, proc_root: str = "/proc") -> None:
         self.proc_root = proc_root
-        self._registries: dict[str, dict[str, tuple[dict[str, object], ...]]] = {}
 
-    def _claude_registry(self, config: str) -> dict[str, tuple[dict[str, object], ...]]:
-        if config not in self._registries:
-            self._registries[config] = liveness.registry_records(
-                os.path.join(config, "sessions"), proc_root=self.proc_root, require_start=True)
-        return self._registries[config]
+    def _observe(self, pid: int):
+        """(start time, command line, config directory) of the process, read as one bracketed unit.
 
-    def _instance(self, pid: int):
-        """(start time, command line, config directory) of the process NOW; None if any is unknown."""
+        Start time first, then command line and environment, then the start time again: a process that
+        was replaced meanwhile, or a read that was cut off, gives None instead of a mixture.
+        """
         start = liveness.start_ticks(pid, proc_root=self.proc_root)
         argv = _live_argv(pid, proc_root=self.proc_root)
         environment = _live_environment(pid, proc_root=self.proc_root)
         if start is None or argv is None or environment is None:
+            return None
+        if liveness.start_ticks(pid, proc_root=self.proc_root) != start:
             return None
         config = environment.get("CLAUDE_CONFIG_DIR") or (
             os.path.join(environment["HOME"], ".claude") if environment.get("HOME") else "")
@@ -448,35 +472,57 @@ class Inspector:
             return None
         return start, argv, config
 
-    def _claude_by_pid(self, processes) -> dict[int, tuple[str, dict[str, object]]]:
-        """pid -> (session id, registry record) for the Claude processes that a record names exactly.
+    def _fresh_row(self, config: str, pid: int):
+        """The one registry row of this config directory that names the pid, read now; None otherwise."""
+        records = liveness.registry_records(
+            os.path.join(config, "sessions"), proc_root=self.proc_root, require_start=True)
+        rows = [(session_id, record) for session_id, group in records.items()
+                for record in group if record.get("pid") == pid]
+        return rows[0] if len(rows) == 1 else None
 
-        A process counts only if it is recognised as Claude by its executable form (`_claude_form`),
-        its whole live command line equals the pane's, and a registry row of its own config directory
-        (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, from its environment) names its pid with a
-        `procStart` equal to its start time. The process is read again when the row is USED (rows are
-        cached per snapshot) and must be unchanged: same start, command line and config directory.
-        A pid with more than one row, or any change meanwhile, has none.
+    def _certify(self, process):
+        """(observation, session id, row) when this Claude process is named exactly now, else None.
+
+        Nothing is carried between panes or snapshots: the process is observed, its registry row is read
+        from disk, the process is observed again and the row read again, and everything must be equal.
         """
-        found: dict[int, tuple[str, dict[str, object]]] = {}
+        snapshot = tuple(process.argv)
+        if not _claude_native(snapshot):
+            return None
+        first = self._observe(process.pid)
+        if first is None or first[1] != snapshot:
+            return None
+        found = self._fresh_row(first[2], process.pid)
+        if found is None or str(found[1].get("procStart")) != first[0]:
+            return None
+        if self._observe(process.pid) != first or self._fresh_row(first[2], process.pid) != found:
+            return None
+        return first, found[0], found[1]
+
+    def _claude_by_pid(self, processes) -> dict[int, tuple[str, dict[str, object]]]:
+        """pid -> (session id, registry row) for the Claude processes that a row names exactly.
+
+        A process is recognised as Claude only in its native form (`_claude_native`); its whole live
+        command line must equal the pane's; its row is in the registry of its own config directory
+        (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, both from its environment), names its pid, and
+        carries a `procStart` equal to its start time; no other row names the pid. Each pane is
+        certified from fresh reads (`_certify`), and once every pane is done all of them are checked
+        once more, so a process that changed while a later pane was inspected is dropped. What remains
+        is the window that any observer has between its last read and the use of its answer.
+        """
+        certified = {}
         for process in processes:
-            snapshot = tuple(process.argv)
-            if not _claude_form(snapshot):
+            result = self._certify(process)
+            if result is not None:
+                certified[process.pid] = result
+        found = {}
+        for process in processes:
+            result = certified.get(process.pid)
+            if result is None:
                 continue
-            before = self._instance(process.pid)
-            if before is None or before[1] != snapshot or not _claude_form(before[1]):
-                continue
-            matches = [
-                (session_id, record)
-                for session_id, records in self._claude_registry(before[2]).items()
-                for record in records if _integer(record.get("pid")) == process.pid
-            ]
-            if len(matches) != 1:
-                continue
-            after = self._instance(process.pid)
-            if after != before or str(matches[0][1].get("procStart")) != before[0]:
-                continue
-            found[process.pid] = matches[0]
+            first, session_id, row = result
+            if self._observe(process.pid) == first and self._fresh_row(first[2], process.pid) == (session_id, row):
+                found[process.pid] = (session_id, row)
         return found
 
     def _coding_for(
@@ -484,40 +530,35 @@ class Inspector:
         pane: kitty_rc.Pane,
         claude_by_pid: dict[int, tuple[str, dict[str, object]]],
     ) -> Session | None:
-        agents = [(process, _process_agent(process)) for process in pane.processes]
-        agents = [(process, provider) for process, provider in agents if provider]
+        agents = [(process, _mentioned(process.argv)) for process in pane.processes]
+        agents = [(process, kinds) for process, kinds in agents if kinds]
         if not agents:
             return None
-        process, provider = agents[0]
+        process, kinds = agents[0]
+        provider = kinds[0]
         pids = tuple(p.pid for p, _ in agents if p.pid > 0)
-        kinds = {kind for _, kind in agents}
-        if len(kinds) > 1 or sum(kind == "claude" for _, kind in agents) > 1:
-            # Which agent the pane's state should describe cannot be told, whatever the order of its
-            # processes (Claude beside Codex, Kimi, Grok, OMP; two Claude): no state.
-            return _minimal_session(provider, pane, session_id=_argument_session(process), pids=pids)
-        if provider == "claude":
-            known = claude_by_pid.get(process.pid)
-            session_id, record = known if known else (_argument_session(process), {})
+        certified = _certifiable(pane)
+        if certified is not None and certified.pid in claude_by_pid:
+            session_id, record = claude_by_pid[certified.pid]
             return _minimal_session(
                 "claude", pane,
                 session_id=session_id,
                 status=str(record.get("status") or "unknown"),
                 cwd=str(record.get("cwd") or ""),
                 title=str(record.get("name") or ""),
-                pids=(process.pid,) if process.pid else (),
+                pids=(certified.pid,) if certified.pid else (),
                 version=str(record.get("version") or ""),
                 entrypoint=str(record.get("entrypoint") or ""),
             )
-        # Codex, Grok, OMP, Kimi: shown (command, directory, title, an id the command line names), but
-        # with no state: their records do not name the session a process runs now.
+        # Everything else is shown (command, directory, title, an id the command line names) with no
+        # state: Codex, Grok, OMP, Kimi, a Claude that is not the lone native process of its pane, a pane
+        # that mixes agents in any order, an agent in a form that is not recognised.
         return _minimal_session(provider, pane, session_id=_argument_session(process), pids=pids)
 
     def snapshot(self, tree: kitty_rc.Tree) -> Snapshot:
         brokers, broker_available, warning = _broker_statuses()
-        self._registries = {}
         claude_by_pid = self._claude_by_pid([
-            process for pane in tree.panes for process in pane.processes
-            if _process_agent(process) == "claude"])
+            process for process in (_certifiable(pane) for pane in tree.panes) if process is not None])
         page_index = {
             page.id: page.index for page in tree.pages
         }

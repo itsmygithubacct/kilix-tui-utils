@@ -234,7 +234,7 @@ def _inspect(
             if settled:
                 break
             continue
-        record = jsonl.load(raw)
+        record = jsonl.load(raw, strict=not settled or need_previous)
         if not settled:
             classified = _strict(record)
             if classified is None:
@@ -286,7 +286,7 @@ def _inspect(
                 elif event in _TURN_COMPLETE:
                     if not newest:
                         newest, newest_turn = event, turn_id
-                    elif not _same_turn(newest_turn, turn_id):
+                    else:           # a turn ends once: a second end before any start is not a coherent history
                         uncertain, settled = True, True
             if not prompt and event == "user_message":
                 prompt = _operator_message(payload.get("message") or payload.get("text"))

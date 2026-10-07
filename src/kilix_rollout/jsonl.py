@@ -13,10 +13,14 @@ import time
 from typing import Iterator
 
 
-def load(raw: bytes) -> dict | None:
-    """Parse one line, returning None for anything that is not an object."""
+def load(raw: bytes, *, strict: bool = False) -> dict | None:
+    """Parse one line, returning None for anything that is not an object.
+
+    By default invalid UTF-8 is replaced (display text stays readable). With `strict` it is refused:
+    a record that contributes to a state must decode exactly, never through a lossy repair.
+    """
     try:
-        value = json.loads(raw.decode("utf-8", errors="replace"))
+        value = json.loads(raw.decode("utf-8", errors="strict" if strict else "replace"))
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None             # includes JSON nested deeper than the decoder allows
     return value if isinstance(value, dict) else None
@@ -119,8 +123,9 @@ def head_records(
 ) -> Iterator[dict]:
     """Yield the first parsed records, for the metadata agents write up front.
 
-    A line longer than `max_line`, or more than `max_bytes` read in all, ends the scan: the head
-    is metadata, and nothing is assembled from an arbitrarily large record.
+    Never more than `max_bytes` are read in all, and a line longer than `max_line` (or than what is
+    left of the budget) ends the scan: the head is metadata, and nothing is assembled from an
+    arbitrarily large record.
     """
     try:
         handle = open(path, "rb")
@@ -129,10 +134,13 @@ def head_records(
     with handle:
         consumed = 0
         for _ in range(limit):
-            raw = handle.readline(max_line + 1)
-            consumed += len(raw)
-            if not raw or (len(raw) > max_line and not raw.endswith(b"\n")) or consumed > max_bytes:
+            allowed = min(max_line, max_bytes - consumed)
+            if allowed <= 0:
                 return
+            raw = handle.readline(allowed)
+            consumed += len(raw)
+            if not raw or (len(raw) >= allowed and not raw.endswith(b"\n")):
+                return                  # end of file, or a line the limits do not let us read whole
             record = load(raw)
             if record is not None:
                 yield record

@@ -241,7 +241,8 @@ class CodexStatesFromEvents(unittest.TestCase):
             ([s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("task_complete", turn_id="a")], "unknown"),
             ([s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("task_complete", turn_id="b")], "unknown"),   # a never ended
             ([s("task_started", turn_id="a"), s("task_complete", turn_id="a")], "idle"),
-            ([s("task_started", turn_id="a"), s("task_complete", turn_id="a"), s("task_complete", turn_id="a")], "idle"),
+            ([s("task_started", turn_id="a"), s("task_complete", turn_id="a"), s("task_complete", turn_id="a")], "unknown"),    # a turn ends once
+            ([s("task_started"), s("task_complete"), s("turn_aborted")], "unknown"),
             ([s("task_started", turn_id="a"), s("task_complete", turn_id="b")], "unknown"),
             ([s("task_complete", turn_id="a")], "unknown"),                     # an end with no start
             ([s("task_started", turn_id="a"), s("task_complete", turn_id="a"), s("task_started", turn_id="b")], "working"),
@@ -322,6 +323,22 @@ class CodexStatesFromEvents(unittest.TestCase):
         self.assertEqual(codex.session_from_path(str(path), pids=()).state, "cut-off")
         done = home.rollout(2, stamp=START + 3, events=("task_started", "task_complete"))
         self.assertEqual(codex.session_from_path(str(done), pids=()).state, "idle")
+
+    def test_invalid_utf8_in_a_record_that_contributes_to_the_state_is_unknown_but_display_stays_tolerant(self):
+        home = Home(self)
+        path = home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+        with open(path, "ab") as handle:
+            handle.write(b'{"type":"event_msg","payload":{"type":"token_count","data":"\xff"}}\n')
+        self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "unknown")
+        self.assertEqual(jsonl.load(b'{"a": "\xff"}'), {"a": "\ufffd"})
+        self.assertIsNone(jsonl.load(b'{"a": "\xff"}', strict=True))
+        # an invalid line older than the settled turn does not matter
+        older = home.rollout(2, stamp=START + 3, events=())
+        with open(older, "ab") as handle:
+            handle.write(b'{"type":"response_item","payload":{"type":"message","role":"user","content":"\xff"}}\n')
+            for record in (self.ev("task_started"), self.ev("task_complete")):
+                handle.write((json.dumps(record) + "\n").encode())
+        self.assertEqual(codex.session_from_path(str(older), pids=(1,)).live_status, "idle")
 
     def test_a_rollout_with_no_owner_is_not_live(self):
         self.assertEqual(self.state(("task_started",), pids=()).live_status, "")
@@ -456,6 +473,18 @@ class BoundedReads(unittest.TestCase):
             self.assertEqual(codex._first_meta(str(path)), {})
         self.assertLessEqual(Counting.total, jsonl.HEAD_BYTES + jsonl.LINE_BYTES)
         self.assertGreater(Counting.total, 1024 * 1024)
+
+    def test_the_head_cap_is_exact(self):
+        path = self.home.root / "rollout-x.jsonl"
+        path.write_bytes(b'{"type":"turn_context","payload":{}}\n' * 100)
+        real = open
+        with mock.patch.object(jsonl, "open", lambda p, m="r": Counting(real(p, m)), create=True):
+            list(jsonl.head_records(str(path), 256, max_bytes=40))
+        self.assertLessEqual(Counting.total, 40)
+        Counting.total = 0
+        with mock.patch.object(jsonl, "open", lambda p, m="r": Counting(real(p, m)), create=True):
+            records = list(jsonl.head_records(str(path), 256, max_bytes=10_000))
+        self.assertEqual(len(records), 100)
 
     def test_the_old_unbounded_reader_is_not_used_for_a_state(self):
         with mock.patch.object(jsonl, "reverse_lines", side_effect=AssertionError("unbounded")):
@@ -644,17 +673,49 @@ class ClaudeRecords(unittest.TestCase):
         os.chdir(self.home.root)                                    # where "rel" would resolve
         self.assertEqual(self.activity(pid), "agent")
 
-    def test_only_executable_forms_of_claude_are_accepted_never_an_argument_that_mentions_it(self):
-        accepted = (["claude"], ["/home/u/.local/bin/claude", "--resume", "x"], ["node", "/x/claude"],
-                    ["bun", "/x/claude", "--print"], ["nodejs", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"],
-                    ["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.mjs", "-p"])
-        rejected = (["less", "claude"], ["grep", "claude", "f"], ["node", "--inspect", "/x/claude"], ["node", "/x/not-claude.js"],
-                    ["python3", "claude"], ["node", "/a/claude-code/cli.js"], ["node", "/a/other/claude-code/x.js"],
-                    ["claude-helper"], ["/x/claude/bin/tool"], [])
-        for argv in accepted:
-            self.assertTrue(pane_center._claude_form(argv), argv)
-        for argv in rejected:
-            self.assertFalse(pane_center._claude_form(argv), argv)
+    def test_only_the_native_form_is_named_and_every_mention_counts_as_a_possible_agent(self):
+        native = (["claude"], ["/home/u/.local/bin/claude", "--resume", "x"], ["claude", "-p", "go"])
+        not_native = (["node", "/x/claude"], ["bun", "/x/claude"], ["nodejs", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"],
+                      ["less", "claude"], ["env", "claude"], ["Claude"], ["claude.exe"], ["python3", "claude"],
+                      ["sh", "-c", "claude"], ["claude-helper"], [])
+        for argv in native:
+            self.assertTrue(pane_center._claude_native(argv), argv)
+        for argv in not_native:
+            self.assertFalse(pane_center._claude_native(argv), argv)
+        mentions = {
+            ("claude",): ["claude"],
+            ("node", "/opt/node_modules/@anthropic-ai/claude-code/cli.mjs"): ["claude"],
+            ("less", "claude"): ["claude"],
+            ("env", "codex", "x"): ["codex"],
+            ("/usr/bin/python3", "/home/u/grok/run.py"): ["grok"],
+            ("omp", "-p", "review"): ["omp"],
+            ("kimi-code",): ["kimi"],
+            ("claude", "/srv/codex/notes"): ["claude", "codex"],
+            ("tmux", "new-session", "-s", "x", "claude", "--resume"): [],          # a host runs a command: the tmux hint's case
+            ("ssh", "host", "claude"): [],
+            ("kitten", "run-shell", "--shell=/bin/bash", "--env=KITTY_HOLD=1", "claude", "--model", "sonnet"): [],
+            ("vim", "notes.txt"): [],
+            ("bash",): [],
+            ("claudette",): [],
+            (): [],
+        }
+        for argv, expected in mentions.items():
+            self.assertEqual(pane_center._mentioned(argv), expected, argv)
+
+    def test_a_node_or_npm_claude_is_never_named_and_makes_a_pane_ambiguous(self):
+        npm = ["node", "/opt/node_modules/@anthropic-ai/claude-code/cli.js"]
+        pid = self.claude(argv=npm)
+        self.record(pid)
+        self.assertEqual(self.activity(pid, argv=npm), "agent")                 # a valid row, but not the native form
+        native = self.claude(92)
+        self.record(native, session=uuid(2), status="busy")
+        self.home.process(pid, npm, environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+        for order in ((native, pid), (pid, native)):
+            pane = (9, [(n, ["claude"] if n == native else npm) for n in order], str(self.home.cwd))
+            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+                got = pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree_for(pane)).panes[0]
+            self.assertEqual(got.activity, "agent", order)
+        self.assertEqual(self.activity(native), "working")                       # alone, the native one is named
 
     def test_a_viewer_that_mentions_claude_is_agent_even_with_a_matching_record(self):
         pid = self.claude(argv=("less", "claude"))
@@ -748,6 +809,204 @@ class ClaudeRecords(unittest.TestCase):
                          [(pid, liveness.start_ticks(pid, proc_root=str(self.home.proc)))])
         loose = liveness.registry_records(str(self.config / "sessions"), proc_root=str(self.home.proc))
         self.assertEqual(sum(len(v) for v in loose.values()), 2)
+
+    def test_a_cut_off_read_is_never_compared_as_if_it_were_whole(self):
+        # a command line longer than the bound: not equal to the pane's (which is shorter), but also never a prefix
+        argv = ["claude", "x" * 200]
+        pid = self.claude(argv=argv)
+        self.record(pid)
+        self.assertEqual(self.activity(pid, argv=argv), "idle")
+        with mock.patch.object(pane_center, "MAX_CMDLINE_BYTES", 100):
+            self.assertIsNone(pane_center._live_argv(pid, proc_root=str(self.home.proc)))
+            self.assertEqual(self.activity(pid, argv=argv), "agent")
+        long_live = argv + ["--resume", "different"]
+        self.home.process(pid, long_live, environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+        self.assertEqual(self.activity(pid, argv=argv), "agent")
+        # the review's shape: the pane's argument fills 64 KiB exactly and the live command has more after it
+        big = ["claude", "y" * 65528]
+        self.home.process(pid, big + ["--resume", "different"], environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+        self.assertEqual(self.activity(pid, argv=big), "agent")
+
+    def test_an_environment_beyond_the_bound_is_refused_not_read_as_far_as_it_goes(self):
+        pid = self.claude(environ={"HOME": str(self.home.root / "h")})
+        self.record(pid, config=self.home.root / "h" / ".claude", status="busy")
+        self.assertEqual(self.activity(pid), "working")
+        env = {"HOME": str(self.home.root / "h"), **{f"FILL{n}": "x" * 60000 for n in range(20)},
+               "CLAUDE_CONFIG_DIR": str(self.home.root / "elsewhere")}
+        self.home.process(pid, ["claude"], environ=env)                  # the real override sits after 1.2 MB
+        self.assertEqual(self.activity(pid), "agent")                    # read whole: that directory has no row
+        with mock.patch.object(pane_center, "MAX_ENVIRON_BYTES", 1 << 20):
+            self.assertIsNone(pane_center._live_environment(pid, proc_root=str(self.home.proc)))
+            self.assertEqual(self.activity(pid), "agent")
+
+    def test_proc_stat_and_registry_files_longer_than_their_bounds_are_refused(self):
+        pid = self.claude()
+        self.record(pid)
+        proc_stat = self.home.proc / str(pid) / "stat"
+        with mock.patch.object(liveness, "MAX_PROC_BYTES", 20):
+            self.assertIsNone(liveness.start_ticks(pid, proc_root=str(self.home.proc)))
+        self.assertIsNotNone(liveness.start_ticks(pid, proc_root=str(self.home.proc)))
+        with mock.patch.object(liveness, "MAX_REGISTRY_BYTES", 20):
+            self.assertEqual(liveness.registry_records(str(self.config / "sessions"), proc_root=str(self.home.proc)), {})
+        self.assertIsNone(liveness.read_bounded(str(proc_stat), 5))
+        self.assertIsNotNone(liveness.read_bounded(str(proc_stat), 4096))
+
+    def test_the_launcher_wrapper_kilix_starts_every_coding_pane_with_does_not_hide_the_native_claude(self):
+        """Live panes list `kitten run-shell … claude …`, the native claude, and its MCP helper together."""
+        wrapper = ["kitten", "run-shell", "--shell=/bin/bash", "--env=KITTY_HOLD=1", "claude", "--model", "sonnet"]
+        helper = ["python3", "-B", "needle_cli.py", "mcp"]
+        native = ["claude", "--model", "sonnet"]
+        self.home.process(90, wrapper)
+        self.home.process(91, native, environ={"CLAUDE_CONFIG_DIR": str(self.config)}, parent=90)
+        self.home.process(92, helper, parent=91)
+        self.record(91, status="busy")
+        pane = (9, [(90, wrapper), (91, native), (92, helper)], str(self.home.cwd))
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+            got = pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree_for(pane)).panes[0]
+        self.assertEqual((got.activity, got.coding.session_id), ("working", uuid(91)))
+        # a second real agent next to it still makes the pane ambiguous
+        other = ["/opt/vendor/codex"]
+        self.home.process(93, other)
+        pane = (9, [(90, wrapper), (91, native), (93, other)], str(self.home.cwd))
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+            got = pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree_for(pane)).panes[0]
+        self.assertEqual(got.activity, "agent")
+
+    def test_a_process_that_mentions_two_agents_is_never_named(self):
+        argv = ["claude", "/srv/codex/notes"]
+        pid = self.claude(argv=argv)
+        self.record(pid)
+        self.assertEqual(self.activity(pid, argv=argv), "agent")
+
+    def test_every_step_of_the_bracket_is_needed_not_only_the_final_check(self):
+        """A change that is undone before the last check of the snapshot is still caught where it happened."""
+        env = {"CLAUDE_CONFIG_DIR": str(self.config)}
+        pid = self.claude()
+        self.record(pid)
+        # 1. the process is something else only while the row is read and the process observed again
+        original = liveness.registry_records
+        calls = {"n": 0}
+
+        def process_swapped_in_between(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                result = original(*args, **kwargs)
+                self.home.process(pid, ["sh"], environ=env)         # after the first row read ...
+                return result
+            if calls["n"] == 2:
+                self.home.process(pid, ["claude"], environ=env)     # ... undone before the second row read
+            return original(*args, **kwargs)
+        with mock.patch.object(liveness, "registry_records", side_effect=process_swapped_in_between):
+            self.assertEqual(self.inspect_with([pid], None, None), ["agent"])
+        self.home.process(pid, ["claude"], environ=env)
+        # 2. the row is another session only while the process is observed the second time
+        original_argv = pane_center._live_argv
+        argv_calls = {"n": 0}
+
+        def row_swapped_in_between(number, **kwargs):
+            argv_calls["n"] += 1
+            if argv_calls["n"] == 2:
+                self.record(pid, session=uuid(7), status="busy")
+            elif argv_calls["n"] == 3:
+                self.record(pid)
+            return original_argv(number, **kwargs)
+        with mock.patch.object(pane_center, "_live_argv", side_effect=row_swapped_in_between):
+            self.assertEqual(self.inspect_with([pid], None, None), ["agent"])
+        self.record(pid)
+        self.assertEqual(self.inspect_with([pid], None, None), ["idle"])
+
+    def test_a_row_whose_start_time_is_not_the_processes_is_refused_by_the_consumer_too(self):
+        pid = self.claude()
+        self.record(pid)
+        row = {"pid": pid, "procStart": "1", "cwd": "", "status": "idle", "name": "", "version": "", "entrypoint": ""}
+        with mock.patch.object(liveness, "registry_records", return_value={uuid(pid): (row,)}):
+            self.assertEqual(self.inspect_with([pid], None, None), ["agent"])
+
+    def test_an_observation_whose_start_time_changed_inside_it_is_none(self):
+        pid = self.claude()
+        original = liveness.start_ticks
+        seen = {"n": 0}
+
+        def second_read_differs(number, **kwargs):
+            seen["n"] += 1
+            return original(number, **kwargs) if seen["n"] == 1 else "999"
+        inspector = pane_center.Inspector(proc_root=str(self.home.proc))
+        self.assertIsNotNone(inspector._observe(pid))
+        with mock.patch.object(liveness, "start_ticks", side_effect=second_read_differs):
+            self.assertIsNone(inspector._observe(pid))
+
+    def test_registry_rows_are_never_taken_from_another_pane_or_an_earlier_read(self):
+        one, two = self.claude(91), self.claude(92)
+        self.record(one)
+        self.record(two, session=uuid(2))
+        original = pane_center._live_argv
+
+        def replace_second_row(number, **kwargs):
+            if number == two:
+                self.record(two, session=uuid(3), status="busy")        # the file changes before pane two is looked at
+            return original(number, **kwargs)
+        pane = lambda pid, wid: (wid, [(pid, ["claude"])], str(self.home.cwd))          # noqa: E731
+        with mock.patch.object(pane_center, "_live_argv", side_effect=replace_second_row), \
+                mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+            got = pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree_for(pane(one, 9), pane(two, 10))).panes
+        self.assertEqual([item.activity for item in got], ["idle", "working"])
+        self.assertEqual(got[1].coding.session_id, uuid(3))                              # the row as it is now, not as it was
+
+    def test_a_process_that_changes_while_a_later_pane_is_inspected_is_dropped_at_the_end(self):
+        one, two = self.claude(91), self.claude(92)
+        self.record(one)
+        self.record(two, session=uuid(2))
+        original = pane_center._live_argv
+
+        def break_first(number, **kwargs):
+            if number == two:
+                self.home.process(one, ["less", "claude"], environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+            return original(number, **kwargs)
+        with mock.patch.object(pane_center, "_live_argv", side_effect=break_first):
+            self.assertEqual(self.inspect_with([one, two], None, None), ["agent", "idle"])
+
+    def test_a_process_replaced_inside_its_own_read_is_agent(self):
+        pid = self.claude()
+        self.record(pid)
+        original = liveness.start_ticks
+        calls = {"n": 0}
+
+        def swap(number, **kwargs):
+            value = original(number, **kwargs)
+            calls["n"] += 1
+            if calls["n"] == 3:                                       # between the two start reads of an observation
+                self.home.process(number, ["claude"], start=START + 10, environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+            return value
+        with mock.patch.object(liveness, "start_ticks", side_effect=swap):
+            self.assertEqual(self.inspect_with([pid], None, None), ["agent"])
+
+    def test_malformed_registry_values_are_refused_without_raising_and_do_not_hide_other_rows(self):
+        good, bad = self.claude(91), self.claude(92)
+        self.record(good)
+        ticks = liveness.start_ticks(bad, proc_root=str(self.home.proc))
+        shapes = {
+            "fractional pid": b'{"pid": 92.5, "sessionId": "s", "procStart": "%s", "status": "idle"}' % ticks.encode(),
+            "float pid": b'{"pid": 92.0, "sessionId": "s", "procStart": "%s", "status": "idle"}' % ticks.encode(),
+            "infinite pid": b'{"pid": 1e309, "sessionId": "s", "procStart": "%s", "status": "idle"}' % ticks.encode(),
+            "string pid": b'{"pid": "92", "sessionId": "s", "procStart": "%s", "status": "idle"}' % ticks.encode(),
+            "boolean pid": b'{"pid": true, "sessionId": "s", "procStart": "%s", "status": "idle"}' % ticks.encode(),
+            "huge pid": b'{"pid": 99999999999999999999, "sessionId": "s", "procStart": "1", "status": "idle"}',
+            "negative pid": b'{"pid": -92, "sessionId": "s", "procStart": "1", "status": "idle"}',
+            "float start": b'{"pid": 92, "sessionId": "s", "procStart": 1.5, "status": "idle"}',
+            "signed start": b'{"pid": 92, "sessionId": "s", "procStart": "-%s", "status": "idle"}' % ticks.encode(),
+            "spaced start": b'{"pid": 92, "sessionId": "s", "procStart": " %s", "status": "idle"}' % ticks.encode(),
+            "deep": b'{"pid": 92, "x": ' + b"[" * 10000 + b"0" + b"]" * 10000 + b"}",
+            "not utf-8": b'{"pid": 92, "sessionId": "\xff", "procStart": "%s"}' % ticks.encode(),
+            "not an object": b"[92]",
+            "truncated": b'{"pid": 92, "sessionId": "s"',
+        }
+        for name, raw in shapes.items():
+            (self.config / "sessions" / "92.json").write_bytes(raw)
+            self.assertEqual(self.inspect_with([good, bad], None, None), ["idle", "agent"], name)
+        # a start that is a JSON integer is as good as the digit string Claude writes
+        (self.config / "sessions" / "92.json").write_text(json.dumps(
+            {"pid": 92, "sessionId": uuid(2), "procStart": int(ticks), "status": "busy"}))
+        self.assertEqual(self.inspect_with([good, bad], None, None), ["idle", "working"])
 
     def test_the_registry_is_the_target_processes_own_not_the_readers(self):
         target = self.home.root / "target-claude"

@@ -56,13 +56,27 @@ def open_by(paths, *, proc_root: str = "/proc") -> dict[str, tuple[int, ...]]:
     return {path: tuple(sorted(pids)) for path, pids in found.items()}
 
 
-def start_ticks(pid: int, *, proc_root: str = "/proc") -> str | None:
-    """Return field 22 of /proc/<pid>/stat, the process start time."""
+MAX_PROC_BYTES = 1 << 16        # /proc/<pid>/stat is far smaller; a read that fills this is not complete
+MAX_REGISTRY_BYTES = 1 << 20    # a registry descriptor is a few hundred bytes
+MAX_PID = 1 << 22               # Linux's largest pid_max
+
+
+def read_bounded(path: str, limit: int) -> bytes | None:
+    """The whole file when it is at most `limit` bytes; None when unreadable or longer (never a prefix)."""
     try:
-        with open(os.path.join(proc_root, str(pid), "stat"), encoding="utf-8") as handle:
-            raw = handle.read()
+        with open(path, "rb") as handle:
+            data = handle.read(limit + 1)
     except OSError:
         return None
+    return None if len(data) > limit else data
+
+
+def start_ticks(pid: int, *, proc_root: str = "/proc") -> str | None:
+    """Return field 22 of /proc/<pid>/stat, the process start time."""
+    data = read_bounded(os.path.join(proc_root, str(pid), "stat"), MAX_PROC_BYTES)
+    if data is None:
+        return None
+    raw = data.decode("utf-8", errors="replace")      # only the numeric fields after the name are used
     # Field 2 is the comm name in parentheses and may itself contain spaces.
     closing = raw.rfind(")")
     if closing == -1:
@@ -122,6 +136,53 @@ def registry_owners(directory: str, *, proc_root: str = "/proc") -> dict[str, tu
     return {key: tuple(sorted(pids)) for key, pids in owners.items()}
 
 
+def read_registry_file(path: str) -> dict | None:
+    """A registry descriptor as an object; None if unreadable, too large, not UTF-8, not JSON (including
+    nested or numeric forms the decoder cannot hold) or not an object. Never raises for a bad file."""
+    data = read_bounded(path, MAX_REGISTRY_BYTES)
+    if data is None:
+        return None
+    try:
+        record = json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError, OverflowError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def registry_row(record: dict) -> dict[str, object] | None:
+    """A descriptor's identity fields, validated without coercion; None for any malformed value.
+
+    `pid` must be a JSON integer in range. `procStart` (Claude writes it as a string of decimal digits)
+    must be a non-negative JSON integer or such a string; absent is allowed here (callers that need it
+    ask for it). A boolean, float, other string or an out-of-range number refuses the descriptor.
+    """
+    session_id = record.get("sessionId")
+    pid = record.get("pid")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if type(pid) is not int or not 0 < pid <= MAX_PID:
+        return None
+    start = record.get("procStart")
+    if start is None:
+        text = ""
+    elif type(start) is int and 0 <= start < 1 << 63:
+        text = str(start)
+    elif isinstance(start, str) and start.isascii() and start.isdigit() and len(start) <= 19:
+        text = start
+    else:
+        return None
+    return {
+        "sessionId": session_id.lower(),
+        "pid": pid,
+        "procStart": text,
+        "cwd": str(record.get("cwd") or ""),
+        "status": str(record.get("status") or ""),
+        "name": str(record.get("name") or ""),
+        "version": str(record.get("version") or ""),
+        "entrypoint": str(record.get("entrypoint") or ""),
+    }
+
+
 def registry_records(
     directory: str,
     *,
@@ -132,7 +193,8 @@ def registry_records(
 
     A descriptor is believed when its process exists and, if it records `procStart`, started
     then. `require_start` also refuses a descriptor without one: with no start time it cannot
-    be told from a descriptor left behind for a pid that has since been reused.
+    be told from a descriptor left behind for a pid that has since been reused. Malformed
+    descriptors are skipped (`registry_row`), never raised.
     """
     found: dict[str, list[dict[str, object]]] = {}
     try:
@@ -142,36 +204,18 @@ def registry_records(
     for name in names:
         if not name.endswith(".json"):
             continue
-        try:
-            with open(os.path.join(directory, name), encoding="utf-8") as handle:
-                record = json.load(handle)
-        except (OSError, ValueError):
+        record = read_registry_file(os.path.join(directory, name))
+        row = registry_row(record) if record is not None else None
+        if row is None:
             continue
-        if not isinstance(record, dict):
+        actual = start_ticks(row["pid"], proc_root=proc_root)
+        recorded = row["procStart"]
+        if actual is None or (recorded and recorded != actual):
             continue
-        session_id = record.get("sessionId")
-        try:
-            pid = int(record.get("pid"))
-        except (TypeError, ValueError):
+        if require_start and not recorded:
             continue
-        if not isinstance(session_id, str) or not session_id or pid <= 0:
-            continue
-        actual = start_ticks(pid, proc_root=proc_root)
-        recorded = record.get("procStart")
-        if actual is None or (
-                recorded is not None and str(recorded) != actual):
-            continue
-        if require_start and recorded is None:
-            continue
-        found.setdefault(session_id.lower(), []).append({
-            "pid": pid,
-            "procStart": "" if recorded is None else str(recorded),
-            "cwd": str(record.get("cwd") or ""),
-            "status": str(record.get("status") or ""),
-            "name": str(record.get("name") or ""),
-            "version": str(record.get("version") or ""),
-            "entrypoint": str(record.get("entrypoint") or ""),
-        })
+        session_id = str(row.pop("sessionId"))
+        found.setdefault(session_id, []).append(row)
     return {
         session_id: tuple(sorted(items, key=lambda item: int(item["pid"])))
         for session_id, items in found.items()

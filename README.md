@@ -395,10 +395,11 @@ So the pane center shows a Codex pane as `agent` (its command, directory and tit
 never an idle/working/waiting). The Codex rollout parser in `src/kilix_rollout/codex.py` still serves
 the session listings and the `rollout` tools, not pane activity. It fails closed for
 every consumer: any record newer than the newest turn boundary that is unreadable,
-not an object, nested too deeply, of an unknown kind or event type, or with a
-payload that is not an object gives "unknown", never the older boundary; an
+not valid UTF-8 (display text stays tolerant, state does not), not an object, nested
+too deeply, of an unknown kind or event type, or with a payload that is not an object
+gives "unknown", never the older boundary; an
 approval request is matched only to a *later* resolution that shares a call or
-approval id and the same turn; a turn end must meet its own start and a start whose
+approval id and the same turn; a turn ends once, it must meet its own start, and a start whose
 previous boundary is another start (overlapping open turns) is unknown; and the
 tail read is limited to 8 MiB, 1 MiB per record and 2 s (a gap before the boundary is
 settled is unknown).
@@ -408,26 +409,40 @@ agent that is idle with half a line typed is `idle`), or a modal (trust, update,
 login) that the records do not mention. This was already true of every state
 Kilix names.
 
-Claude Code's descriptor is believed only when all of this holds, each checked
-again when the row is used (a row is cached for one snapshot; the process is read
-again and must be unchanged):
+Claude Code's descriptor is believed only when all of this holds. Nothing is carried
+between panes or snapshots: for each pane the process is observed (start time, then
+command line and environment, then the start time again), its registry row is read
+**from disk now**, the process is observed again and the row read again, and
+everything must be equal; once every pane is done they are all checked once more, so
+a process that changed while a later pane was inspected is dropped.
 
-- the pane has **exactly one** agent process, and it is Claude by its **executable
-  form**: `argv[0]` named `claude` (`claude`, `/path/to/claude`), or `node`,
-  `nodejs` or `bun` running a script named `claude` or the npm entrypoint
-  `@anthropic-ai/claude-code/cli.js|cli.mjs`. An argument that merely mentions
-  claude (`less claude`, `grep claude`) is not Claude;
-- its **whole live command line** (`/proc/<pid>/cmdline`) equals the pane's;
+- the pane has **exactly one** process that mentions any agent at all. A process
+  *mentions* an agent when any path component of any of its arguments (program
+  included) is `claude`, `claude-code`, `codex`, `grok`, `omp`, `kimi` or `kimi-code`
+  (or `name-…`/`name.…`): `less claude`, `env claude`, `node …/claude-code/cli.js`
+  all count. `tmux`, `screen`, `ssh`, `mosh` and `kitten` host a command and are not counted
+  (the needle tmux hint covers `tmux … claude`; Kilix starts every coding pane as
+  `kitten run-shell … claude …`, whose child, the agent itself, is listed beside it). Two such processes, or one that
+  mentions two agents, make the pane `agent`;
+- that process is Claude in its **native form only**: `argv[0]` is exactly `claude`
+  (`claude`, `/path/to/claude`). `node`/`nodejs`/`bun` running the npm entrypoint or
+  a script, aliases, differently spelled names and wrappers are *possible* Claudes
+  (they make a pane ambiguous) but are never named: they read `agent`;
+- its **whole live command line** (`/proc/<pid>/cmdline`) equals the pane's. Every
+  read of `/proc/<pid>/{cmdline,environ,stat}` and of a registry file is bounded and
+  an overflow means "incomplete", so a prefix is never compared as if it were whole
+  (1 MiB for a command line, 4 MiB for an environment); text that is not UTF-8 is
+  refused;
 - the row is in the registry of the process's **own** `CLAUDE_CONFIG_DIR` (else
   `$HOME/.claude`, both from its `/proc/<pid>/environ`; an unreadable, unknown or
-  relative context is `agent`);
-- the row's `procStart` equals the process's live start time (a row without one
-  cannot be told from one left behind for a reused PID), and no other row names
-  the PID;
-- start time, command line and config directory are unchanged between the lookup
-  and the use.
+  relative context is `agent`), its `pid` is a JSON integer in range, its
+  `procStart` is a non-negative integer or a string of decimal digits (the form
+  Claude writes) equal to the process's start time, and no other row names the pid.
+  A malformed file (float, string, boolean or out-of-range numbers, nesting too deep,
+  not UTF-8, too large) is that row refused, never an error for the other panes.
 
-Anything else is `agent`.
+Anything else is `agent`. What remains, and cannot be removed by any reader, is the
+window between the last read and the moment the answer is used.
 
 ### Creating panes
 
