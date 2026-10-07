@@ -369,40 +369,54 @@ look like an empty prompt (two independent reviews of a screen reader showed it)
 
 | Provider | Which record names the session | How the state is read |
 | --- | --- | --- |
-| Claude Code | the registry descriptor `~/.claude/sessions/<pid>.json` of a pane process, accepted only while the process exists and its recorded `procStart` equals the process's start time (a descriptor without one, or two for one PID, is not accepted) | its `status`: `idle` → idle, `busy` → working, `waiting` → waiting, `shell` → idle. Claude Code derives `shell` as "idle at its prompt while a background shell, monitor or task still runs" (`status === "idle" && <background work> ? "shell" : status`), which is the "1 monitor" case. Any other value is `agent` |
-| Codex | only a rollout the pane's Codex **holds open** (`/proc/<pid>/fd` of its own Codex processes, `rollout-*.jsonl`, paths compared canonically) | the rollout's last turn event: `task_started` → working, `task_complete` or `turn_aborted` → idle, an approval request not yet followed by a command or patch with its own call id → waiting, no turn yet → `agent` |
+| Claude Code | the registry descriptor `~/.claude/sessions/<pid>.json` of a pane process, accepted only for the pane's single Claude process, from its own config directory, while its recorded `procStart` equals the process's start time (see below) | its `status`: `idle` → idle, `busy` → working, `waiting` → waiting, `shell` → idle. Claude Code derives `shell` as "idle at its prompt while a background shell, monitor or task still runs" (`status === "idle" && <background work> ? "shell" : status`), which is the "1 monitor" case. Any other value is `agent` |
+| Codex | **none** | **no state: a Codex pane is always `agent`** |
 
-**Codex panes are `agent` unless that descriptor exists, and that is the
-common case.** Codex 0.160 opens its rollout only for each write, so a running
-Codex normally holds none, and nothing else Codex writes names the session a
-process runs *now*:
+**Codex state is not available until Codex exposes an exact current-session
+identity, and kilix-needle's `tell`/`wait` therefore refuse Codex panes.** Nothing
+Codex writes names the session a process runs *now*, and every candidate failed
+review:
 
 - a rollout's directory, `originator`, timestamp or file name say when and where
-  a session started, not which process still owns it (a process can switch
-  sessions in place with `/resume` or `/fork`; the writer of a rollout may have
-  exited; another run may share the directory; a PID can be reused);
+  a session started, not which process still owns it (`/resume` and `/fork` switch
+  sessions in place, the writer may have exited, another run may share the
+  directory, a PID can be reused);
 - `resume <id>` on the command line names the session the process *started*
   with, not the one it runs after a `/resume`;
+- a rollout the process holds open (`/proc/<pid>/fd`) is usually absent (Codex
+  0.160 opens it per write), and when present it does not establish who owns
+  it or whether it is the main session: the PID may now be another program, the
+  holder may be a viewer, a read-only reader or a subagent's helper, the file may
+  have been deleted and replaced, a second holder may be missing from the pane
+  census, and the census can change while it is read;
 - `logs_2.sqlite` tags log rows with `pid:<n>:<uuid>` and a `thread_id`, but one
-  process logs many threads (subagents included, a dozen were measured on one
-  instance), no row says which is the current one, and a fresh or idle process
-  has no rows at all. It is therefore not exact and is not used.
+  process logs many threads (a dozen were measured on one instance, subagents
+  included), no row says which is the current one, and a fresh or idle process
+  has no rows.
 
-No start-window matching, no command-line session ids and no "newest rollout in
-the directory" are used any more. A pane that holds **two different rollouts**,
-or a rollout that **two panes** hold, is `agent` as well, and a rollout whose
-newest line is unreadable, torn or malformed has no state (`agent`), never an
-older idle. needle keeps refusing such panes: an honest "not available" instead
-of a guess.
+So the pane center shows a Codex pane as `agent` (its command, directory and title,
+never an idle/working/waiting), and a pane that also runs another agent process is
+`agent` too. The Codex rollout parser in `src/kilix_rollout/codex.py` still serves
+the session listings and the `rollout` tools, not pane activity. It fails closed for
+every consumer: a torn, unreadable or structurally invalid newest record, an
+approval request matched only to a *later* resolution with its own call or
+approval id, turn ends whose turn id is not the nearest earlier start, and a
+tail read limited to 8 MiB, 1 MiB per record and 2 s all give "unknown", never an
+older idle.
 
 What a structured state cannot see: a **draft typed into the composer** (an
 agent that is idle with half a line typed is `idle`), or a modal (trust, update,
 login) that the records do not mention. This was already true of every state
 Kilix names.
 
-Claude Code's descriptor is believed only if it records `procStart` and that
-equals the live process's start time (a descriptor without it cannot be told from
-one left behind for a reused PID), and two descriptors for one PID are `agent`.
+Claude Code's descriptor is believed only for a pane with **exactly one** Claude
+process, only while that process's command line is still the one the pane listed
+(a PID that has since exec'd something else is `agent`), only in the registry of
+the process's **own** `CLAUDE_CONFIG_DIR` (else `$HOME/.claude`, both from its
+`/proc/<pid>/environ`; an unreadable or unknown context is `agent`), only if the
+record's `procStart` equals the live start time (a descriptor without one cannot be
+told from one left behind for a reused PID), and two descriptors for one PID are
+`agent`.
 
 ### Creating panes
 

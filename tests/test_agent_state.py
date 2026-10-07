@@ -11,13 +11,15 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
+import tracemalloc
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kilix_rollout import claude, codex, grok, liveness  # noqa: E402
+from kilix_rollout import claude, codex, grok, jsonl, liveness  # noqa: E402
 from kilix_rollout.model import Session  # noqa: E402
 from kilix_tui import kitty_rc, pane_center  # noqa: E402
 
@@ -112,9 +114,9 @@ class CodexStatesFromEvents(unittest.TestCase):
         patch = [{"type": "event_msg", "payload": {"type": "apply_patch_approval_request"}}]
         self.assertEqual(self.state(("task_started",), extra=patch).live_status, "waiting")
 
-    def ev(self, kind, call_id=None):
-        payload = {"type": kind}
-        if call_id:
+    def ev(self, kind, call_id=None, **more):
+        payload = {"type": kind, **more}
+        if call_id is not None:
             payload["call_id"] = call_id
         return {"type": "event_msg", "payload": payload}
 
@@ -177,8 +179,207 @@ class CodexStatesFromEvents(unittest.TestCase):
         got = self.state(("task_started", "task_complete", "task_started"), extra=[])
         self.assertEqual(got.live_status, "working")
 
+    def raw_state(self, records):
+        """The state of a rollout whose records (after the metadata) are exactly these dicts."""
+        home = Home(self)
+        path = home.rollout(1, stamp=START + 2, events=())
+        with open(path, "a") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        return codex.session_from_path(str(path), pids=(11,)).live_status
+
+    def test_an_approval_is_matched_only_to_a_later_resolution(self):
+        a = self.ev("exec_approval_request", "a")
+        begin = self.ev("exec_command_begin", "a")
+        start = self.ev("task_started")
+        cases = (
+            ([start, begin, a], "waiting"),                       # the command came first: it resolves nothing
+            ([start, a, begin, a], "waiting"),                    # re-approval after a resolution
+            ([start, a, begin, a, begin], "working"),
+            ([start, a, begin], "working"),
+            ([start, begin, begin, a, a], "waiting"),
+            ([start, self.ev("apply_patch_approval_request", "p"), self.ev("patch_apply_end", "p")], "working"),
+        )
+        for records, expected in cases:
+            with self.subTest(records=[r["payload"]["type"] for r in records]):
+                self.assertEqual(self.raw_state(records), expected)
+
+    def test_a_structurally_invalid_newest_event_is_unknown_never_an_older_state_or_a_crash(self):
+        done = [self.ev("task_started"), self.ev("task_complete")]
+        bad = (
+            {"type": "event_msg", "payload": None},
+            {"type": "event_msg", "payload": "x"},
+            {"type": "event_msg", "payload": []},
+            {"type": "event_msg", "payload": {"type": ["task_started"]}},
+            {"type": "event_msg", "payload": {"type": 7}},
+            {"type": "event_msg", "payload": {"type": {"a": 1}}},
+            {"type": "event_msg"},
+            {"type": ["event_msg"]},
+            {"type": 5, "payload": {}},                         # no turn/approval marker in the text at all
+            {"type": None},
+            {"kind": "x"},
+            {"type": None, "payload": {"type": "task_started"}},
+            {"payload": {"type": "task_started"}},
+            self.ev("exec_approval_request", ["a"]),
+            self.ev("exec_command_begin", {"id": 1}),
+            self.ev("task_started", turn_id=["t"]),
+        )
+        for record in bad:
+            with self.subTest(record=record):
+                self.assertEqual(self.raw_state(done + [record]), "unknown")
+                self.assertEqual(self.raw_state(done + [record, self.ev("token_count")]), "unknown")   # not the last line
+                self.assertEqual(self.raw_state([self.ev("task_started"), record]), "unknown")
+
+    def test_an_invalid_record_older_than_the_settled_boundary_is_ignored(self):
+        bad = {"type": "event_msg", "payload": None}
+        self.assertEqual(self.raw_state([bad, self.ev("task_started"), self.ev("task_complete")]), "idle")
+        self.assertEqual(self.raw_state([self.ev("task_started"), bad, self.ev("token_count"), self.ev("task_complete")]), "unknown")
+
+    def test_turn_ids_must_be_coherent(self):
+        s = self.ev
+        cases = (
+            ([s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("task_complete", turn_id="a")], "unknown"),
+            ([s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("task_complete", turn_id="b")], "idle"),
+            ([s("task_started", turn_id="a"), s("task_complete", turn_id="a")], "idle"),
+            ([s("task_started", turn_id="a"), s("task_complete", turn_id="a"), s("task_complete", turn_id="a")], "idle"),
+            ([s("task_started", turn_id="a"), s("task_complete", turn_id="b")], "unknown"),
+            ([s("task_complete", turn_id="a")], "unknown"),                     # an end with no start
+            ([s("task_started", turn_id="a"), s("task_complete", turn_id="a"), s("task_started", turn_id="b")], "working"),
+            ([s("task_started", turn_id="a"), s("turn_aborted", turn_id="a")], "idle"),
+            ([s("task_started"), s("task_complete", turn_id="a")], "idle"),     # ids not both given: order decides
+        )
+        for records, expected in cases:
+            with self.subTest(records=[(r["payload"]["type"], r["payload"].get("turn_id")) for r in records]):
+                self.assertEqual(self.raw_state(records), expected)
+
     def test_a_rollout_with_no_owner_is_not_live(self):
         self.assertEqual(self.state(("task_started",), pids=()).live_status, "")
+
+
+class Counting:
+    """A file wrapper that counts the bytes a reader actually asks the file for."""
+
+    total = 0
+
+    def __init__(self, handle):
+        self.handle = handle
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.handle.close()
+
+    def seek(self, *args):
+        return self.handle.seek(*args)
+
+    def tell(self):
+        return self.handle.tell()
+
+    def read(self, size=-1):
+        data = self.handle.read(size)
+        Counting.total += len(data)
+        return data
+
+    def readline(self, size=-1):
+        data = self.handle.readline(size)
+        Counting.total += len(data)
+        return data
+
+
+class BoundedReads(unittest.TestCase):
+    """A state is read from a bounded tail: bytes, line size and time are all capped."""
+
+    def setUp(self):
+        self.home = Home(self)
+        Counting.total = 0
+
+    def read_state(self, path):
+        real = open
+        with mock.patch.object(jsonl, "open", lambda p, m="r": Counting(real(p, m)), create=True):
+            return codex.session_from_path(str(path), pids=(1,))
+
+    def test_lines_are_yielded_newest_first_with_a_gap_for_a_line_too_long(self):
+        path = self.home.root / "t.jsonl"
+        path.write_bytes(b"l1\n" + b"x" * 200 + b"\nl3\n\nl4")
+        self.assertEqual(list(jsonl.bounded_reverse_lines(str(path), max_line=100, chunk=7)), [b"l4", b"l3", None, b"l1"])
+        self.assertEqual(list(jsonl.bounded_reverse_lines(str(path), max_line=1000, chunk=7))[2], b"x" * 200)
+
+    def test_the_byte_budget_ends_with_a_gap_and_reads_no_more(self):
+        path = self.home.root / "t.jsonl"
+        path.write_bytes(b"".join(b"line %06d\n" % n for n in range(5000)))
+        got = list(jsonl.bounded_reverse_lines(str(path), max_bytes=1000, chunk=100))
+        self.assertIsNone(got[-1])
+        self.assertEqual(got[0], b"line 004999")
+        self.assertLessEqual(sum(len(line) + 1 for line in got if line), 1000)
+
+    def test_the_time_budget_ends_with_a_gap(self):
+        path = self.home.root / "t.jsonl"
+        path.write_bytes(b"a\nb\n")
+        self.assertEqual(list(jsonl.bounded_reverse_lines(str(path), max_seconds=0)), [None])
+
+    def huge_line_rollout(self):
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
+        with open(path, "ab") as handle:
+            handle.truncate(handle.tell() + 40 * 1024 * 1024)            # a 40 MiB line (sparse)
+        return path
+
+    def test_one_huge_line_after_an_open_turn_is_unknown_and_reads_only_the_budget(self):
+        path = self.huge_line_rollout()
+        started = time.monotonic()
+        session = self.read_state(path)
+        self.assertLess(time.monotonic() - started, 1.0)           # the byte budget ends it at once, not the 2 s clock
+        self.assertEqual(session.live_status, "unknown")
+        self.assertLessEqual(Counting.total, codex.MAX_TAIL_BYTES + (1 << 16))
+        self.assertGreater(Counting.total, codex.MAX_TAIL_BYTES - (1 << 20))      # the budget, not the file, ended the read
+
+    def test_one_huge_line_is_never_held_in_memory(self):
+        path = self.huge_line_rollout()
+        tracemalloc.start()
+        try:
+            codex.session_from_path(str(path), pids=(1,))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 12 * 1024 * 1024)
+
+    def test_a_gap_before_the_newest_boundary_makes_the_state_unknown(self):
+        """A record too long to read could be a newer turn start: the older idle is not believed."""
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+        with open(path, "a") as handle:
+            handle.write(json.dumps({"type": "response_item", "payload": {"output": "y" * 5000}}) + "\n")
+        with mock.patch.object(codex, "MAX_LINE_BYTES", 1000):
+            self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "unknown")
+        self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "idle")
+
+    def test_many_records_before_a_settled_boundary_are_still_bounded(self):
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+        filler = (json.dumps({"type": "response_item", "payload": {"type": "function_call_output", "output": "x" * 30000}}) + "\n").encode()
+        original = path.read_bytes()
+        marker = b'{"type": "event_msg", "payload": {"type": "task_started"}}'
+        head, _, rest = original.partition(marker)
+        path.write_bytes(head + filler * 1300 + marker + rest)      # about 39 MB between the prompt and the turn
+        started = time.monotonic()
+        session = self.read_state(path)
+        self.assertEqual(session.live_status, "idle")
+        self.assertGreater(Counting.total, 1024 * 1024)               # it did read on, up to the budget
+        self.assertLessEqual(Counting.total, codex.MAX_TAIL_BYTES + (1 << 20))
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_huge_first_record_is_not_assembled(self):
+        path = self.home.root / "rollout-x.jsonl"
+        with open(path, "wb") as handle:
+            handle.truncate(40 * 1024 * 1024)
+        self.assertEqual(codex._first_meta(str(path)), {})
+        real = open
+        with mock.patch.object(jsonl, "open", lambda p, m="r": Counting(real(p, m)), create=True):
+            self.assertEqual(list(jsonl.head_records(str(path), 256)), [])
+        self.assertLessEqual(Counting.total, jsonl.LINE_BYTES + 1)
+
+    def test_the_old_unbounded_reader_is_not_used_for_a_state(self):
+        with mock.patch.object(jsonl, "reverse_lines", side_effect=AssertionError("unbounded")):
+            path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
+            self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "working")
 
 
 def tree_for(*panes):
@@ -189,161 +390,199 @@ def tree_for(*panes):
         for wid, procs, cwd in panes]}]}])
 
 
-class InspectorHoldsOneRollout(unittest.TestCase):
-    """A Codex pane has a state only through the one rollout it holds open; anything else is `agent`."""
+class CodexIsAlwaysAgent(unittest.TestCase):
+    """Nothing Codex writes names the session a process runs NOW, so no pane gets a Codex state."""
 
     def setUp(self):
         self.home = Home(self)
-        self.panes = {}
 
     def snapshot(self, tree):
         with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
-                mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}), \
                 mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home.codex_home)}):
             return pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree)
 
-    def codex_pane(self, wid=9, pid=100, start=START, argv=("/opt/vendor/codex", "--yolo")):
-        self.home.process(pid, list(argv), start=start)
+    def codex_pane(self, wid=9, pid=100, argv=("/opt/vendor/codex", "--yolo")):
+        self.home.process(pid, list(argv))
         return (wid, [(pid, list(argv))], str(self.home.cwd))
 
     def hold(self, pid, path, fd=4):
         os.symlink(path, self.home.proc / str(pid) / "fd" / str(fd))
 
-    def test_the_held_rollouts_events_name_idle_working_and_waiting(self):
-        request = {"type": "event_msg", "payload": {"type": "exec_approval_request", "call_id": "a"}}
-        for events, extra, expected in ((("task_started", "task_complete"), (), "idle"),
-                                        (("task_started",), (), "working"),
-                                        (("task_started",), [request], "waiting"),
-                                        (("task_started", "turn_aborted"), (), "idle")):
-            self.home = Home(self)
-            path = self.home.rollout(1, stamp=START + 2, events=events, extra=extra)
+    def test_a_held_rollout_names_no_state_whatever_its_events(self):
+        for events in (("task_started", "task_complete"), ("task_started",),
+                       ("task_started", "turn_aborted"), ("task_started", "exec_approval_request")):
+            home = Home(self)
+            self.home = home
+            path = home.rollout(1, stamp=START + 2, events=events)
             pane = self.codex_pane()
             self.hold(100, path)
             got = self.snapshot(tree_for(pane)).panes[0]
-            self.assertEqual((got.activity, got.coding.provider, got.coding.session_id), (expected, "codex", uuid(1)), events)
+            self.assertEqual((got.activity, got.coding.provider, got.coding.live_status), ("agent", "codex", "unknown"), events)
 
-    def test_a_pane_that_holds_nothing_stays_agent_whatever_the_directory_holds(self):
-        """Time, directory, originator, argv and filename name no session; there is no such guess left."""
-        self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
-        for argv in (("codex", "--yolo"), ("codex", "resume", uuid(1)), ("codex", "-C", str(self.home.cwd)),
-                     ("codex", "exec", "go"), ("codex", "resume", "--last")):
-            self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
-            got = self.snapshot(tree_for(self.codex_pane(argv=argv))).panes[0]
-            self.assertEqual((got.activity, got.coding.live_status), ("agent", "unknown"), argv)   # the id is a label only
-
-    def test_two_different_rollouts_held_by_one_pane_are_ambiguous(self):
-        first = self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
-        second = self.home.rollout(2, stamp=START + 3, events=("task_started",))
-        pane = self.codex_pane()
-        self.hold(100, first, 4)
-        self.hold(100, second, 5)
-        self.assertEqual(self.snapshot(tree_for(pane)).panes[0].activity, "agent")
-
-    def test_the_same_rollout_held_twice_in_one_pane_is_still_one_session(self):
-        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
-        self.home.process(101, ["/opt/vendor/codex", "--yolo"], parent=100)
-        pane = (9, [(100, ["node", "/usr/local/bin/codex"]), (101, ["/opt/vendor/codex", "--yolo"])], str(self.home.cwd))
-        self.home.process(100, ["node", "/usr/local/bin/codex"])
-        self.hold(100, path, 4)
-        self.hold(101, path, 5)
-        got = self.snapshot(tree_for(pane)).panes[0]
-        self.assertEqual((got.activity, got.coding.pids), ("working", (100, 101)))
-
-    def test_a_descriptor_claimed_by_two_panes_is_nobodys(self):
-        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
-        one, two = self.codex_pane(9, 100), self.codex_pane(10, 200)
-        self.hold(100, path)
+    def test_no_pane_layout_gives_codex_a_state(self):
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+        other = self.home.rollout(2, stamp=START + 3, events=("task_started",))
+        self.home.process(200, ["codex"])
         self.hold(200, path)
-        self.assertEqual([p.activity for p in self.snapshot(tree_for(one, two)).panes], ["agent", "agent"])
-
-    def test_canonical_paths_are_compared(self):
-        """A symlinked alias of one rollout is that rollout (one session), and held by two panes it is still shared."""
-        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
-        alias = self.home.root / "rollout-alias.jsonl"
-        os.symlink(path, alias)
-        one, two = self.codex_pane(9, 100), self.codex_pane(10, 200)
+        cases = {
+            "nothing held": self.codex_pane(),
+            "resume argv": self.codex_pane(argv=("codex", "resume", uuid(1))),
+            "two panes sharing": self.codex_pane(10, 300),
+        }
         self.hold(100, path)
-        self.hold(200, alias)
-        self.assertEqual([p.activity for p in self.snapshot(tree_for(one, two)).panes], ["agent", "agent"])
-        solo = self.codex_pane(11, 300)
-        self.hold(300, alias, 7)
-        self.hold(300, path, 8)
-        self.assertEqual(self.snapshot(tree_for(solo)).panes[0].activity, "working")
+        self.hold(300, path)
+        for name, pane in cases.items():
+            self.assertEqual(self.snapshot(tree_for(pane)).panes[0].activity, "agent", name)
+        self.hold(100, other, 5)
 
-    def test_only_a_codex_process_holding_a_rollout_names_it(self):
-        """`tail -f` or an editor on a rollout is not the session's owner."""
-        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
-        self.home.process(100, ["tail", "-f", str(path)])
+    def test_a_viewer_or_helper_or_replaced_file_never_gives_idle(self):
+        path = self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+        self.home.process(100, ["cat", str(path)])
         self.hold(100, path)
-        pane = (9, [(100, ["tail", "-f", str(path)])], str(self.home.cwd))
-        got = self.snapshot(tree_for(pane)).panes[0]
-        self.assertIsNone(got.coding)
-        self.assertNotEqual(got.activity, "idle")        # an ordinary foreground program: no agent state
+        for argv in (["cat", str(path)], ["less", "codex"], ["codex", "debug", "x"]):
+            self.home.process(100, argv)
+            got = self.snapshot(tree_for((9, [(100, argv)], str(self.home.cwd)))).panes[0]
+            self.assertNotEqual(got.activity, "idle", argv)
+        deleted = self.home.root / "gone.jsonl"
+        os.symlink(f"{path} (deleted)", self.home.proc / "100" / "fd" / "9")
+        self.assertEqual(self.snapshot(tree_for(self.codex_pane())).panes[0].activity, "agent")
 
-    def test_a_rollout_that_cannot_be_read_stays_agent(self):
-        path = self.home.rollout(1, stamp=START + 2, events=("task_started",))
-        pane = self.codex_pane()
-        self.hold(100, path)
-        path.unlink()
+    def test_a_pane_with_claude_and_a_codex_process_is_agent(self):
+        pane = (9, [(100, ["claude"]), (101, ["/opt/vendor/codex"])], str(self.home.cwd))
+        self.home.process(100, ["claude"])
+        self.home.process(101, ["/opt/vendor/codex"])
         self.assertEqual(self.snapshot(tree_for(pane)).panes[0].activity, "agent")
 
-    def test_the_resolver_and_its_cache_are_gone(self):
+    def test_the_activity_table_never_maps_a_codex_session(self):
+        for status in ("idle", "working", "waiting", "ready", "busy"):
+            session = Session(provider="codex", session_id="s", path="", cwd="/srv/x", title="", updated=0,
+                              state="live", pids=(1,), live_status=status)
+            pane = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{"id": 9, "pid": 70, "cwd": "/srv/x"}]}]}]).panes[0]
+            self.assertEqual(pane_center._activity(session, pane), "agent", status)
+
+    def test_the_held_descriptor_and_resolver_code_is_gone(self):
         for name in ("Instance", "resolve_instances", "resume_id", "_META_CACHE", "_candidates"):
             self.assertFalse(hasattr(codex, name), name)
-        for name in ("_codex_by_start", "_match_codex", "_codex_unclear"):
-            self.assertFalse(hasattr(pane_center.Inspector, name) or hasattr(pane_center, name), name)
+        for name in ("_codex_by_start", "_match_codex", "_codex_unclear", "_codex_for", "_held", "_held_rollouts", "_codex_cache"):
+            self.assertFalse(hasattr(pane_center.Inspector, name) or hasattr(pane_center.Inspector(), name), name)
+        self.assertFalse(hasattr(pane_center, "_open_files"))
 
 
 class ClaudeRecords(unittest.TestCase):
-    """The registry names a live Claude only through a record whose start time is the process's."""
+    """A Claude pane has a state only through a record of the process's OWN registry that names it now."""
 
     def setUp(self):
         self.home = Home(self)
-        self.claude = self.home.root / "claude"
-        (self.claude / "sessions").mkdir(parents=True)
+        self.config = self.home.root / "claude"
+        (self.config / "sessions").mkdir(parents=True)
 
-    def record(self, pid, *, session=None, start="", status="idle", name=None, **extra):
-        data = {"pid": pid, "sessionId": session or uuid(pid), "status": status, "cwd": str(self.home.cwd), **extra}
-        if start != "":
+    def claude(self, pid=91, argv=("claude",), environ="own", **kwargs):
+        if environ == "own":
+            environ = {"CLAUDE_CONFIG_DIR": str(self.config)}
+        self.home.process(pid, list(argv), environ=environ, **kwargs)
+        return pid
+
+    def record(self, pid, *, config=None, session=None, start="live", status="idle", name=None):
+        data = {"pid": pid, "sessionId": session or uuid(pid), "status": status, "cwd": str(self.home.cwd)}
+        if start == "live":
+            start = liveness.start_ticks(pid, proc_root=str(self.home.proc))
+        if start is not None:
             data["procStart"] = start
-        (self.claude / "sessions" / (name or f"{pid}.json")).write_text(json.dumps(data))
+        folder = (config or self.config) / "sessions"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / (name or f"{pid}.json")).write_text(json.dumps(data))
 
-    def ticks(self, pid):
-        return liveness.start_ticks(pid, proc_root=str(self.home.proc))
-
-    def activity(self, pid=91):
-        tree = tree_for((9, [(pid, ["claude"])], str(self.home.cwd)))
+    def activity(self, *pids, argv=("claude",), reader_config=None):
+        pane = (9, [(pid, list(argv)) for pid in pids], str(self.home.cwd))
+        env = {"HOME": str(self.home.root / "reader-home")}
+        if reader_config:
+            env["CLAUDE_CONFIG_DIR"] = str(reader_config)
         with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
-                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.claude), "HOME": str(self.home.root)}):
-            return pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree).panes[0]
+                mock.patch.dict(os.environ, env):
+            return pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree_for(pane)).panes[0].activity
 
     def test_a_record_with_the_live_start_time_names_the_state(self):
-        self.home.process(91, ["claude"])
+        pid = self.claude()
         for status, expected in (("idle", "idle"), ("shell", "idle"), ("busy", "working"), ("waiting", "waiting")):
-            self.record(91, start=self.ticks(91), status=status)
-            self.assertEqual(self.activity().activity, expected, status)
+            self.record(pid, status=status)
+            self.assertEqual(self.activity(pid), expected, status)
 
-    def test_a_record_without_procstart_is_not_identity(self):
-        self.home.process(91, ["claude"])
-        self.record(91, status="busy")
-        got = self.activity()
-        self.assertEqual(got.activity, "agent")
+    def test_a_record_without_procstart_or_for_another_start_is_not_identity(self):
+        pid = self.claude()
+        self.record(pid, start=None, status="busy")
+        self.assertEqual(self.activity(pid), "agent")
+        self.record(pid, start=str(int(liveness.start_ticks(pid, proc_root=str(self.home.proc))) + 7), status="busy")
+        self.assertEqual(self.activity(pid), "agent")
 
-    def test_a_record_for_another_start_time_is_a_reused_pid(self):
-        self.home.process(91, ["claude"])
-        self.record(91, start=str(int(self.ticks(91)) + 7), status="busy")
-        self.assertEqual(self.activity().activity, "agent")
-
-    def test_two_records_for_one_pid_and_start_are_ambiguous(self):
-        self.home.process(91, ["claude"])
-        self.record(91, session=uuid(1), start=self.ticks(91), status="idle", name="a.json")
-        self.record(91, session=uuid(2), start=self.ticks(91), status="busy", name="b.json")
-        self.assertEqual(self.activity().activity, "agent")
+    def test_two_records_for_one_pid_are_ambiguous(self):
+        pid = self.claude()
+        self.record(pid, session=uuid(1), name="a.json")
+        self.record(pid, session=uuid(2), status="busy", name="b.json")
+        self.assertEqual(self.activity(pid), "agent")
 
     def test_a_malformed_status_is_agent(self):
-        self.home.process(91, ["claude"])
-        self.record(91, start=self.ticks(91), status="sleeping")
-        self.assertEqual(self.activity().activity, "agent")
+        pid = self.claude()
+        self.record(pid, status="sleeping")
+        self.assertEqual(self.activity(pid), "agent")
+
+    def test_two_claude_processes_in_one_pane_are_agent_in_either_order(self):
+        one, two = self.claude(91), self.claude(92)
+        self.record(one, status="idle")
+        self.record(two, status="busy")
+        self.assertEqual(self.activity(one, two), "agent")
+        self.assertEqual(self.activity(two, one), "agent")
+        self.assertEqual(self.activity(one), "idle")
+
+    def test_a_pid_that_now_runs_something_else_is_agent(self):
+        pid = self.claude()
+        self.record(pid)
+        self.home.process(pid, ["sh"], environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+        self.assertEqual(self.activity(pid), "agent")           # the pane still lists `claude`
+        self.home.process(pid, ["less", "claude"], environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+        self.assertEqual(self.activity(pid), "agent")           # argv[1] names claude, but it is not the pane's command
+        self.home.process(pid, ["claude"], environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+        self.assertEqual(self.activity(pid), "idle")
+
+    def test_a_pane_that_also_runs_codex_is_agent_even_with_a_valid_claude_record(self):
+        pid = self.claude()
+        self.record(pid, status="idle")
+        self.home.process(101, ["/opt/vendor/codex"])
+        self.assertEqual(self.activity(pid), "idle")
+        self.assertEqual(self.activity(pid, 101, argv=("claude",)), "agent")
+        pane = (9, [(pid, ["claude"]), (101, ["/opt/vendor/codex"])], str(self.home.cwd))
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+            got = pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree_for(pane)).panes[0]
+        self.assertEqual(got.activity, "agent")
+
+    def test_a_relative_config_directory_is_never_followed(self):
+        relative = self.home.root / "rel"
+        pid = self.claude(environ={"CLAUDE_CONFIG_DIR": "rel"})
+        self.record(pid, config=relative, status="busy")
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(self.home.root)                                    # where "rel" would resolve
+        self.assertEqual(self.activity(pid), "agent")
+
+    def test_the_registry_is_the_target_processes_own_not_the_readers(self):
+        target = self.home.root / "target-claude"
+        pid = self.claude(environ={"CLAUDE_CONFIG_DIR": str(target)})
+        (target / "sessions").mkdir(parents=True)
+        self.record(pid, status="busy")                             # a matching record, in the reader's directory only
+        self.assertEqual(self.activity(pid, reader_config=self.config), "agent")
+        self.record(pid, config=target, status="waiting")
+        self.assertEqual(self.activity(pid, reader_config=self.config), "waiting")
+
+    def test_home_is_the_fallback_and_unknown_context_is_agent(self):
+        pid = self.claude(environ={"HOME": str(self.home.root / "h")})
+        self.record(pid, config=self.home.root / "h" / ".claude", status="busy")
+        self.assertEqual(self.activity(pid), "working")
+        self.claude(pid, environ={})                                # no CLAUDE_CONFIG_DIR and no HOME
+        self.assertEqual(self.activity(pid, reader_config=self.config), "agent")
+        self.claude(pid, environ={"CLAUDE_CONFIG_DIR": "relative/dir"})
+        self.assertEqual(self.activity(pid), "agent")
+        self.claude(pid)
+        (self.home.proc / str(pid) / "environ").unlink()            # environment unreadable
+        self.assertEqual(self.activity(pid), "agent")
 
 
 class ClaudeRegistryStates(unittest.TestCase):

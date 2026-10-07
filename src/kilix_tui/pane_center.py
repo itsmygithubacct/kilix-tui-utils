@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from kilix_rollout import claude, codex, grok, liveness, omp
+from kilix_rollout import claude, grok, liveness, omp
 from kilix_rollout.model import Session
 
 from . import kitty_rc
@@ -304,27 +304,38 @@ def _argument_session(process: kitty_rc.Process) -> str:
     return ""
 
 
-def _open_files(pid: int, *, proc_root: str) -> tuple[str, ...]:
+def _live_argv(pid: int, *, proc_root: str) -> tuple[str, ...] | None:
+    """The command line the process has NOW, from /proc/<pid>/cmdline; None if unreadable."""
     if pid <= 0:
-        return ()
-    process_root = os.path.join(proc_root, str(pid))
+        return None
     try:
-        if os.stat(process_root).st_uid != os.getuid():
-            return ()
-        names = os.listdir(os.path.join(process_root, "fd"))
+        with open(os.path.join(proc_root, str(pid), "cmdline"), "rb") as handle:
+            raw = handle.read(65536)
     except OSError:
-        return ()
-    found = []
-    for name in names:
-        try:
-            target = os.readlink(os.path.join(process_root, "fd", name))
-        except OSError:
-            continue
-        if target.endswith(" (deleted)"):
-            target = target[:-10]
-        if os.path.isabs(target):
-            found.append(target)
-    return tuple(found)
+        return None
+    parts = raw.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    return tuple(part.decode("utf-8", errors="surrogateescape") for part in parts) or None
+
+
+def _live_environment(pid: int, *, proc_root: str) -> dict[str, str] | None:
+    """The environment the process started with; None if it cannot be read."""
+    try:
+        with open(os.path.join(proc_root, str(pid), "environ"), "rb") as handle:
+            raw = handle.read(1 << 20)
+    except OSError:
+        return None
+    found: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        name, separator, value = entry.partition(b"=")
+        if separator and name:
+            found[name.decode("utf-8", errors="surrogateescape")] = value.decode("utf-8", errors="surrogateescape")
+    return found
+
+
+def _agent_names(argv) -> set[str]:
+    return {(os.path.basename(value) or value).casefold() for value in tuple(argv)[:2]}
 
 
 def _minimal_session(
@@ -358,6 +369,9 @@ def _minimal_session(
 def _activity(session: Session | None, pane: kitty_rc.Pane) -> str:
     if session is not None:
         status = session.live_status.strip().casefold().replace("_", "-")
+        if session.provider == "codex":
+            # Nothing Codex writes names the session a process runs NOW, so no state is read.
+            return "agent"
         if session.provider == "claude":
             # Claude's registry status has its own vocabulary (`shell` is idle with
             # background work running); only what it defines is mapped.
@@ -395,80 +409,43 @@ class Inspector:
 
     def __init__(self, *, proc_root: str = "/proc") -> None:
         self.proc_root = proc_root
-        self._codex_cache: dict[
-            tuple[str, int, int, tuple[int, ...]], Session
-        ] = {}
-        # canonical rollout path -> the pane ids whose Codex holds it open (set per snapshot)
-        self._codex_held_by: dict[str, set[int]] = {}
+        self._registries: dict[str, dict[str, tuple[dict[str, object], ...]]] = {}
 
-    def _held(self, pane: kitty_rc.Pane) -> dict[str, set[int]]:
-        """Canonical rollout path -> the pane's Codex pids holding it open."""
-        owners: dict[str, set[int]] = {}
-        for process in pane.processes:
-            if _process_agent(process) != "codex":
+    def _claude_registry(self, config: str) -> dict[str, tuple[dict[str, object], ...]]:
+        if config not in self._registries:
+            self._registries[config] = liveness.registry_records(
+                os.path.join(config, "sessions"), proc_root=self.proc_root, require_start=True)
+        return self._registries[config]
+
+    def _claude_by_pid(self, processes) -> dict[int, tuple[str, dict[str, object]]]:
+        """pid -> (session id, registry record) for the Claude processes that a record names exactly.
+
+        A process counts only if what it runs NOW is still Claude (its command line is the one the
+        pane listed), and its record is in the registry of ITS OWN config directory
+        (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, from its environment; unknown context: none),
+        with `procStart` equal to its start time. A pid with more than one record has none.
+        """
+        found: dict[int, tuple[str, dict[str, object]]] = {}
+        for process in processes:
+            live = _live_argv(process.pid, proc_root=self.proc_root)
+            if (live is None or "claude" not in _agent_names(live)
+                    or _agent_names(live) != _agent_names(process.argv)):
                 continue
-            for path in _open_files(process.pid, proc_root=self.proc_root):
-                name = os.path.basename(path)
-                if name.startswith("rollout-") and name.endswith(".jsonl"):
-                    owners.setdefault(os.path.realpath(path), set()).add(process.pid)
-        return owners
-
-    def _held_rollouts(self, panes) -> dict[str, set[int]]:
-        """Canonical rollout path -> the ids of the panes whose Codex holds it open."""
-        claimed: dict[str, set[int]] = {}
-        for pane in panes:
-            for path in self._held(pane):
-                claimed.setdefault(path, set()).add(pane.id)
-        return claimed
-
-    def _codex_for(self, pane: kitty_rc.Pane) -> Session | None:
-        """The rollout this pane's Codex holds open, and only that.
-
-        Codex 0.160 usually holds none (it opens its rollout per write), and then nothing
-        names its session exactly: a rollout's directory, originator, timestamp or an id on
-        the command line say nothing of which session a process runs *now* (it can be switched
-        with /resume; the writer may have exited), so the pane stays an unreadable `agent`.
-        Two different rollouts held by one pane, or one held by two panes, are not exact either.
-        """
-        owners = self._held(pane)
-        if len(owners) != 1:
-            return None
-        (path, pids), = owners.items()
-        if self._codex_held_by.get(path, {pane.id}) != {pane.id}:
-            return None
-        try:
-            stat = os.stat(path)
-        except OSError:
-            return None
-        owner_tuple = tuple(sorted(pids))
-        key = (path, stat.st_mtime_ns, stat.st_size, owner_tuple)
-        session = self._codex_cache.get(key)
-        if session is None:
-            session = codex.session_from_path(path, pids=owner_tuple)
-            if session is None:
-                return None
-            self._codex_cache[key] = session
-        if len(self._codex_cache) > 128:
-            self._codex_cache = {k: v for k, v in self._codex_cache.items() if k[0] == path}
-        return session
-
-    def _claude_by_pid(self) -> dict[int, tuple[str, dict[str, object]]]:
-        """pid -> (session id, registry record) for registry records that name the live process.
-
-        A record counts only if its `procStart` equals the live process's start time (a missing one
-        cannot tell a stale descriptor from a reused pid), and a pid with more than one record is
-        dropped: which of them is current cannot be told.
-        """
-        registry = os.path.join(claude.home(), "sessions")
-        grouped = liveness.registry_records(
-            registry, proc_root=self.proc_root, require_start=True)
-        found: dict[int, list[tuple[str, dict[str, object]]]] = {}
-        for session_id, records in grouped.items():
-            for record in records:
-                pid = _integer(record.get("pid"))
-                if pid:
-                    found.setdefault(pid, []).append((session_id, record))
-        return {pid: items[0] for pid, items in found.items() if len(items) == 1}
+            environment = _live_environment(process.pid, proc_root=self.proc_root)
+            if environment is None:
+                continue
+            config = environment.get("CLAUDE_CONFIG_DIR") or (
+                os.path.join(environment["HOME"], ".claude") if environment.get("HOME") else "")
+            if not config or not os.path.isabs(config):
+                continue
+            matches = [
+                (session_id, record)
+                for session_id, records in self._claude_registry(config).items()
+                for record in records if _integer(record.get("pid")) == process.pid
+            ]
+            if len(matches) == 1:
+                found[process.pid] = matches[0]
+        return found
 
     def _coding_for(
         self,
@@ -476,8 +453,17 @@ class Inspector:
         claude_by_pid: dict[int, tuple[str, dict[str, object]]],
         ambiguous_omp_cwds: frozenset[str] = frozenset(),
     ) -> Session | None:
-        if session := self._codex_for(pane):
-            return session
+        agents = [(process, _process_agent(process)) for process in pane.processes]
+        agents = [(process, provider) for process, provider in agents if provider]
+        kinds = {provider for _, provider in agents}
+        if (len(kinds) > 1 and "codex" in kinds) or sum(
+                provider == "claude" for _, provider in agents) > 1:
+            # Codex has no readable state, so a pane that also runs another agent cannot say which
+            # one it describes; two Claude processes cannot say either: no state.
+            process, provider = agents[0]
+            return _minimal_session(
+                provider, pane, session_id=_argument_session(process),
+                pids=tuple(p.pid for p, _ in agents if p.pid > 0))
         for process in pane.processes:
             provider = _process_agent(process)
             if provider == "claude":
@@ -541,8 +527,10 @@ class Inspector:
 
     def snapshot(self, tree: kitty_rc.Tree) -> Snapshot:
         brokers, broker_available, warning = _broker_statuses()
-        claude_by_pid = self._claude_by_pid()
-        self._codex_held_by = self._held_rollouts(tree.panes)
+        claude_by_pid = self._claude_by_pid([
+            process for pane in tree.panes for process in pane.processes
+            if _process_agent(process) == "claude"])
+        self._registries = {}
         page_index = {
             page.id: page.index for page in tree.pages
         }

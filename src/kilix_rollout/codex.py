@@ -88,17 +88,59 @@ def _first_meta(path: str) -> dict[str, object]:
     return {}
 
 
-MAX_TAIL_BYTES = 32 * 1024 * 1024    # how far back a state is searched for; further is unknown
+MAX_TAIL_BYTES = jsonl.TAIL_BYTES      # bytes read from the end of a rollout for a state
+MAX_LINE_BYTES = jsonl.LINE_BYTES      # bytes held for one record
+MAX_TAIL_SECONDS = jsonl.TAIL_SECONDS
 _MARKERS = (b"task_", b"turn_", b"approval", b"exec_command", b"patch_apply", b"event_msg")
+_INVALID = object()
 
 
-def _identities(payload: dict, *names: str) -> tuple[str, ...]:
+def _scalar_ids(payload: dict, *names: str):
+    """The ids a payload carries under these names; `_INVALID` when one is present but not an id."""
     found = []
     for name in names:
-        value = payload.get(name)
-        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value):
+        if name not in payload:
+            continue
+        value = payload[name]
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return _INVALID
+        if str(value):
             found.append(str(value))
     return tuple(found)
+
+
+def _classify(record: dict):
+    """One record as (kind, payload, event): `event` is the event type of an `event_msg`.
+
+    Returns None for a record whose structure a state could depend on but is not valid: a `type` that
+    is not a string, or an `event_msg` whose payload is not an object or whose `type` is not a string.
+    """
+    kind = record.get("type")
+    if not isinstance(kind, str):
+        return None
+    payload = record.get("payload")
+    if kind != "event_msg":
+        return kind, payload if isinstance(payload, dict) else {}, ""
+    if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
+        return None
+    return kind, payload, payload["type"]
+
+
+def _pending(events) -> str:
+    """The approval kind still waiting after these events, oldest first; "" if none.
+
+    A request is resolved only by a LATER command or patch event carrying its own call or approval id;
+    a request without an id is never resolved by one. A repeated request after its resolution waits again.
+    """
+    waiting: list[tuple[tuple[str, ...], str]] = []
+    for role, ids, label in events:
+        if role == "request":
+            waiting.append((ids, label))
+        elif ids:
+            waiting = [item for item in waiting if not set(ids) & set(item[0])]
+    if not waiting:
+        return ""
+    return "command approval" if waiting[-1][1] == "exec_approval_request" else "file-change approval"
 
 
 def _inspect(
@@ -106,58 +148,78 @@ def _inspect(
     *,
     include_agent_message: bool = True,
 ) -> dict[str, object]:
-    """Return the latest cwd, messages, turn boundary and pending approvals.
+    """Return the latest cwd, messages, turn boundary and pending approval, reading a bounded tail.
 
-    The state is only as certain as the newest record: a last line that is not a complete JSON
-    object (a write in progress, a torn or corrupt line), or any unreadable line that could be
-    a turn or approval event, makes the state `uncertain` (the caller reports unknown), never
-    the older boundary that happens to be readable. A pending approval is a request whose own
-    call id (or approval id) has not been resolved by a later command or patch event with the same id, inside
-    the turn that is still open; an unrelated command resolves nothing.
+    The state is only as certain as the evidence read, and anything doubtful makes it `uncertain`
+    (the caller reports unknown), never an older boundary:
+    - an unreadable, torn or non-object line, or an `event_msg` whose payload or type is not valid,
+      or an id that is not an id, newer than the newest turn boundary;
+    - a line or tail beyond the byte, line or time limits before a boundary is settled;
+    - a turn end whose own start is not the nearest earlier start (interleaved or unmatched turn ids),
+      or is not found.
+    Approvals are matched in order (`_pending`), inside the turn that is still open.
     """
-    cwd = prompt = agent_message = turn_event = ""
+    cwd = prompt = agent_message = ""
     uncertain = False
-    scanned = 0
     first = True
-    requests: list[tuple[tuple[str, ...], str]] = []   # (ids, kind) newer than the open turn's start
-    resolved: set[str] = set()
-    pending_tool = ""
-    for raw in jsonl.reverse_lines(path):
-        scanned += len(raw)
-        if scanned > MAX_TAIL_BYTES and not turn_event:
-            uncertain = True
-            break
+    newest = ""                 # the newest turn boundary event
+    newest_turn = ""
+    settled = False             # the newest boundary is settled (a start, or an end with its own start)
+    tail: list[tuple[str, tuple[str, ...], str]] = []      # approval events newer than the boundary, newest first
+    for raw in jsonl.bounded_reverse_lines(
+            path, max_bytes=MAX_TAIL_BYTES, max_line=MAX_LINE_BYTES, max_seconds=MAX_TAIL_SECONDS):
+        if raw is None:         # a line or the rest of the tail was not read
+            if not settled:
+                uncertain = True
+            first = False
+            continue
         record = jsonl.load(raw)
-        if record is None:
-            if first or any(marker in raw for marker in _MARKERS):
+        classified = _classify(record) if record is not None else None
+        if classified is None:
+            if not settled and (record is not None or first or any(marker in raw for marker in _MARKERS)):
                 uncertain = True
             first = False
             continue
         first = False
-        kind = record.get("type")
-        payload = record.get("payload")
-        payload = payload if isinstance(payload, dict) else {}
+        kind, payload, event = classified
         if kind == "turn_context" and not cwd:
             value = payload.get("cwd")
             if isinstance(value, str) and value:
                 cwd = value
         elif kind == "event_msg":
-            event = payload.get("type")
-            if not turn_event:
-                if event in _APPROVAL_REQUESTED:
-                    requests.append((_identities(payload, "call_id", "approval_id"), str(event)))
-                elif event in _APPROVAL_RESOLVED_BY_ID:
-                    resolved.update(_identities(payload, "call_id"))
-                elif event in (_TURN_STARTED | _TURN_COMPLETE):
-                    turn_event = str(event)
-                    if event in _TURN_STARTED:
-                        open_requests = [item for item in requests if not resolved.intersection(item[0])]
-                        if open_requests:
-                            pending_tool = "command approval" if open_requests[-1][1] == "exec_approval_request" \
-                                else "file-change approval"
+            turn = _scalar_ids(payload, "turn_id")
+            if turn is _INVALID:
+                if not settled:
+                    uncertain = True
+                turn = ()
+            turn_id = turn[0] if turn else ""
+            if not settled:
+                if event in _APPROVAL_REQUESTED and not newest:
+                    ids = _scalar_ids(payload, "call_id", "approval_id")
+                    if ids is _INVALID:
+                        uncertain = True
+                    else:
+                        tail.append(("request", ids, event))
+                elif event in _APPROVAL_RESOLVED_BY_ID and not newest:
+                    ids = _scalar_ids(payload, "call_id")
+                    if ids is _INVALID:
+                        uncertain = True
+                    else:
+                        tail.append(("resolve", ids, event))
+                elif event in _TURN_STARTED:
+                    if not newest:
+                        newest, newest_turn, settled = event, turn_id, True
+                    elif _same_turn(newest_turn, turn_id):
+                        settled = True
+                    else:
+                        uncertain, settled = True, True
+                elif event in _TURN_COMPLETE:
+                    if not newest:
+                        newest, newest_turn = event, turn_id
+                    elif not _same_turn(newest_turn, turn_id):
+                        uncertain, settled = True, True
             if not prompt and event == "user_message":
-                prompt = _operator_message(
-                    payload.get("message") or payload.get("text"))
+                prompt = _operator_message(payload.get("message") or payload.get("text"))
             if not agent_message and event == "agent_message":
                 agent_message = _message_text(payload.get("message"))
         elif kind == "response_item" and payload.get("type") == "message":
@@ -166,19 +228,29 @@ def _inspect(
                 prompt = _operator_message(payload.get("content"))
             elif not agent_message and role == "assistant":
                 agent_message = _message_text(payload.get("content"))
-        if (cwd and prompt and turn_event
+        if (settled and cwd and prompt
                 and (agent_message or not include_agent_message)):
             break
-    if uncertain:
-        turn_event, pending_tool = "", ""
+    if newest and not settled:
+        uncertain = True          # an end with no start found: nothing says which turn it ended
+    pending_tool = ""
+    if uncertain or not newest:
+        newest, pending_tool = "", ""
+    elif newest in _TURN_STARTED:
+        pending_tool = _pending(reversed(tail))
     return {
         "cwd": cwd,
         "prompt": prompt,
         "agent_message": agent_message,
-        "turn_event": turn_event,
+        "turn_event": newest,
         "pending_tool": pending_tool,
         "uncertain": uncertain,
     }
+
+
+def _same_turn(left: str, right: str) -> bool:
+    """Two boundary events belong to one turn: equal ids, or ids that are not both given."""
+    return not left or not right or left == right
 
 
 def _session_id(path: str, meta: dict[str, object]) -> str:

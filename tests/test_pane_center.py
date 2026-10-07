@@ -198,7 +198,7 @@ class CodexStateTests(unittest.TestCase):
             self.assertEqual(resolved.live_status, "working")
             self.assertEqual(resolved.pending_tool, "")
 
-    def test_inspector_uses_only_the_rollout_opened_by_the_pane_pid(self):
+    def test_a_codex_pane_is_agent_even_when_it_holds_a_rollout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             rollout = root / "sessions" / f"rollout-{CODEX_ID}.jsonl"
@@ -213,9 +213,9 @@ class CodexStateTests(unittest.TestCase):
             ):
                 got = pane_center.Inspector(
                     proc_root=str(root / "proc")).snapshot(tree())
-            self.assertEqual(got.panes[0].activity, "idle")
-            self.assertEqual(got.panes[0].doing, "real task")
-            self.assertEqual(got.panes[0].coding.session_id, CODEX_ID)
+            self.assertEqual(got.panes[0].activity, "agent")
+            self.assertEqual(got.panes[0].coding.provider, "codex")
+            self.assertEqual(got.panes[0].coding.live_status, "unknown")
 
 
 def agent_tree(argv: list[str], pid: int = 91) -> kitty_rc.Tree:
