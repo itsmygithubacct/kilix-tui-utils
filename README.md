@@ -360,6 +360,37 @@ change nothing sends you somewhere else to finish the job. Closing always asks
 first, and both go through the terminal's remote control, which refuses them
 outright unless Kilix's scoped credential has been widened to allow them.
 
+### Where an agent's state comes from
+
+A pane's `activity` (`idle`, `working`, `waiting`; anything the reader cannot
+prove is `agent`) is read from the agent's own structured records, never from
+the screen. A screen cannot be read safely: a draft, an approval or a modal can
+look like an empty prompt (two independent reviews of a screen reader showed it).
+
+| Provider | Which record names the session | How the state is read |
+| --- | --- | --- |
+| Claude Code | the registry descriptor `~/.claude/sessions/<pid>.json` of a pane process, accepted only while the process exists and started when the descriptor says | its `status`: `idle` → idle, `busy` → working, `waiting` → waiting, `shell` → idle. Claude Code derives `shell` as "idle at its prompt while a background shell, monitor or task still runs" (`status === "idle" && <background work> ? "shell" : status`), which is the "1 monitor" case. Any other value is `agent` |
+| Codex | 1. a rollout the pane's Codex holds open (`/proc/<pid>/fd`); 2. `codex resume <uuid>` on its command line; 3. the one rollout whose `session_meta` (working directory, not a subagent, same `originator`) is stamped within 30 s after the process started | the rollout's last turn event: `task_started` → working, `task_complete` or `turn_aborted` → idle, a pending `exec_approval_request`/`apply_patch_approval_request` → waiting, no turn yet → `agent` |
+
+Codex 0.160 opens its rollout only for each write, so the descriptor (1) is
+usually not there, and (3) is what finds the session. The match is refused (the
+pane stays `agent`) whenever it could name two sessions: another rollout in the
+same directory since the process started (a `/new` in the same process, another
+Codex run), two instances started together, a `resume` without an id (picker,
+`--last`) or `fork`, more than 400 candidates. `-C/--cd DIR` roots the match in
+DIR, `CODEX_HOME` in the process's environment is honoured, `codex exec` runs
+match only `codex_exec` rollouts. `logs_*.sqlite` is not used: it tags log rows
+with `pid:<n>` and a thread, but an idle session logs none.
+
+What a structured state cannot see, and the screen could not either: a **draft
+typed into the composer** (an agent that is idle with half a line typed is
+`idle`), or a modal (trust, update, login) that the records do not mention.
+This was already true of every state Kilix names. A session switched inside a
+running Codex by `/resume` or `/fork` writes no new rollout in the start window,
+so its first rollout's state would be reported; and a Codex whose first message
+was sent more than 30 s after it started, or has none yet, has no matched
+rollout (`agent`).
+
 ### Creating panes
 
 `new` builds a page and fills it, which is the one verb here that makes something
