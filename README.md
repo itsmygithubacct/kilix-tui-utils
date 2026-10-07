@@ -305,21 +305,12 @@ what the highlighted pane is showing. `/` filters across all of those fields;
 scope between everything, this page, and everywhere else. Kilix binds `F12` to
 open on everything and its tmux-style leader `q` to open on this page.
 
-Activity is evidence-based. A live Codex process is `working` when its newest
-turn boundary is `task_started`, and `idle` only when the same process still
-owns the rollout and the newest boundary is `task_complete`. Claude's validated
-live registry supplies `idle`, `waiting`, or active state. A recognized agent
-without an explicit signal stays `agent`; it is never optimistically called
-idle. Shells, SSH sessions, and other foreground programs are labelled
-separately.
-
-For live OMP panes, a clean assistant stop becomes idle only after a short
-stability window. OMP 18.3.2 can automatically retry a provider error after a
-backoff (five minutes by default, potentially longer for an opted-in quota-reset
-wait), but writes the failed assistant row without persisting its
-`auto_retry_start` event. Therefore a transcript ending in provider `error`
-remains conservatively `working`; a finite idle debounce would expose the pane
-during a retry backoff. Deliberate aborts still use the short stability window.
+Activity is evidence-based, and only **Claude Code** is certified: its validated live
+registry supplies `idle`, `waiting` or `working` (see "Where an agent's state comes
+from"). Every other coding agent (Codex, Grok, Qwen OMP, Kimi, anything unrecognised)
+is shown with its command, directory and title but reads `agent`: it is never
+optimistically called idle, working or waiting. Shells, SSH sessions and other
+foreground programs are labelled separately.
 
 The same snapshot is a scriptable `kilix panes` interface:
 
@@ -364,13 +355,19 @@ outright unless Kilix's scoped credential has been widened to allow them.
 
 A pane's `activity` (`idle`, `working`, `waiting`; anything the reader cannot
 prove is `agent`) is read from the agent's own structured records, never from
-the screen. A screen cannot be read safely: a draft, an approval or a modal can
+the screen, and **only for Claude Code**. Codex, Grok, Qwen OMP, Kimi and any
+other provider are always `agent`: none of them writes a record that names the
+session a given process runs *now*, and the heuristics that stood in for one (a
+Grok registry entry that only needs its PID to exist, the newest OMP file in a
+directory, a Codex rollout's directory or timestamp) all named the wrong session in
+review. A pane that runs Claude beside any other agent process is `agent`, in
+either process order. A screen cannot be read safely: a draft, an approval or a modal can
 look like an empty prompt (two independent reviews of a screen reader showed it).
 
 | Provider | Which record names the session | How the state is read |
 | --- | --- | --- |
 | Claude Code | the registry descriptor `~/.claude/sessions/<pid>.json` of a pane process, accepted only for the pane's single Claude process, from its own config directory, while its recorded `procStart` equals the process's start time (see below) | its `status`: `idle` → idle, `busy` → working, `waiting` → waiting, `shell` → idle. Claude Code derives `shell` as "idle at its prompt while a background shell, monitor or task still runs" (`status === "idle" && <background work> ? "shell" : status`), which is the "1 monitor" case. Any other value is `agent` |
-| Codex | **none** | **no state: a Codex pane is always `agent`** |
+| Codex, Grok, Qwen OMP, Kimi, others | **none** | **no state: always `agent`** |
 
 **Codex state is not available until Codex exposes an exact current-session
 identity, and kilix-needle's `tell`/`wait` therefore refuse Codex panes.** Nothing
@@ -395,28 +392,42 @@ review:
   has no rows.
 
 So the pane center shows a Codex pane as `agent` (its command, directory and title,
-never an idle/working/waiting), and a pane that also runs another agent process is
-`agent` too. The Codex rollout parser in `src/kilix_rollout/codex.py` still serves
+never an idle/working/waiting). The Codex rollout parser in `src/kilix_rollout/codex.py` still serves
 the session listings and the `rollout` tools, not pane activity. It fails closed for
-every consumer: a torn, unreadable or structurally invalid newest record, an
-approval request matched only to a *later* resolution with its own call or
-approval id, turn ends whose turn id is not the nearest earlier start, and a
-tail read limited to 8 MiB, 1 MiB per record and 2 s all give "unknown", never an
-older idle.
+every consumer: any record newer than the newest turn boundary that is unreadable,
+not an object, nested too deeply, of an unknown kind or event type, or with a
+payload that is not an object gives "unknown", never the older boundary; an
+approval request is matched only to a *later* resolution that shares a call or
+approval id and the same turn; a turn end must meet its own start and a start whose
+previous boundary is another start (overlapping open turns) is unknown; and the
+tail read is limited to 8 MiB, 1 MiB per record and 2 s (a gap before the boundary is
+settled is unknown).
 
 What a structured state cannot see: a **draft typed into the composer** (an
 agent that is idle with half a line typed is `idle`), or a modal (trust, update,
 login) that the records do not mention. This was already true of every state
 Kilix names.
 
-Claude Code's descriptor is believed only for a pane with **exactly one** Claude
-process, only while that process's command line is still the one the pane listed
-(a PID that has since exec'd something else is `agent`), only in the registry of
-the process's **own** `CLAUDE_CONFIG_DIR` (else `$HOME/.claude`, both from its
-`/proc/<pid>/environ`; an unreadable or unknown context is `agent`), only if the
-record's `procStart` equals the live start time (a descriptor without one cannot be
-told from one left behind for a reused PID), and two descriptors for one PID are
-`agent`.
+Claude Code's descriptor is believed only when all of this holds, each checked
+again when the row is used (a row is cached for one snapshot; the process is read
+again and must be unchanged):
+
+- the pane has **exactly one** agent process, and it is Claude by its **executable
+  form**: `argv[0]` named `claude` (`claude`, `/path/to/claude`), or `node`,
+  `nodejs` or `bun` running a script named `claude` or the npm entrypoint
+  `@anthropic-ai/claude-code/cli.js|cli.mjs`. An argument that merely mentions
+  claude (`less claude`, `grep claude`) is not Claude;
+- its **whole live command line** (`/proc/<pid>/cmdline`) equals the pane's;
+- the row is in the registry of the process's **own** `CLAUDE_CONFIG_DIR` (else
+  `$HOME/.claude`, both from its `/proc/<pid>/environ`; an unreadable, unknown or
+  relative context is `agent`);
+- the row's `procStart` equals the process's live start time (a row without one
+  cannot be told from one left behind for a reused PID), and no other row names
+  the PID;
+- start time, command line and config directory are unchanged between the lookup
+  and the use.
+
+Anything else is `agent`.
 
 ### Creating panes
 

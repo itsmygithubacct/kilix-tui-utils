@@ -239,7 +239,7 @@ class CodexStatesFromEvents(unittest.TestCase):
         s = self.ev
         cases = (
             ([s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("task_complete", turn_id="a")], "unknown"),
-            ([s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("task_complete", turn_id="b")], "idle"),
+            ([s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("task_complete", turn_id="b")], "unknown"),   # a never ended
             ([s("task_started", turn_id="a"), s("task_complete", turn_id="a")], "idle"),
             ([s("task_started", turn_id="a"), s("task_complete", turn_id="a"), s("task_complete", turn_id="a")], "idle"),
             ([s("task_started", turn_id="a"), s("task_complete", turn_id="b")], "unknown"),
@@ -251,6 +251,77 @@ class CodexStatesFromEvents(unittest.TestCase):
         for records, expected in cases:
             with self.subTest(records=[(r["payload"]["type"], r["payload"].get("turn_id")) for r in records]):
                 self.assertEqual(self.raw_state(records), expected)
+
+    def test_anything_newer_than_the_boundary_that_is_not_understood_is_unknown(self):
+        done = [self.ev("task_started"), self.ev("task_complete")]
+        odd = (
+            [1, 2],                                                         # valid JSON, not an object
+            "text",
+            {"type": "response_item", "payload": None},
+            {"type": "response_item", "payload": {"type": "mystery"}},
+            {"type": "response_item", "payload": {}},
+            {"type": "turn_context", "payload": []},
+            {"type": "brand_new_record_kind", "payload": {}},
+            self.ev("new_unknown_state"),
+            self.ev(""),
+        )
+        for record in odd:
+            with self.subTest(record=record):
+                self.assertEqual(self.raw_state(done + [record, self.ev("token_count")]), "unknown")
+                self.assertEqual(self.raw_state(done + [record]), "unknown")
+        known = [self.ev("token_count"), self.ev("item_completed"), self.ev("thread_settings_applied"),
+                 {"type": "response_item", "payload": {"type": "reasoning"}},
+                 {"type": "world_state", "payload": {}}, {"type": "token_usage_record", "payload": {}}]
+        self.assertEqual(self.raw_state(done + known), "idle")               # what real 0.160 rollouts hold
+
+    def test_json_nested_too_deep_is_unknown_and_never_raises(self):
+        deep = '{"type":"response_item","payload":' + "[" * 10000 + "0" + "]" * 10000 + "}"
+        home = Home(self)
+        path = home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
+        with open(path, "a") as handle:
+            handle.write(deep + "\n")
+        self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "unknown")
+        self.assertIsNone(jsonl.load(deep.encode()))
+
+    def test_overlapping_open_turns_are_unknown(self):
+        s = self.ev
+        for records in ([s("task_started", turn_id="a"), s("task_started", turn_id="b")],
+                        [s("task_started"), s("task_started")],
+                        [s("task_complete", turn_id="x"), s("task_started", turn_id="a"), s("task_started", turn_id="b"), s("exec_approval_request", "q", turn_id="b")]):
+            self.assertEqual(self.raw_state(records), "unknown", records)
+        self.assertEqual(self.raw_state([s("task_started", turn_id="a"), s("task_complete", turn_id="a"), s("task_started", turn_id="b")]), "working")
+
+    def test_approvals_and_resolutions_must_share_ids_and_turns(self):
+        s = self.ev
+        start = s("task_started", turn_id="a")
+        cases = (
+            ([start, s("exec_approval_request", "x", turn_id="a"), s("exec_command_begin", "x", turn_id="b")], "unknown"),
+            ([start, s("exec_approval_request", "x", turn_id="a"), s("exec_command_begin", "x", turn_id="a")], "working"),
+            ([start, s("exec_approval_request", "x", turn_id="a"), s("exec_command_begin", "y", turn_id="b")], "unknown"),   # another turn's event in the open turn
+            ([start, s("exec_approval_request", approval_id="x"), s("exec_command_begin", approval_id="x")], "working"),
+            ([start, s("exec_approval_request", approval_id="x"), s("exec_command_begin", "x")], "working"),
+            ([start, s("exec_approval_request", "x", approval_id="y"), s("exec_command_begin", approval_id="y")], "working"),
+            ([start, s("exec_approval_request", approval_id="x"), s("exec_command_begin", approval_id="z")], "waiting"),
+            ([start, s("exec_approval_request", "x", turn_id="b")], "unknown"),                 # an approval of another turn
+            ([s("task_started"), s("exec_approval_request", "x", turn_id="a"), s("exec_command_begin", "x", turn_id="b")], "unknown"),
+            ([s("task_started"), s("exec_approval_request", "x", turn_id="a"), s("exec_command_begin", "x", turn_id="a")], "working"),
+        )
+        for records, expected in cases:
+            with self.subTest(records=[(r["payload"]["type"], r["payload"].get("turn_id")) for r in records]):
+                self.assertEqual(self.raw_state(records), expected)
+
+    def test_the_recovery_tools_cut_off_flag_does_not_depend_on_the_strict_checks(self):
+        """Records this reader does not understand make the live state unknown, but a dead session's turn
+        that never ended is still offered for recovery as cut-off."""
+        home = Home(self)
+        path = home.rollout(1, stamp=START + 2, events=("task_started",))
+        with open(path, "a") as handle:
+            for index in range(5):
+                handle.write(json.dumps({"type": "response_item", "payload": {"index": index}}) + "\n")
+        self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "unknown")
+        self.assertEqual(codex.session_from_path(str(path), pids=()).state, "cut-off")
+        done = home.rollout(2, stamp=START + 3, events=("task_started", "task_complete"))
+        self.assertEqual(codex.session_from_path(str(done), pids=()).state, "idle")
 
     def test_a_rollout_with_no_owner_is_not_live(self):
         self.assertEqual(self.state(("task_started",), pids=()).live_status, "")
@@ -347,7 +418,7 @@ class BoundedReads(unittest.TestCase):
         """A record too long to read could be a newer turn start: the older idle is not believed."""
         path = self.home.rollout(1, stamp=START + 2, events=("task_started", "task_complete"))
         with open(path, "a") as handle:
-            handle.write(json.dumps({"type": "response_item", "payload": {"output": "y" * 5000}}) + "\n")
+            handle.write(json.dumps({"type": "response_item", "payload": {"type": "function_call_output", "output": "y" * 5000}}) + "\n")
         with mock.patch.object(codex, "MAX_LINE_BYTES", 1000):
             self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "unknown")
         self.assertEqual(codex.session_from_path(str(path), pids=(1,)).live_status, "idle")
@@ -361,7 +432,7 @@ class BoundedReads(unittest.TestCase):
         path.write_bytes(head + filler * 1300 + marker + rest)      # about 39 MB between the prompt and the turn
         started = time.monotonic()
         session = self.read_state(path)
-        self.assertEqual(session.live_status, "idle")
+        self.assertEqual(session.live_status, "unknown")           # the turn's start has no previous boundary in the budget
         self.assertGreater(Counting.total, 1024 * 1024)               # it did read on, up to the budget
         self.assertLessEqual(Counting.total, codex.MAX_TAIL_BYTES + (1 << 20))
         self.assertLess(time.monotonic() - started, 5)
@@ -375,6 +446,16 @@ class BoundedReads(unittest.TestCase):
         with mock.patch.object(jsonl, "open", lambda p, m="r": Counting(real(p, m)), create=True):
             self.assertEqual(list(jsonl.head_records(str(path), 256)), [])
         self.assertLessEqual(Counting.total, jsonl.LINE_BYTES + 1)
+
+    def test_the_head_scan_is_bounded_in_total(self):
+        path = self.home.root / "rollout-x.jsonl"
+        line = b'{"type": "x", "payload": {"pad": "' + b"p" * 900000 + b'"}}\n'
+        path.write_bytes(line * 64)                                  # 64 records of 0.9 MB, no session_meta
+        real = open
+        with mock.patch.object(jsonl, "open", lambda p, m="r": Counting(real(p, m)), create=True):
+            self.assertEqual(codex._first_meta(str(path)), {})
+        self.assertLessEqual(Counting.total, jsonl.HEAD_BYTES + jsonl.LINE_BYTES)
+        self.assertGreater(Counting.total, 1024 * 1024)
 
     def test_the_old_unbounded_reader_is_not_used_for_a_state(self):
         with mock.patch.object(jsonl, "reverse_lines", side_effect=AssertionError("unbounded")):
@@ -562,6 +643,111 @@ class ClaudeRecords(unittest.TestCase):
         self.addCleanup(os.chdir, previous)
         os.chdir(self.home.root)                                    # where "rel" would resolve
         self.assertEqual(self.activity(pid), "agent")
+
+    def test_only_executable_forms_of_claude_are_accepted_never_an_argument_that_mentions_it(self):
+        accepted = (["claude"], ["/home/u/.local/bin/claude", "--resume", "x"], ["node", "/x/claude"],
+                    ["bun", "/x/claude", "--print"], ["nodejs", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"],
+                    ["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.mjs", "-p"])
+        rejected = (["less", "claude"], ["grep", "claude", "f"], ["node", "--inspect", "/x/claude"], ["node", "/x/not-claude.js"],
+                    ["python3", "claude"], ["node", "/a/claude-code/cli.js"], ["node", "/a/other/claude-code/x.js"],
+                    ["claude-helper"], ["/x/claude/bin/tool"], [])
+        for argv in accepted:
+            self.assertTrue(pane_center._claude_form(argv), argv)
+        for argv in rejected:
+            self.assertFalse(pane_center._claude_form(argv), argv)
+
+    def test_a_viewer_that_mentions_claude_is_agent_even_with_a_matching_record(self):
+        pid = self.claude(argv=("less", "claude"))
+        self.record(pid, status="idle")
+        self.assertEqual(self.activity(pid, argv=("less", "claude")), "agent")
+
+    def test_the_whole_command_line_must_equal_the_panes(self):
+        pid = self.claude(argv=("claude", "--resume", uuid(1)))
+        self.record(pid, status="idle")
+        self.assertEqual(self.activity(pid, argv=("claude", "--resume", uuid(1))), "idle")
+        self.assertEqual(self.activity(pid, argv=("claude", "--resume", uuid(2))), "agent")
+        self.assertEqual(self.activity(pid, argv=("claude",)), "agent")
+
+    def inspect_with(self, pids, hook_target, hook):
+        """Run a snapshot of one pane per pid while `hook` runs the first time `hook_target` is called."""
+        panes = [(9 + n, [(pid, ["claude"])], str(self.home.cwd)) for n, pid in enumerate(pids)]
+        tree = kitty_rc.parse([{"id": 1, "is_focused": True, "tabs": [{"id": 2, "title": "w", "is_active": True, "windows": [
+            {"id": wid, "pid": 70 + wid, "title": f"p{wid}", "cwd": cwd, "env": {"KITTY_PTY_BROKER_SESSION": SESSION},
+             "foreground_processes": [{"pid": pid, "cmdline": argv, "cwd": cwd} for pid, argv in procs]}
+            for wid, procs, cwd in panes]}]}])
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
+            return [pane.activity for pane in pane_center.Inspector(proc_root=str(self.home.proc)).snapshot(tree).panes]
+
+    def test_a_process_that_changes_while_its_row_is_being_read_is_agent(self):
+        env = {"CLAUDE_CONFIG_DIR": str(self.config)}
+        changes = {
+            "exec": lambda pid: self.home.process(pid, ["sh"], environ=env),
+            "config": lambda pid: self.home.process(pid, ["claude"], environ={"CLAUDE_CONFIG_DIR": str(self.home.root / "other")}),
+            "recycled": lambda pid: self.home.process(pid, ["claude"], start=START + 10, environ=env),
+        }
+        for name, change in changes.items():
+            pid = self.claude()
+            self.record(pid)
+            original = liveness.registry_records
+
+            def changing(*args, _change=change, _pid=pid, **kwargs):
+                _change(_pid)
+                return original(*args, **kwargs)
+            with mock.patch.object(liveness, "registry_records", side_effect=changing):
+                self.assertEqual(self.inspect_with([pid], None, None), ["agent"], name)
+
+    def test_a_process_recycled_between_the_scan_and_its_start_check_is_agent(self):
+        pid = self.claude()
+        self.record(pid)
+        original = liveness.start_ticks
+
+        def late(number, **kwargs):
+            result = original(number, **kwargs)
+            self.home.process(number, ["claude"], start=START + 10, environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+            return result
+        with mock.patch.object(liveness, "start_ticks", side_effect=late):
+            self.assertEqual(self.inspect_with([pid], None, None), ["agent"])
+
+    def test_a_cached_row_is_checked_again_when_a_later_pane_uses_it(self):
+        one, two = self.claude(91), self.claude(92)
+        self.record(one)
+        self.record(two, session=uuid(2))
+        original = pane_center._live_argv
+
+        def recycle_second(number, **kwargs):
+            if number == two:
+                self.home.process(two, ["claude"], start=START + 10, environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+            return original(number, **kwargs)
+        with mock.patch.object(pane_center, "_live_argv", side_effect=recycle_second):
+            self.assertEqual(self.inspect_with([one, two], None, None), ["idle", "agent"])
+        self.home.process(two, ["claude"], environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+        self.assertEqual(self.inspect_with([one, two], None, None), ["idle", "idle"])
+
+    def test_a_row_scanned_for_an_earlier_pane_is_compared_with_the_start_time_when_a_later_pane_uses_it(self):
+        one, two = self.claude(91), self.claude(92)
+        self.record(one)
+        self.record(two, session=uuid(2))
+        original = pane_center._live_argv
+        calls = {"n": 0}
+
+        def recycle_second_after_the_scan(number, **kwargs):
+            if number == one:
+                calls["n"] += 1
+                if calls["n"] == 2:                       # the registry has been scanned for pane one
+                    self.home.process(two, ["claude"], start=START + 10, environ={"CLAUDE_CONFIG_DIR": str(self.config)})
+            return original(number, **kwargs)
+        with mock.patch.object(pane_center, "_live_argv", side_effect=recycle_second_after_the_scan):
+            self.assertEqual(self.inspect_with([one, two], None, None), ["idle", "agent"])
+
+    def test_registry_rows_keep_pid_and_start_and_a_missing_start_is_refused_when_required(self):
+        pid = self.claude()
+        self.record(pid)
+        self.record(self.claude(92), start=None, name="nostart.json")
+        rows = liveness.registry_records(str(self.config / "sessions"), proc_root=str(self.home.proc), require_start=True)
+        self.assertEqual([(r["pid"], r["procStart"]) for rows_ in rows.values() for r in rows_],
+                         [(pid, liveness.start_ticks(pid, proc_root=str(self.home.proc)))])
+        loose = liveness.registry_records(str(self.config / "sessions"), proc_root=str(self.home.proc))
+        self.assertEqual(sum(len(v) for v in loose.values()), 2)
 
     def test_the_registry_is_the_target_processes_own_not_the_readers(self):
         target = self.home.root / "target-claude"

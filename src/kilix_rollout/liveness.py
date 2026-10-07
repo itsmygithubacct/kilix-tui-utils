@@ -165,6 +165,7 @@ def registry_records(
             continue
         found.setdefault(session_id.lower(), []).append({
             "pid": pid,
+            "procStart": "" if recorded is None else str(recorded),
             "cwd": str(record.get("cwd") or ""),
             "status": str(record.get("status") or ""),
             "name": str(record.get("name") or ""),

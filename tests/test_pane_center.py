@@ -239,83 +239,67 @@ def two_agent_tree(first, second) -> kitty_rc.Tree:
         ]}]}])
 
 
-class GrokAndOmpStateTests(unittest.TestCase):
-    """kilix-needle's agents job: idle detection for grok and qwen-omp panes."""
+class OtherProvidersHaveNoStateTests(unittest.TestCase):
+    """Only Claude Code is certified; Grok, OMP, Kimi and Codex panes are shown but read `agent`."""
 
     def inspect(self, argv, proc_root):
-        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
-                mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}):
+        with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")):
             return pane_center.Inspector(proc_root=proc_root).snapshot(agent_tree(argv)).panes[0]
 
-    def test_a_live_grok_pane_reports_its_turn(self):
+    def test_no_other_provider_reads_a_state_even_with_every_record_present(self):
         with tempfile.TemporaryDirectory() as temporary:
+            session = Session(provider="omp", session_id="osid", path="/p", cwd="/tmp/project", title="t", updated=5.0)
             with mock.patch.object(grok, "active", return_value={"sid": (91, "/tmp/project")}), \
-                    mock.patch.object(grok, "activity", side_effect=["idle", "working", "waiting"]):
-                for want in ("idle", "working", "waiting"):
-                    got = self.inspect(["/home/u/.grok/bin/grok"], temporary)
-                    self.assertEqual((got.activity, got.coding.session_id), (want, "sid"))
+                    mock.patch.object(grok, "activity", return_value="idle"), \
+                    mock.patch.object(omp, "newest_in", return_value=session), \
+                    mock.patch.object(omp, "activity", return_value="idle"), \
+                    mock.patch.object(omp, "session_for_pid", return_value=session):
+                for argv in (["/home/u/.grok/bin/grok"], ["omp", "--model", "m"], ["kimi"], ["codex"]):
+                    got = self.inspect(argv, temporary)
+                    self.assertEqual(got.activity, "agent", argv)
+                    self.assertEqual(got.coding.live_status, "unknown", argv)
 
-    def test_a_live_omp_pane_uses_the_newest_session_since_it_started(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            session = Session(provider="omp", session_id="osid", path="/p", cwd="/tmp/project",
-                              title="t", updated=5.0)
-            with mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
-                    mock.patch.object(omp, "newest_in", return_value=session) as newest, \
-                    mock.patch.object(omp, "activity", return_value="idle"):
-                got = self.inspect(["omp", "--model", "qwen3.8-max"], temporary)
-            newest.assert_called_once_with("/tmp/project", after=4.0)
-            self.assertEqual((got.activity, got.coding.session_id), ("idle", "osid"))
+    def test_the_removed_grok_and_omp_heuristics_are_never_consulted(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(grok, "active", side_effect=AssertionError("grok registry")), \
+                mock.patch.object(omp, "newest_in", side_effect=AssertionError("omp newest_in")), \
+                mock.patch.object(omp, "session_for_pid", side_effect=AssertionError("omp pid")):
+            for argv in (["grok"], ["omp"]):
+                self.assertEqual(self.inspect(argv, temporary).activity, "agent")
 
-    def test_two_omp_panes_in_one_directory_do_not_share_the_newest_session(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
-                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}), \
-                    mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
-                    mock.patch.object(omp, "session_for_pid", return_value=None), \
-                    mock.patch.object(omp, "newest_in") as newest:
-                got = pane_center.Inspector(proc_root=temporary).snapshot(
-                    two_agent_tree(["omp"], ["omp"]))
-            newest.assert_not_called()
-            self.assertEqual([item.activity for item in got.panes], ["agent", "agent"])
+    def test_claude_beside_any_other_agent_is_agent_in_either_order(self):
+        for other in (["omp", "-p", "review"], ["kimi"], ["grok"], ["/opt/vendor/codex"]):
+            for order in (0, 1):
+                procs = [{"pid": 91, "cmdline": ["claude"], "cwd": "/tmp/project"},
+                         {"pid": 92, "cmdline": other, "cwd": "/tmp/project"}]
+                procs = procs if order == 0 else procs[::-1]
+                nested = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{
+                    "id": 9, "pid": 70, "title": "claude", "cwd": "/tmp/project", "foreground_processes": procs}]}]}])
+                with tempfile.TemporaryDirectory() as temporary, \
+                        mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                        mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={
+                            91: ("claude-sid", {"status": "busy", "cwd": "/tmp/project"})}):
+                    got = pane_center.Inspector(proc_root=temporary).snapshot(nested).panes[0]
+                self.assertEqual(got.activity, "agent", (other, order))
 
-    def test_a_fresh_omp_breadcrumb_never_falls_back_to_another_session(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
-                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}), \
-                    mock.patch.object(pane_center.liveness, "start_time", return_value=4.0), \
-                    mock.patch.object(omp, "session_for_pid", return_value=None), \
-                    mock.patch.object(omp, "has_terminal_marker", return_value=True), \
-                    mock.patch.object(omp, "newest_in") as newest:
-                got = self.inspect(["omp", "--model", "qwen3.8-max"], temporary)
-            newest.assert_not_called()
-            self.assertEqual(got.activity, "agent")
+    def test_an_unknown_provider_session_is_agent_whatever_its_status(self):
+        pane = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{"id": 9, "pid": 70, "cwd": "/x"}]}]}]).panes[0]
+        for provider in ("unrecognized", "", "CLAUDE", "grok", "omp", "kimi"):
+            for status in ("idle", "working", "waiting", "busy"):
+                session = Session(provider=provider, session_id="s", path="", cwd="/x", title="", updated=0,
+                                  state="live", live_status=status)
+                self.assertEqual(pane_center._activity(session, pane), "agent", (provider, status))
 
-    def test_outer_claude_owns_a_pane_with_an_omp_child(self):
+    def test_a_claude_pane_still_reads_its_state(self):
         nested = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{
             "id": 9, "pid": 70, "title": "claude", "cwd": "/tmp/project",
-            "foreground_processes": [
-                {"pid": 91, "cmdline": ["claude"], "cwd": "/tmp/project"},
-                {"pid": 92, "cmdline": ["omp", "-p", "review"],
-                 "cwd": "/tmp/project"},
-            ],
-        }]}]}])
-        with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
-                    mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={
-                        91: ("claude-sid", {"status": "busy", "cwd": "/tmp/project"})
-                    }), mock.patch.object(omp, "newest_in") as newest:
-                got = pane_center.Inspector(proc_root=temporary).snapshot(nested).panes[0]
-            newest.assert_not_called()
-            self.assertEqual((got.coding.provider, got.activity), ("claude", "working"))
-
-    def test_without_a_session_record_the_pane_is_only_an_agent(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.object(grok, "active", return_value={}), \
-                    mock.patch.object(pane_center.liveness, "start_time", return_value=0.0), \
-                    mock.patch.object(omp, "newest_in") as newest:
-                self.assertEqual(self.inspect(["grok"], temporary).activity, "agent")
-                self.assertEqual(self.inspect(["omp"], temporary).activity, "agent")
-            newest.assert_not_called()
+            "foreground_processes": [{"pid": 91, "cmdline": ["claude"], "cwd": "/tmp/project"}]}]}]}])
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(pane_center, "_broker_statuses", return_value=({}, False, "")), \
+                mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={
+                    91: ("claude-sid", {"status": "busy", "cwd": "/tmp/project"})}):
+            got = pane_center.Inspector(proc_root=temporary).snapshot(nested).panes[0]
+        self.assertEqual((got.coding.provider, got.activity), ("claude", "working"))
 
 
 class SnapshotTests(unittest.TestCase):

@@ -109,38 +109,95 @@ def _scalar_ids(payload: dict, *names: str):
     return tuple(found)
 
 
-def _classify(record: dict):
-    """One record as (kind, payload, event): `event` is the event type of an `event_msg`.
+# What a rollout is known to hold. A record newer than the newest turn boundary that is none of these is
+# not understood, so the state is unknown rather than the older boundary.
+_KNOWN_KINDS = frozenset({
+    "session_meta", "event_msg", "response_item", "turn_context", "compacted", "world_state",
+    "token_usage_record", "inter_agent_communication_metadata",
+})
+_NEUTRAL_EVENTS = frozenset({
+    "user_message", "agent_message", "agent_message_delta", "agent_message_content_delta",
+    "agent_reasoning", "agent_reasoning_delta", "agent_reasoning_raw_content",
+    "agent_reasoning_raw_content_delta", "agent_reasoning_section_break", "reasoning_content_delta",
+    "token_count", "item_started", "item_completed", "thread_settings_applied", "context_compacted",
+    "thread_rolled_back", "turn_diff", "plan_update", "plan_delta", "background_event", "stream_error",
+    "error", "warning", "web_search_begin", "web_search_end", "mcp_tool_call_begin", "mcp_tool_call_end",
+    "exec_command_output_delta", "terminal_interaction", "view_image_tool_call", "entered_review_mode",
+    "exited_review_mode", "session_configured", "shutdown_complete", "undo_started", "undo_completed",
+    "patch_apply_updated", "dynamic_tool_call_request", "dynamic_tool_call_response",
+    "collab_agent_spawn_begin", "collab_agent_spawn_end", "collab_agent_interaction_begin",
+    "collab_agent_interaction_end", "collab_waiting_begin", "collab_waiting_end", "collab_close_begin",
+    "collab_close_end", "collab_resume_begin", "collab_resume_end", "mcp_startup_update",
+    "mcp_startup_complete", "deprecation_notice", "raw_response_item",
+})
+_NEUTRAL_RESPONSE = frozenset({
+    "message", "reasoning", "function_call", "function_call_output", "custom_tool_call",
+    "custom_tool_call_output", "local_shell_call", "web_search_call", "agent_message",
+    "ghost_snapshot", "compaction", "tool_search_call", "tool_search_output", "image_generation_call",
+})
 
-    Returns None for a record whose structure a state could depend on but is not valid: a `type` that
-    is not a string, or an `event_msg` whose payload is not an object or whose `type` is not a string.
+
+def _strict(record) -> tuple[str, dict, str] | None:
+    """(kind, payload, event) of a record newer than the turn boundary, or None if it is not understood.
+
+    Not understood: not an object, a `type` that is not a string or is unknown, a payload that is not
+    an object, an `event_msg` or `response_item` of an unknown type.
     """
+    if not isinstance(record, dict):
+        return None
     kind = record.get("type")
-    if not isinstance(kind, str):
-        return None
     payload = record.get("payload")
-    if kind != "event_msg":
-        return kind, payload if isinstance(payload, dict) else {}, ""
-    if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
+    if not isinstance(kind, str) or kind not in _KNOWN_KINDS or not isinstance(payload, dict):
         return None
-    return kind, payload, payload["type"]
+    if kind == "event_msg":
+        event = payload.get("type")
+        known = (_TURN_STARTED | _TURN_COMPLETE | _APPROVAL_REQUESTED | _APPROVAL_RESOLVED_BY_ID
+                 | _NEUTRAL_EVENTS)
+        if not isinstance(event, str) or event not in known:
+            return None
+        return kind, payload, event
+    if kind == "response_item":
+        inner = payload.get("type")
+        if not isinstance(inner, str) or inner not in _NEUTRAL_RESPONSE:
+            return None
+    return kind, payload, ""
 
 
-def _pending(events) -> str:
-    """The approval kind still waiting after these events, oldest first; "" if none.
+def _lenient(record: dict) -> tuple[str, dict, str]:
+    """The same split for an older record, where only turn boundaries and display fields matter."""
+    kind = record.get("type")
+    payload = record.get("payload")
+    kind = kind if isinstance(kind, str) else ""
+    payload = payload if isinstance(payload, dict) else {}
+    event = payload.get("type") if kind == "event_msg" else ""
+    return kind, payload, event if isinstance(event, str) else ""
 
-    A request is resolved only by a LATER command or patch event carrying its own call or approval id;
-    a request without an id is never resolved by one. A repeated request after its resolution waits again.
+
+def _pending(events, open_turn: str):
+    """(approval label still waiting or "", uncertain) after these events, oldest first.
+
+    A request is resolved only by a LATER command or patch event that shares one of its call or
+    approval ids; ids are compared on both sides. A resolution whose turn id differs from its request's,
+    or an approval of another turn than the open one, cannot be attributed: uncertain.
     """
-    waiting: list[tuple[tuple[str, ...], str]] = []
-    for role, ids, label in events:
+    waiting: list[tuple[tuple[str, ...], str, str]] = []
+    for role, ids, label, turn in events:
+        if turn and open_turn and turn != open_turn:
+            return "", True
         if role == "request":
-            waiting.append((ids, label))
-        elif ids:
-            waiting = [item for item in waiting if not set(ids) & set(item[0])]
+            waiting.append((ids, label, turn))
+            continue
+        kept = []
+        for item in waiting:
+            if set(ids) & set(item[0]):
+                if turn and item[2] and turn != item[2]:
+                    return "", True
+                continue
+            kept.append(item)
+        waiting = kept
     if not waiting:
-        return ""
-    return "command approval" if waiting[-1][1] == "exec_approval_request" else "file-change approval"
+        return "", False
+    return ("command approval" if waiting[-1][1] == "exec_approval_request" else "file-change approval"), False
 
 
 def _inspect(
@@ -152,65 +209,78 @@ def _inspect(
 
     The state is only as certain as the evidence read, and anything doubtful makes it `uncertain`
     (the caller reports unknown), never an older boundary:
-    - an unreadable, torn or non-object line, or an `event_msg` whose payload or type is not valid,
-      or an id that is not an id, newer than the newest turn boundary;
-    - a line or tail beyond the byte, line or time limits before a boundary is settled;
-    - a turn end whose own start is not the nearest earlier start (interleaved or unmatched turn ids),
-      or is not found.
-    Approvals are matched in order (`_pending`), inside the turn that is still open.
+    - any record newer than the newest turn boundary that is unreadable, not an object, or not
+      understood (`_strict`), or carries an id that is not an id;
+    - a line or tail beyond the byte, line or time limits before the boundary is settled;
+    - a turn end whose own start is not the nearest earlier start (interleaved or unmatched turn ids), or
+      that is not found; a start whose previous boundary is another start (overlapping open turns);
+    - approvals of another turn than the open one, or resolved by another turn's event.
+    Approvals are matched in order and by id (`_pending`), inside the turn that is still open.
     """
     cwd = prompt = agent_message = ""
     uncertain = False
-    first = True
     newest = ""                 # the newest turn boundary event
+    first_boundary = ""         # the same, believed without any check: for the recovery tool's cut-off flag
     newest_turn = ""
     settled = False             # the newest boundary is settled (a start, or an end with its own start)
-    tail: list[tuple[str, tuple[str, ...], str]] = []      # approval events newer than the boundary, newest first
+    need_previous = False       # a settled turn start is still waiting for its previous boundary
+    tail: list[tuple[str, tuple[str, ...], str, str]] = []   # approval events newer than the boundary, newest first
     for raw in jsonl.bounded_reverse_lines(
             path, max_bytes=MAX_TAIL_BYTES, max_line=MAX_LINE_BYTES, max_seconds=MAX_TAIL_SECONDS):
         if raw is None:         # a line or the rest of the tail was not read
-            if not settled:
+            if not settled or need_previous:
                 uncertain = True
-            first = False
+            need_previous = False
+            if settled:
+                break
             continue
         record = jsonl.load(raw)
-        classified = _classify(record) if record is not None else None
-        if classified is None:
-            if not settled and (record is not None or first or any(marker in raw for marker in _MARKERS)):
+        if not settled:
+            classified = _strict(record)
+            if classified is None:
                 uncertain = True
-            first = False
+                continue
+        elif record is None:
+            if need_previous and any(marker in raw for marker in _MARKERS):
+                uncertain, need_previous = True, False
             continue
-        first = False
+        else:
+            classified = _lenient(record)
         kind, payload, event = classified
         if kind == "turn_context" and not cwd:
             value = payload.get("cwd")
             if isinstance(value, str) and value:
                 cwd = value
         elif kind == "event_msg":
+            if not first_boundary and event in (_TURN_STARTED | _TURN_COMPLETE):
+                first_boundary = event
             turn = _scalar_ids(payload, "turn_id")
-            if turn is _INVALID:
-                if not settled:
-                    uncertain = True
-                turn = ()
-            turn_id = turn[0] if turn else ""
-            if not settled:
+            turn_id = turn[0] if turn and turn is not _INVALID else ""
+            if turn is _INVALID and not settled:
+                uncertain = True
+            if need_previous:
+                if event in _TURN_STARTED:
+                    uncertain, need_previous = True, False        # overlapping open turns
+                elif event in _TURN_COMPLETE:
+                    need_previous = False
+            elif not settled:
                 if event in _APPROVAL_REQUESTED and not newest:
                     ids = _scalar_ids(payload, "call_id", "approval_id")
                     if ids is _INVALID:
                         uncertain = True
                     else:
-                        tail.append(("request", ids, event))
+                        tail.append(("request", ids, event, turn_id))
                 elif event in _APPROVAL_RESOLVED_BY_ID and not newest:
-                    ids = _scalar_ids(payload, "call_id")
+                    ids = _scalar_ids(payload, "call_id", "approval_id")
                     if ids is _INVALID:
                         uncertain = True
                     else:
-                        tail.append(("resolve", ids, event))
+                        tail.append(("resolve", ids, event, turn_id))
                 elif event in _TURN_STARTED:
                     if not newest:
-                        newest, newest_turn, settled = event, turn_id, True
+                        newest, newest_turn, settled, need_previous = event, turn_id, True, True
                     elif _same_turn(newest_turn, turn_id):
-                        settled = True
+                        settled, need_previous = True, True
                     else:
                         uncertain, settled = True, True
                 elif event in _TURN_COMPLETE:
@@ -228,21 +298,23 @@ def _inspect(
                 prompt = _operator_message(payload.get("content"))
             elif not agent_message and role == "assistant":
                 agent_message = _message_text(payload.get("content"))
-        if (settled and cwd and prompt
+        if (settled and not need_previous and cwd and prompt
                 and (agent_message or not include_agent_message)):
             break
     if newest and not settled:
         uncertain = True          # an end with no start found: nothing says which turn it ended
     pending_tool = ""
+    if not uncertain and newest in _TURN_STARTED:
+        pending_tool, doubtful = _pending(reversed(tail), newest_turn)
+        uncertain = doubtful
     if uncertain or not newest:
         newest, pending_tool = "", ""
-    elif newest in _TURN_STARTED:
-        pending_tool = _pending(reversed(tail))
     return {
         "cwd": cwd,
         "prompt": prompt,
         "agent_message": agent_message,
         "turn_event": newest,
+        "boundary": first_boundary,
         "pending_tool": pending_tool,
         "uncertain": uncertain,
     }
@@ -309,7 +381,7 @@ def _session_record(
     state = (
         "invalid" if not session_id else
         "live" if owners else
-        "cut-off" if event in _TURN_STARTED else
+        "cut-off" if str(details["boundary"]) in _TURN_STARTED else
         "idle"
     )
     live_status = (

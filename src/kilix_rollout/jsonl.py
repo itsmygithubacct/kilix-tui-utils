@@ -17,8 +17,8 @@ def load(raw: bytes) -> dict | None:
     """Parse one line, returning None for anything that is not an object."""
     try:
         value = json.loads(raw.decode("utf-8", errors="replace"))
-    except (ValueError, UnicodeDecodeError):
-        return None
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None             # includes JSON nested deeper than the decoder allows
     return value if isinstance(value, dict) else None
 
 
@@ -49,6 +49,7 @@ def reverse_lines(path: str, *, chunk: int = 65536) -> Iterator[bytes]:
 TAIL_BYTES = 8 * 1024 * 1024
 LINE_BYTES = 1024 * 1024
 TAIL_SECONDS = 2.0
+HEAD_BYTES = 4 * 1024 * 1024        # bytes a head scan may read in all
 
 
 def bounded_reverse_lines(
@@ -113,20 +114,24 @@ def bounded_reverse_lines(
             yield remainder
 
 
-def head_records(path: str, limit: int = 64, *, max_line: int = LINE_BYTES) -> Iterator[dict]:
+def head_records(
+    path: str, limit: int = 64, *, max_line: int = LINE_BYTES, max_bytes: int = HEAD_BYTES,
+) -> Iterator[dict]:
     """Yield the first parsed records, for the metadata agents write up front.
 
-    A line longer than `max_line` ends the scan: the head is metadata, and nothing is assembled
-    from an arbitrarily large record.
+    A line longer than `max_line`, or more than `max_bytes` read in all, ends the scan: the head
+    is metadata, and nothing is assembled from an arbitrarily large record.
     """
     try:
         handle = open(path, "rb")
     except OSError:
         return
     with handle:
+        consumed = 0
         for _ in range(limit):
             raw = handle.readline(max_line + 1)
-            if not raw or (len(raw) > max_line and not raw.endswith(b"\n")):
+            consumed += len(raw)
+            if not raw or (len(raw) > max_line and not raw.endswith(b"\n")) or consumed > max_bytes:
                 return
             record = load(raw)
             if record is not None:
