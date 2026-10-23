@@ -101,7 +101,8 @@ def observed_activity(session_dir: str, *, after: float, now: float | None = Non
     now = time.time() if now is None else now
     kinds = {"turn_started", "turn_ended", "tool_started", "tool_completed",
              "first_token", "loop_started", "goal_planner_fired", "interjected",
-             "permission_requested", "permission_resolved", "permission_pending"}
+             "permission_requested", "permission_resolved", "permission_pending",
+             "phase_changed"}
     events = []
     newest_boundary = None
     newer_stamp = now
@@ -109,6 +110,11 @@ def observed_activity(session_dir: str, *, after: float, now: float | None = Non
         record = jsonl.load(raw, strict=True) if raw is not None else None
         if (record is None or not isinstance(record.get("type"), str)
                 or record["type"] not in kinds):
+            return "unknown"
+        # These observed model phases do not resolve approvals or end a turn.
+        # New phases remain unknown until their semantics have been checked.
+        if record["type"] == "phase_changed" and record.get("phase") not in (
+                "waiting_for_model", "streaming_text"):
             return "unknown"
         stamp = _timestamp(record.get("ts"))
         if not stamp or stamp > newer_stamp or stamp < after:

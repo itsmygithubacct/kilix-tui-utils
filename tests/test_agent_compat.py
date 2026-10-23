@@ -224,6 +224,24 @@ class Compatibility(unittest.TestCase):
             handle.write(json.dumps({'type': 'permission_requested', 'ts': stamp(START + 11)}) + '\n')
         self.assertEqual(self.snapshot('grok').panes[0].activity, 'waiting')
 
+    def test_grok_known_model_phases_keep_turn_and_permission_boundaries(self):
+        path, _, _ = self.grok()
+        def write(records):
+            path.write_text(''.join(json.dumps({**r, 'ts': stamp(START + 5 + i)}) + '\n'
+                                    for i, r in enumerate(records)))
+        start = {'type': 'turn_started'}
+        for phase in ('waiting_for_model', 'streaming_text'):
+            event = {'type': 'phase_changed', 'phase': phase}
+            write([start, event])
+            self.assertEqual(self.snapshot('grok').panes[0].activity, 'working')
+            write([start, {'type': 'permission_requested', 'request_id': 'a'}, event])
+            self.assertEqual(self.snapshot('grok').panes[0].activity, 'waiting')
+            write([start, event, {'type': 'turn_ended'}])
+            self.assertEqual(self.snapshot('grok').panes[0].activity, 'idle')
+        for phase in ('unknown', '', None, 1):
+            write([start, {'type': 'phase_changed', 'phase': phase}, {'type': 'turn_ended'}])
+            self.assertEqual(self.snapshot('grok').panes[0].activity, 'agent')
+
     def test_grok_duplicate_stale_missing_or_changed_registry_is_unknown(self):
         path, registry, row = self.grok()
         for rows in ([row, row], [{**row, 'opened_at': stamp(START - 1)}],
