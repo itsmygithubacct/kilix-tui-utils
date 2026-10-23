@@ -167,8 +167,8 @@ def main(argv: list[str] | None = None) -> int:
     start = next((a for a in argv if not a.startswith("-")), None)
     state = State(start)
     if path := app.screenshot_argv(argv):
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(app.render_to_text(render, state) + "\n")
+        with open(path, "w", encoding="utf-8") as output:
+            output.write(app.render_to_text(render, state) + "\n")
         return 0
     return app.run(render, state, handle=handle)
 
