@@ -9,15 +9,30 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Iterator
 
 
-def load(raw: bytes) -> dict | None:
-    """Parse one line, returning None for anything that is not an object."""
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def load(raw: bytes, *, strict: bool = False) -> dict | None:
+    """Parse one line, returning None for anything that is not an object.
+
+    By default invalid UTF-8 is replaced (display text stays readable). With `strict` it is refused:
+    a record that contributes to a state must decode exactly, never through a lossy repair.
+    """
     try:
-        value = json.loads(raw.decode("utf-8", errors="replace"))
-    except (ValueError, UnicodeDecodeError):
-        return None
+        value = json.loads(raw.decode("utf-8", errors="strict" if strict else "replace"),
+                           object_pairs_hook=_unique_object if strict else None)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None             # includes JSON nested deeper than the decoder allows
     return value if isinstance(value, dict) else None
 
 
@@ -44,17 +59,115 @@ def reverse_lines(path: str, *, chunk: int = 65536) -> Iterator[bytes]:
             yield remainder
 
 
-def head_records(path: str, limit: int = 64) -> Iterator[dict]:
-    """Yield the first parsed records, for the metadata agents write up front."""
+# Hard limits for a bounded read: bytes read from the end, bytes held for one line, seconds.
+TAIL_BYTES = 8 * 1024 * 1024
+LINE_BYTES = 1024 * 1024
+TAIL_SECONDS = 2.0
+HEAD_BYTES = 4 * 1024 * 1024        # bytes a head scan may read in all
+
+
+def _bounded_reverse_lines(
+    path: str,
+    *,
+    max_bytes: int = TAIL_BYTES,
+    max_line: int = LINE_BYTES,
+    max_seconds: float = TAIL_SECONDS,
+    chunk: int = 65536,
+) -> Iterator[bytes | None]:
+    """Yield non-empty lines newest first under hard limits; `None` marks what was not read.
+
+    At most `max_bytes` are read from the end of the file, never more than `max_line + chunk` bytes
+    are held for one line, and reading stops after `max_seconds`. A line longer than `max_line` is
+    never assembled: a `None` stands in for it and reading goes on past it. When the byte or time
+    budget ends before the start of the file, a final `None` is yielded and the generator stops, so
+    a caller can tell "the file ended" from "the rest was not read".
+    """
+    deadline = time.monotonic() + max_seconds
     try:
         handle = open(path, "rb")
     except OSError:
         return
     with handle:
-        for _, raw in zip(range(limit), handle):
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        consumed = 0
+        remainder = b""
+        skipping = False        # inside a line longer than max_line, discarding back to its start
+        while position > 0:
+            if consumed >= max_bytes or time.monotonic() >= deadline:
+                yield None
+                return
+            amount = min(chunk, position, max_bytes - consumed)
+            position -= amount
+            consumed += amount
+            handle.seek(position)
+            data = handle.read(amount)
+            if skipping:
+                segments = data.split(b"\n")
+                if len(segments) == 1:
+                    continue
+                skipping = False
+                data = b"\n".join(segments[:-1])        # the line's own start is dropped
+                parts = data.split(b"\n")
+                remainder = parts[0]
+                lines = parts[1:]
+            else:
+                parts = (data + remainder).split(b"\n")
+                remainder = parts[0]
+                lines = parts[1:]
+            for line in reversed(lines):
+                if len(line) > max_line:
+                    yield None
+                elif line.strip():
+                    yield line
+            if len(remainder) > max_line:
+                yield None
+                remainder = b""
+                skipping = True
+        if remainder.strip() and not skipping:
+            yield remainder
+
+
+def bounded_reverse_lines(path: str, **kwargs) -> Iterator[bytes | None]:
+    """A read failure is an evidence gap, just like exceeding a read bound."""
+    try:
+        yield from _bounded_reverse_lines(path, **kwargs)
+    except OSError:
+        yield None
+
+
+def head_records(
+    path: str, limit: int = 64, *, max_line: int = LINE_BYTES, max_bytes: int = HEAD_BYTES,
+) -> Iterator[dict]:
+    """Yield the first parsed records, for the metadata agents write up front.
+
+    Never more than `max_bytes` are read in all, and a line longer than `max_line` (or than what is
+    left of the budget) ends the scan: the head is metadata, and nothing is assembled from an
+    arbitrarily large record.
+    """
+    try:
+        handle = open(path, "rb")
+    except OSError:
+        return
+    with handle:
+        consumed = 0
+        for _ in range(limit):
+            allowed = min(max_line, max_bytes - consumed)
+            if allowed <= 0:
+                return
+            raw = handle.readline(allowed)
+            consumed += len(raw)
+            if not raw or (len(raw) >= allowed and not raw.endswith(b"\n")):
+                return                  # end of file, or a line the limits do not let us read whole
             record = load(raw)
             if record is not None:
                 yield record
+
+
+# The wider limits of a scan for display fields (not for a state): still bounded.
+SCAN_BYTES = 128 * 1024 * 1024
+SCAN_LINE = 16 * 1024 * 1024
+SCAN_SECONDS = 15.0
 
 
 def tail_records(path: str, limit: int | None = 200) -> Iterator[dict]:
@@ -65,7 +178,9 @@ def tail_records(path: str, limit: int | None = 200) -> Iterator[dict]:
     transcript.
     """
     seen = 0
-    for raw in reverse_lines(path):
+    for raw in bounded_reverse_lines(path, max_bytes=SCAN_BYTES, max_line=SCAN_LINE, max_seconds=SCAN_SECONDS):
+        if raw is None:
+            continue
         record = load(raw)
         if record is None:
             continue
@@ -89,7 +204,9 @@ def tail_records_matching(
     while a caller supplies every spelling it considers relevant.
     """
     seen = 0
-    for raw in reverse_lines(path):
+    for raw in bounded_reverse_lines(path, max_bytes=SCAN_BYTES, max_line=SCAN_LINE, max_seconds=SCAN_SECONDS):
+        if raw is None:
+            continue
         if needles and not any(needle in raw for needle in needles):
             continue
         record = load(raw)

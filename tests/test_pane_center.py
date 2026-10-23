@@ -198,7 +198,7 @@ class CodexStateTests(unittest.TestCase):
             self.assertEqual(resolved.live_status, "working")
             self.assertEqual(resolved.pending_tool, "")
 
-    def test_inspector_uses_only_the_rollout_opened_by_the_pane_pid(self):
+    def test_a_descriptor_without_process_identity_does_not_certify_a_pane(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             rollout = root / "sessions" / f"rollout-{CODEX_ID}.jsonl"
@@ -213,9 +213,7 @@ class CodexStateTests(unittest.TestCase):
             ):
                 got = pane_center.Inspector(
                     proc_root=str(root / "proc")).snapshot(tree())
-            self.assertEqual(got.panes[0].activity, "idle")
-            self.assertEqual(got.panes[0].doing, "real task")
-            self.assertEqual(got.panes[0].coding.session_id, CODEX_ID)
+            self.assertEqual(got.panes[0].activity, "agent")
 
 
 def agent_tree(argv: list[str], pid: int = 91) -> kitty_rc.Tree:
@@ -247,13 +245,13 @@ class GrokAndOmpStateTests(unittest.TestCase):
                 mock.patch.object(pane_center.Inspector, "_claude_by_pid", return_value={}):
             return pane_center.Inspector(proc_root=proc_root).snapshot(agent_tree(argv)).panes[0]
 
-    def test_a_live_grok_pane_reports_its_turn(self):
+    def test_grok_legacy_registry_alone_does_not_certify_a_pane(self):
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(grok, "active", return_value={"sid": (91, "/tmp/project")}), \
                     mock.patch.object(grok, "activity", side_effect=["idle", "working", "waiting"]):
                 for want in ("idle", "working", "waiting"):
                     got = self.inspect(["/home/u/.grok/bin/grok"], temporary)
-                    self.assertEqual((got.activity, got.coding.session_id), (want, "sid"))
+                    self.assertEqual((got.activity, got.coding.session_id), ("agent", "unknown"))
 
     def test_a_live_omp_pane_uses_the_newest_session_since_it_started(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -290,7 +288,7 @@ class GrokAndOmpStateTests(unittest.TestCase):
             newest.assert_not_called()
             self.assertEqual(got.activity, "agent")
 
-    def test_outer_claude_owns_a_pane_with_an_omp_child(self):
+    def test_mixed_claude_and_omp_pane_has_no_unambiguous_state(self):
         nested = kitty_rc.parse([{"id": 1, "tabs": [{"id": 2, "windows": [{
             "id": 9, "pid": 70, "title": "claude", "cwd": "/tmp/project",
             "foreground_processes": [
@@ -306,7 +304,7 @@ class GrokAndOmpStateTests(unittest.TestCase):
                     }), mock.patch.object(omp, "newest_in") as newest:
                 got = pane_center.Inspector(proc_root=temporary).snapshot(nested).panes[0]
             newest.assert_not_called()
-            self.assertEqual((got.coding.provider, got.activity), ("claude", "working"))
+            self.assertEqual((got.coding.provider, got.activity), ("claude", "agent"))
 
     def test_without_a_session_record_the_pane_is_only_an_agent(self):
         with tempfile.TemporaryDirectory() as temporary:

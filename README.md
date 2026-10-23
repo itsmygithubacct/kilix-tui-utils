@@ -381,6 +381,48 @@ The TUI offers only the narrow case — `n`, type a title, Enter creates one she
 pane in a new page. A four-pane office with per-pane directories carries more
 arguments than a one-line prompt can hold honestly, so it stays a scripted act.
 
+### Agent activity and tell/wait
+
+The pane `activity` is an observation of provider records, not certification that
+input is safe. JSON explicitly reports `activity_readiness_verified: false`.
+`idle` means an observed turn ended; it does not establish an empty composer,
+absence of a menu, or delivery of a previous message. Input acceptance likewise
+does not prove that the application received a prompt.
+
+Codex activity requires one unambiguous process with a matching live command
+line and start time, holding one writable rollout. The descriptor must still
+name the same inode, and the file and owner must remain unchanged across the
+read. A completion older than the process, conflicting owners, multiple open
+rollouts, malformed or unknown newer records, incomplete turn boundaries, or
+exceeded read limits leave the pane as `agent`. No directory, newest-file, or
+resume-argument fallback guesses the current session. Clients that open their
+rollout only briefly can therefore remain `agent` between writes.
+
+Grok activity uses the target process's own `GROK_HOME` (or its `HOME/.grok`).
+Exactly one registry row must name that process and session, with an opening
+time after the process started. Bounded, coherent events must follow that
+opening time. The registry, log and process are checked again after reading.
+Conflicts, missing opening times, stale completions and unreadable newer events
+leave the pane as `agent`. Completed turns retain the five-second settling delay.
+
+Claude activity uses its native process's own config directory, an exact
+`procStart` registry match, and repeated command-line, environment and registry
+checks. A mixed-agent pane or duplicate process identity is ambiguous. Its
+`idle` and `shell` statuses map to idle, `busy` to working, and `waiting` to
+waiting. Other statuses remain `agent`.
+
+`kilix panes wait PANE --for idle` still works for supported Codex/Grok
+observations; unknown state never satisfies it. A wait also refuses a changed
+broker session. `kilix panes tell` remains an explicit bounded input operation,
+not an automatic readiness check. Higher-level clients that gate tell on idle
+can use the retained states, but must still honor their delivery and composer
+checks. For an uncertain pane, use the host's broker-bound deferred delivery
+workflow and inspect its receipt; do not infer readiness from elapsed time.
+
+These checks reduce stale observations but cannot eliminate the interval
+between the last read and an action. They do not establish physical terminal,
+installed-client, or ISO acceptance.
+
 ## Recovering coding sessions
 
 `kilix-rollout-resume` exists because a coding agent's terminal and its

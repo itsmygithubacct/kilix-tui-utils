@@ -863,6 +863,7 @@ def _cmd_wait(ns: argparse.Namespace) -> int:
     inspector = pane_center.Inspector()
     started = time.monotonic()
     pane_id = 0
+    broker_session = ""
     last: pane_center.PaneInfo | None = None
     while True:
         snapshot = _live(inspector)
@@ -870,9 +871,12 @@ def _cmd_wait(ns: argparse.Namespace) -> int:
             last = snapshot.by_id(pane_id)
             if last is None:
                 raise ValueError(f"pane {pane_id} closed while waiting")
+            if last.pane.broker_session != broker_session:
+                raise ValueError(f"pane {pane_id} changed broker session while waiting")
         else:
             last = snapshot.resolve(ns.target)
             pane_id = last.pane.id
+            broker_session = last.pane.broker_session
         elapsed = time.monotonic() - started
         if last.activity == ns.wanted:
             result = {

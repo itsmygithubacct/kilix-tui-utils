@@ -68,6 +68,104 @@ def active(base: str = "", *, proc_root: str = "/proc") -> dict[str, tuple[int, 
             for pid, (_opened, _index, session_id, cwd) in by_pid.items()}
 
 
+def live_record(base: str, pid: int, *, proc_root: str = "/proc"):
+    """One unambiguous registry ownership row, opened during this process instance."""
+    raw = liveness.read_bounded(os.path.join(base, "active_sessions.json"), 1 << 20)
+    if raw is None:
+        return None
+    try:
+        rows = json.loads(raw.decode("utf-8"), object_pairs_hook=jsonl._unique_object)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    matches = [r for r in rows if isinstance(r, dict) and r.get("pid") == pid]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    sid, cwd = row.get("session_id"), row.get("cwd")
+    opened = _timestamp(row.get("opened_at"))
+    started = liveness.start_time(pid, proc_root=proc_root)
+    if (type(row.get("pid")) is not int or pid <= 0
+            or not isinstance(sid, str) or not sid or sid in {".", ".."}
+            or "/" in sid or "\\" in sid or "\0" in sid
+            or not isinstance(cwd, str) or not os.path.isabs(cwd)
+            or not started or opened < started or opened > time.time()
+            or sum(r.get("session_id") == sid for r in rows if isinstance(r, dict)) != 1):
+        return None
+    return sid, cwd, opened
+
+
+def observed_activity(session_dir: str, *, after: float, now: float | None = None) -> str:
+    """Conservative turn observation for a live pane; never skip unreadable newer data."""
+    now = time.time() if now is None else now
+    kinds = {"turn_started", "turn_ended", "tool_started", "tool_completed",
+             "first_token", "loop_started", "goal_planner_fired", "interjected",
+             "permission_requested", "permission_resolved", "permission_pending"}
+    events = []
+    newest_boundary = None
+    newer_stamp = now
+    for raw in jsonl.bounded_reverse_lines(os.path.join(session_dir, "events.jsonl")):
+        record = jsonl.load(raw, strict=True) if raw is not None else None
+        if (record is None or not isinstance(record.get("type"), str)
+                or record["type"] not in kinds):
+            return "unknown"
+        stamp = _timestamp(record.get("ts"))
+        if not stamp or stamp > newer_stamp or stamp < after:
+            return "unknown"
+        newer_stamp = stamp
+        turn = record.get("turn_id")
+        if "turn_id" in record and (type(turn) not in (str, int) or turn == ""):
+            return "unknown"
+        kind = record["type"]
+        events.append(record)
+        if kind in {"turn_started", "turn_ended"}:
+            if newest_boundary is None:
+                newest_boundary = record
+            elif newest_boundary["type"] == "turn_ended":
+                if kind != "turn_started":
+                    return "unknown"
+                left, right = newest_boundary.get("turn_id"), record.get("turn_id")
+                if left is not None or right is not None:
+                    if not isinstance(left, (str, int)) or type(left) is bool or left != right:
+                        return "unknown"
+                break
+            else:
+                if kind == "turn_started":
+                    return "unknown"
+                events.pop()
+                break
+    if not events or newest_boundary is None:
+        return "unknown"
+    if newest_boundary["type"] == "turn_ended":
+        if events[-1]["type"] != "turn_started":
+            return "unknown"
+        # Anything after an end except another complete turn is ambiguous.
+        if events[0]["type"] != "turn_ended":
+            return "unknown"
+        return "idle" if now - _timestamp(events[0]["ts"]) >= 5 else "working"
+    turn = newest_boundary.get("turn_id")
+    if any(event.get("turn_id") not in (None, turn) for event in events):
+        return "unknown"
+    pending = False
+    for event in reversed(events):
+        if event["type"] in {"permission_requested", "permission_pending"}:
+            pending = True
+        elif event["type"] == "permission_resolved":
+            turn = newest_boundary.get("turn_id")
+    if any(event.get("turn_id") not in (None, turn) for event in events):
+        return "unknown"
+    pending = False
+    if pending:
+        return "waiting"
+    latest = events[0]
+    if latest["type"] in {"permission_requested", "permission_pending"}:
+        return "waiting"
+    if latest["type"] == "tool_started" and latest.get("tool_name") == "ask_user_question":
+        return "waiting"
+    return "working"
+
+
 def activity(session_dir: str, *, now: float | None = None) -> str:
     """`working`, `waiting` or `idle` from the newest turn and tool events;
     `unknown` when the log says nothing yet."""
