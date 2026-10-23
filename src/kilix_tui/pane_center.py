@@ -494,6 +494,39 @@ class Inspector:
             return None
         return process
 
+    def _codex_owner(self, pane):
+        """One native writer, optionally behind its verified nonwriting Node launcher."""
+        possible = [p for p in pane.processes if _mentioned(p.argv)]
+        if len(possible) == 1:
+            process = self._single(pane, "codex")
+            identity = self._identity(process) if process is not None else None
+            return (process, (identity,)) if identity is not None else None
+        if len(possible) != 2 or any(
+                self._listed_pids.count(p.pid) != 1 or _mentioned(p.argv) != ["codex"]
+                for p in possible):
+            return None
+        native = [p for p in possible if p.argv and os.path.basename(p.argv[0]) == "codex"]
+        wrappers = [p for p in possible if len(p.argv) > 1
+                    and os.path.basename(p.argv[0]) == "node"
+                    and os.path.basename(p.argv[1]) == "codex"]
+        if len(native) != 1 or len(wrappers) != 1:
+            return None
+        child, wrapper = native[0], wrappers[0]
+        identities = tuple(self._identity(p) for p in (wrapper, child))
+        raw = liveness.read_bounded(os.path.join(self.proc_root, str(child.pid), "stat"),
+                                    liveness.MAX_PROC_BYTES)
+        if raw is None or any(identity is None or not identity[0].isascii()
+                              or not identity[0].isdigit() for identity in identities):
+            return None
+        fields = raw.rsplit(b")", 1)[-1].split()
+        if (len(fields) < 20 or fields[1] != str(wrapper.pid).encode()
+                or fields[19] != identities[1][0].encode()
+                or int(identities[0][0]) > int(identities[1][0])
+                or self._held(wrapper) != ()
+                or tuple(self._identity(p) for p in (wrapper, child)) != identities):
+            return None
+        return child, identities
+
     def _held(self, process):
         """Writable, nondeleted rollouts, with the descriptor and inode identities."""
         directory = os.path.join(self.proc_root, str(process.pid), "fd")
@@ -524,9 +557,10 @@ class Inspector:
             return None
 
     def _codex_for(self, pane: kitty_rc.Pane) -> Session | None:
-        process = self._single(pane, "codex")
-        if process is None:
+        owner = self._codex_owner(pane)
+        if owner is None:
             return None
+        process = owner[0]
         identity = self._identity(process)
         held = self._held(process)
         if identity is None or not held or len({row[0] for row in held}) != 1:
@@ -550,11 +584,11 @@ class Inspector:
         if (not details.get("boundary_time") or details["boundary_time"] < started
                 or details["boundary_time"] > time.time()
                 or before != _file_version(path) or self._identity(process) != identity
-                or self._held(process) != held):
+                or self._held(process) != held or self._codex_owner(pane) != owner):
             return None
         self._checks[pane.id] = lambda: (
             _file_version(path) == before and self._held(process) == held
-            and self._identity(process) == identity)
+            and self._identity(process) == identity and self._codex_owner(pane) == owner)
         return session
 
     def _grok_for(self, pane):
@@ -674,10 +708,10 @@ class Inspector:
         ambiguous_omp_cwds: frozenset[str] = frozenset(),
     ) -> Session | None:
         possible = [p for p in pane.processes if _mentioned(p.argv)]
-        if (len(possible) > 1 or any(self._listed_pids.count(p.pid) != 1 for p in possible)):
-            return _minimal_session(_process_agent(possible[0]), pane)
         if session := self._codex_for(pane):
             return session
+        if (len(possible) > 1 or any(self._listed_pids.count(p.pid) != 1 for p in possible)):
+            return _minimal_session(_process_agent(possible[0]), pane)
         for process in pane.processes:
             provider = _process_agent(process)
             if provider == "claude":

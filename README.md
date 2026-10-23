@@ -389,8 +389,12 @@ input is safe. JSON explicitly reports `activity_readiness_verified: false`.
 absence of a menu, or delivery of a previous message. Input acceptance likewise
 does not prove that the application received a prompt.
 
-Codex activity requires one unambiguous process with a matching live command
-line and start time, holding one writable rollout. The descriptor must still
+Codex activity requires one unambiguous writer with a matching live command
+line and start time, holding one writable rollout. A listed Node launcher and
+native child count as one owner only when live process records verify the
+direct parent/child relationship, both identities remain stable, neither PID
+is duplicated, and the launcher holds no writable rollout. The relationship
+is checked again after reading and at the end of the snapshot. The descriptor must still
 name the same inode, and the file and owner must remain unchanged across the
 read. A completion older than the process, conflicting owners, multiple open
 rollouts, malformed or unknown newer records, incomplete turn boundaries, or
@@ -403,7 +407,9 @@ Exactly one registry row must name that process and session, with an opening
 time after the process started. Bounded, coherent events must follow that
 opening time. The registry, log and process are checked again after reading.
 Conflicts, missing opening times, stale completions and unreadable newer events
-leave the pane as `agent`. Completed turns retain the five-second settling delay.
+leave the pane as `agent`. Pending permissions survive unrelated tool events;
+only coherent matching resolutions clear them. Completed turns retain the
+five-second settling delay.
 
 Claude activity uses its native process's own config directory, an exact
 `procStart` registry match, and repeated command-line, environment and registry

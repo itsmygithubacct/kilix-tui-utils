@@ -119,6 +119,81 @@ class Compatibility(unittest.TestCase):
         snapshot = self.inspector.snapshot(two_agent_tree(['codex'], ['codex']))
         self.assertEqual([item.activity for item in snapshot.panes], ['agent', 'agent'])
 
+    def wrapper_tree(self, *, parent=90, wrapper_start=START, reverse=False):
+        self.home.process(90, ['node', '/usr/local/bin/codex'], start=wrapper_start)
+        self.home.process(91, ['codex'], parent=parent)
+        tree = agent_tree(['codex'], pid=91)
+        child = tree.panes[0].processes[0]
+        wrapper = replace(child, pid=90, argv=('node', '/usr/local/bin/codex'))
+        processes = (child, wrapper) if reverse else (wrapper, child)
+        tree.pages[0].panes[0] = replace(tree.panes[0], processes=processes)
+        return tree
+
+    def test_verified_wrapper_child_accepts_either_listing_order(self):
+        self.codex()
+        for reverse in (False, True):
+            snapshot = self.inspector.snapshot(self.wrapper_tree(reverse=reverse))
+            self.assertEqual(snapshot.panes[0].activity, 'idle')
+            self.assertEqual(snapshot.panes[0].coding.pids, (91,))
+
+    def test_unrelated_or_recycled_wrapper_is_ambiguous(self):
+        self.codex()
+        for kwargs in ({'parent': 89}, {'wrapper_start': START + 1}):
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(self.inspector.snapshot(self.wrapper_tree(**kwargs)).panes[0].activity, 'agent')
+        tree = self.wrapper_tree()
+        (self.home.proc / '90/cmdline').write_bytes(b'node\0other-script\0')
+        self.assertEqual(self.inspector.snapshot(tree).panes[0].activity, 'agent')
+
+    def test_wrapper_must_not_write_a_rollout_or_be_listed_twice(self):
+        path = self.codex()
+        tree = self.wrapper_tree()
+        (self.home.proc / '90/fd/4').symlink_to(path)
+        (self.home.proc / '90/fdinfo').mkdir()
+        (self.home.proc / '90/fdinfo/4').write_text('flags:\t0100001\n')
+        self.assertEqual(self.inspector.snapshot(tree).panes[0].activity, 'agent')
+        (self.home.proc / '90/fd/4').unlink()
+        tree.pages[0].panes.append(replace(tree.panes[0], id=10, processes=(tree.panes[0].processes[0],)))
+        self.assertEqual([p.activity for p in self.inspector.snapshot(tree).panes], ['agent', 'agent'])
+
+    def test_wrapper_relationship_is_rechecked_after_read(self):
+        self.codex()
+        tree = self.wrapper_tree()
+        original = codex.session_from_path
+        def reparent(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.home.process(91, ['codex'], parent=1)
+            return result
+        with mock.patch.object(codex, 'session_from_path', side_effect=reparent):
+            self.assertEqual(self.inspector.snapshot(tree).panes[0].activity, 'agent')
+
+    def test_grok_pending_permissions_require_coherent_resolution(self):
+        path, _, _ = self.grok(events=())
+        cases = [
+            ([{'type': 'permission_requested'}, {'type': 'tool_completed'}], 'waiting'),
+            ([{'type': 'permission_requested'}, {'type': 'permission_pending'},
+              {'type': 'tool_completed'}, {'type': 'permission_resolved'}], 'working'),
+            ([{'type': 'permission_requested', 'request_id': 'a'},
+              {'type': 'permission_resolved', 'request_id': 'b'}], 'agent'),
+            ([{'type': 'permission_requested', 'request_id': 'a'},
+              {'type': 'permission_resolved'}], 'agent'),
+            ([{'type': 'permission_requested', 'request_id': 'a'},
+              {'type': 'permission_requested', 'request_id': 'b'},
+              {'type': 'permission_resolved', 'request_id': 'a'},
+              {'type': 'tool_completed'}], 'waiting'),
+            ([{'type': 'permission_requested'}, {'type': 'permission_requested'},
+              {'type': 'permission_resolved'}], 'agent'),
+            ([{'type': 'permission_resolved'}], 'agent'),
+            ([{'type': 'permission_requested', 'request_id': True}], 'agent'),
+            ([{'type': 'permission_requested', 'turn_id': 'other'}], 'agent'),
+        ]
+        for events, expected in cases:
+            with self.subTest(events=events):
+                records = [{'type': 'turn_started'}] + events
+                path.write_text(''.join(json.dumps({**r, 'ts': stamp(START + 5 + i)}) + '\n'
+                                        for i, r in enumerate(records)))
+                self.assertEqual(self.snapshot('grok').panes[0].activity, expected)
+
     def test_newer_malformed_or_user_event_never_reuses_idle(self):
         path = self.codex()
         original = path.read_bytes()

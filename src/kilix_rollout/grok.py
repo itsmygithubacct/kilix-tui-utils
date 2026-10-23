@@ -147,15 +147,26 @@ def observed_activity(session_dir: str, *, after: float, now: float | None = Non
     turn = newest_boundary.get("turn_id")
     if any(event.get("turn_id") not in (None, turn) for event in events):
         return "unknown"
-    pending = False
+    pending = set()
     for event in reversed(events):
-        if event["type"] in {"permission_requested", "permission_pending"}:
-            pending = True
-        elif event["type"] == "permission_resolved":
-            turn = newest_boundary.get("turn_id")
-    if any(event.get("turn_id") not in (None, turn) for event in events):
-        return "unknown"
-    pending = False
+        kind = event["type"]
+        if kind not in {"permission_requested", "permission_pending", "permission_resolved"}:
+            continue
+        identifiers = [event[key] for key in ("permission_id", "request_id", "call_id") if key in event]
+        if any(type(value) not in (str, int) or value == "" for value in identifiers):
+            return "unknown"
+        if len({str(value) for value in identifiers}) > 1:
+            return "unknown"
+        identifier = str(identifiers[0]) if identifiers else None
+        if kind != "permission_resolved":
+            if kind == "permission_requested" and identifier is None and None in pending:
+                return "unknown"
+            pending.add(identifier)
+        elif identifier in pending:
+            pending.remove(identifier)
+        else:
+            # An unmatched resolution cannot clear somebody else's approval.
+            return "unknown"
     if pending:
         return "waiting"
     latest = events[0]
