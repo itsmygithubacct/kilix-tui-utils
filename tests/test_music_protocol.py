@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from kilix_tui.music_protocol import MusicControl, control_parent, validate_reply
+from kilix_tui.music_protocol import MusicControl, control_parent, validate_reply, MAX_REPLY, MAX_REPLY_NODES
 
 
 PING = {"protocol": 2, "ok": True, "max_protocol": 2, "encodec": True, "live_sources": True}
@@ -121,7 +121,7 @@ class ReplyTests(unittest.TestCase):
                     b'{"protocol":2,"ok":true,"x":"\\ud800"}',
                     b'{"protocol":2,"ok":true,"x":"\\u0000"}',
                     b'{"protocol":2,"ok":true,"x":"\xff"}', encoded(dict(PING, title="x" * 8193)),
-                    encoded(dict(PING, extra=[0] * 32768)), b" " * (1024 * 1024 + 1)):
+                    encoded(dict(PING, extra=[0] * MAX_REPLY_NODES)), b" " * (MAX_REPLY + 1)):
             with self.subTest(prefix=raw[:90]):
                 with self.assertRaises(ValueError):
                     validate_reply(raw)
@@ -267,7 +267,7 @@ class ExchangeTests(unittest.TestCase):
             self.assertEqual([r["cmd"] for r in peer.requests], ["ping"])
 
     def test_truncated_oversized_and_extra_reply_refuse(self):
-        for body in (encoded(PING), b" " * (1024 * 1024 + 1), encoded(PING) + b"\n{}\n"):
+        for body in (encoded(PING), b" " * (MAX_REPLY + 1), encoded(PING) + b"\n{}\n"):
             with self.subTest(size=len(body)):
                 with Peer(lambda request, client: client.sendall(body)) as peer:
                     control = MusicControl(peer.path)

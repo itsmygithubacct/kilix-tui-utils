@@ -10,7 +10,8 @@ import threading
 import time
 
 PROTOCOL_VERSION = 2
-MAX_REPLY = 1024 * 1024
+MAX_REPLY = 32 * 1024 * 1024
+MAX_REPLY_NODES = 262144  # Bounded metadata snapshots for large music libraries.
 CONTROL_TIMEOUT = 5.0
 
 
@@ -100,7 +101,7 @@ def validate_reply(data: bytes) -> dict:
     while stack:
         value, depth = stack.pop()
         nodes += 1
-        if depth > 16 or nodes > 32768:
+        if depth > 16 or nodes > MAX_REPLY_NODES:
             raise ValueError("reply structure is too large")
         if isinstance(value, dict):
             stack.extend((v, depth + 1) for v in value.values())
@@ -121,13 +122,13 @@ def validate_reply(data: bytes) -> dict:
         if key in reply and not isinstance(reply[key], str):
             raise ValueError("wrongly typed reply text")
     for key in ("shuffle", "live", "ready", "seekable", "model_ready", "buffering", "ended", "degraded",
-                "wire_valid", "reconnect_required", "source_error_recoverable", "error_recoverable", "encodec", "live_sources"):
+                "wire_valid", "reconnect_required", "source_error_recoverable", "error_recoverable", "encodec", "live_sources", "shared_playback"):
         if key in reply and type(reply[key]) is not bool:
             raise ValueError("wrongly typed reply boolean")
     for key, low, high in (("index", -1, 2147483647), ("count", 0, 2147483647), ("volume", 0, 100),
                            ("repeat", 0, 2), ("profile", 0, 2), ("sample_rate", 0, 384000),
                            ("channels", 0, 64), ("bitrate", 0, 2147483647), ("threads", 0, 2),
-                           ("source_error_code", 0, 9), ("max_protocol", 1, 2)):
+                           ("source_error_code", 0, 9), ("max_protocol", 1, 2), ("queue_revision", 0, 9223372036854775807)):
         if key in reply and (type(reply[key]) is not int or not low <= reply[key] <= high):
             raise ValueError("invalid integer reply field")
     for key in ("pos", "len"):
@@ -290,6 +291,8 @@ class MusicControl:
                 if reply.get("max_protocol") != 2 or type(reply.get("encodec")) is not bool or type(reply.get("live_sources")) is not bool:
                     raise ValueError("incomplete version-2 capability reply")
                 capabilities = {key: reply[key] for key in ("encodec", "live_sources")}
+                if "shared_playback" in reply:
+                    capabilities["shared_playback"] = reply["shared_playback"]
             with self._connection_lock:
                 self._check_active(deadline)
                 self.identity = identity

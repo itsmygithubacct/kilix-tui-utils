@@ -230,6 +230,7 @@ class Backend(MusicControl):
         super().__init__(path or socket_path())
         self._owned: subprocess.Popen | None = None
         self.selection = {}
+        self._shared_child: subprocess.Popen | None = None
 
     def installed(self) -> bool:
         # Rendering reads only the last explicit worker lookup.
@@ -309,6 +310,8 @@ class Backend(MusicControl):
                         break
                     if (self._owned is child and child.poll() is None
                             and self.identity and self.identity[-1] == child.pid):
+                        if self.capabilities.get("shared_playback"):
+                            self._shared_child = child
                         return True
                     self.error = "another backend replaced the startup endpoint"
                     break
@@ -319,9 +322,16 @@ class Backend(MusicControl):
         return False
 
     def close(self) -> None:
-        """Never send quit or a signal to an attached, pre-existing backend."""
+        """Leave a negotiated shared service running; cancel unfinished startup."""
         identity, version = self._close_control()
-        self._stop_owned(identity=identity, version=version)
+        if self._shared_child is not None and self._owned is self._shared_child:
+            # Successful protocol negotiation transfers lifetime to the session.
+            # Cancellation before that handoff still tears down the owned child.
+            child = self._owned
+            self._owned = self._shared_child = None
+            threading.Thread(target=child.wait, daemon=True).start()
+        else:
+            self._stop_owned(identity=identity, version=version)
 
     def _stop_owned(self, *, identity=None, version=None) -> None:
         child = self._owned
@@ -370,6 +380,7 @@ class State:
         self.backend = Backend()
         self.status: dict = {}
         self.playlist: list[str] = []
+        self.playlist_revision: int | None = None
         self.section = 0            # 0 Now playing, 1 Playlist
         self.selected = 0
         self.phase = ""             # "", "installing", "starting"
@@ -407,12 +418,14 @@ class State:
             self.status = reply
 
     def refresh(self) -> None:
-        self.status = self.backend.command("state") or {}
+        shared = getattr(self.backend, "capabilities", {}).get("shared_playback", False)
+        self.status = self.backend.command("snapshot" if shared else "state") or {}
         if not self.status or self.status.get("ok") is False:
             self.message = safe_text(self.backend.error or str(self.status.get("error") or "player unavailable"))
             self.status = {}; self.playlist = []
             return
-        listing = self.backend.command("playlist") or {}
+        listing = self.status if shared else (self.backend.command("playlist") or {})
+        self.playlist_revision = listing.get("queue_revision")
         self.playlist = [str(i) for i in listing.get("items", [])]
         if self.selected >= len(self.playlist):
             self.selected = max(0, len(self.playlist) - 1)
@@ -447,6 +460,9 @@ class State:
     # ── transport, as the backend defines it ────────────────────────────────
 
     def send(self, name: str, **fields: object) -> None:
+        # Capture the revision of the displayed rows before starting a worker.
+        if "index" in fields and self.playlist_revision is not None:
+            fields["queue_revision"] = self.playlist_revision
         def request():
             reply = self.backend.command(name, **fields)
             self.absorb(reply)
@@ -491,9 +507,9 @@ class State:
         self.send("volume", level=level)
 
     def add_path(self, raw: str) -> None:
-        path = os.path.expanduser(raw.strip())
-        if not path:
+        if not raw.strip():
             return
+        path = os.path.abspath(os.path.expanduser(raw.strip()))
         def add():
             reply = self.backend.command("add", path=path)
             self.absorb(reply)

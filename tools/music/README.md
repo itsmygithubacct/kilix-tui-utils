@@ -4,7 +4,8 @@ Music controls the shared Kilix Amp player. The desktop's Music entry opens a
 Kilix tab, using the ordinary terminal handoff when tabs are unavailable.
 It attaches to an existing healthy user backend, or starts a headless backend
 when none exists. If Amp is absent, the existing pinned Kilix installer runs
-off the UI thread. Closing Music stops only a backend that Music started;
+off the UI thread. Closing Music leaves a negotiated shared-playback service running. A legacy
+backend started by Music still exits with its controller;
 an attached player keeps running. A canceled or expired startup cannot publish
 a successful connection or peer identity after its reply arrives. State construction, imports and rendering
 perform no player lookup, setup or process launch.
@@ -98,3 +99,12 @@ python3 tests/music_amp_integration.py --help
 The music suites exercise real Unix peers, fragmented/trickled/malformed
 replies, version negotiation, replacement and permission refusal, bounded
 shutdown, live presentation, asynchronous input and the shared tab route.
+
+Shared-playback Amp advertises `shared_playback:true` during protocol-2
+negotiation. Startup cancellation still stops an owned child until its exact
+PID has completed that handshake. After handoff, Amp GUI and Music share the
+queue and settings, and either can close without stopping the session. Music
+uses atomic `snapshot` replies and sends the displayed playlist revision with
+an indexed Play command, preventing a concurrent reorder from selecting the
+wrong song. Paths added from Music are absolute. The bounded reply reader
+accepts up to 32 MiB and 262,144 JSON values for large metadata snapshots.

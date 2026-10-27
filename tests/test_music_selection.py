@@ -39,6 +39,33 @@ class SelectedBackendTests(unittest.TestCase):
              'KILIX_CONTENT_ROOT':self.root,'PYTHONDONTWRITEBYTECODE':'1'}
         self.env=patch.dict(os.environ,env,clear=True);self.env.start();self.addCleanup(self.env.stop)
 
+    def test_shared_service_handoff_survives_client_close(self):
+        source = self.executable.read_text().replace(
+            'reply = {"protocol": 1, "ok": request["protocol"] == 1}',
+            'reply = {"protocol": 2, "ok": True, "max_protocol": 2, '
+            '"encodec": False, "live_sources": False, "shared_playback": True}')
+        self.executable.write_text(source)
+        backend = music.Backend(str(self.base / 'shared'))
+        child = None
+        try:
+            self.assertTrue(backend.start(), backend.error)
+            child = backend._owned
+            backend.close()
+            self.assertIsNone(child.poll())
+            attached = music.Backend(backend.path)
+            try:
+                self.assertTrue(attached.start(), attached.error)
+                self.assertEqual(attached.identity[-1], child.pid)
+                self.assertTrue(attached.command('quit')['ok'])
+            finally:
+                attached.close()
+            child.wait(timeout=3)
+        finally:
+            backend.close()
+            if child is not None and child.poll() is None:
+                child.terminate()
+                child.wait(timeout=3)
+
     def test_path_and_development_executables_never_replace_catalog_selection(self):
         fake=self.base/'bin';fake.mkdir()
         (fake/'kilix-amp').write_text('#!/bin/sh\nexit 99\n');(fake/'kilix-amp').chmod(0o700)
@@ -160,7 +187,7 @@ class StartupAuthorityTests(unittest.TestCase):
         self.assertIn(old, source)
         self.executable.write_text(source.replace(old,
             'reply = {"protocol": 2, "ok": True, "max_protocol": 2, '
-            '"encodec": False, "live_sources": False}'))
+            '"encodec": False, "live_sources": False, "shared_playback": True}'))
         self.env = patch.dict(os.environ, {"HOME": str(self.base), "PATH": os.defpath,
             "KILIX_AMP": str(self.executable), "KILIX_CONTENT_ROOT": str(self.base / "apps"),
             "PYTHONDONTWRITEBYTECODE": "1"}, clear=True)
