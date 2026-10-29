@@ -5,6 +5,10 @@ each can reload one by ID, so a session whose window closed is still on disk.
 This lists all three together, hands the current Kilix tab over to the one you
 pick, and — because a picker is no use without the agent that owns the
 transcript — installs or updates the agents themselves.
+
+`log --pane PANE_ID` prints the log the program in that Kilix pane is writing:
+the Codex rollout, the Claude session, the Grok, Kimi, or omp log, the tmux-cli
+capture when the pane is a tmux client, or the Kilix transcript otherwise.
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ sys.path.insert(0, os.path.join(
 from kilix_tui import app, keys as keymap, shell  # noqa: E402
 from kilix_rollout import (  # noqa: E402
     claude, codex, config, installer, kimi, launch, liveness, manage, menu,
-    model, pacing, providers,
+    model, pacing, pane_log, providers,
 )
 from kilix_rollout.errors import (  # noqa: E402
     BackendError, ConflictError, NotFoundError, PacingError, ResumeError,
@@ -1206,6 +1210,7 @@ def _print_help() -> None:
         "\nCommands:\n"
         "  list|ls                 list saved sessions\n"
         "  show <id>               show one session in detail\n"
+        "  log --pane PANE_ID      print that Kilix pane's rollout log\n"
         "  resume <id>             hand this terminal to one agent\n"
         "  restore [id ...]        restore several sessions in detached tmux\n"
         "  doctor                  check transcripts, agents, tmux, and launchers\n"
@@ -1308,6 +1313,25 @@ def _cmd_uninstall_launcher(arguments: list[str], as_json: bool) -> int:
     return 0
 
 
+def _cmd_log(arguments: list[str], as_json: bool) -> int:
+    """Print the log file for one live Kilix pane."""
+    pane = _take_value(arguments, "--pane", default="")
+    if not pane:
+        raise UsageError(
+            "usage: kilix-rollout-resume log --pane PANE_ID [--json]")
+    if not pane.isdecimal():
+        raise UsageError(f"pane id must be a number, not {pane!r}")
+    if arguments:
+        raise UsageError(
+            "unexpected log argument(s): " + " ".join(arguments))
+    found = pane_log.resolve(pane_log.load_live_pane(pane))
+    if as_json:
+        print(json.dumps(found.to_dict(), indent=2))
+    else:
+        print(found.path)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     arguments = list(argv)
     screenshot = _take_value(arguments, "--screenshot", default="")
@@ -1345,7 +1369,8 @@ def main(argv: list[str]) -> int:
     command = arguments.pop(0) if arguments else ""
     command_help = (arguments in (["-h"], ["--help"]) and command in {
         "list", "ls", "show", "resume", "restore", "doctor", "configure", "prune",
-        "status", "install", "update", "install-launcher", "uninstall-launcher", "sync-menu", "tui"})
+        "status", "install", "update", "install-launcher", "uninstall-launcher",
+        "sync-menu", "tui", "log"})
     if command in ("-h", "--help", "help") or command_help:
         _print_help()
         return 0
@@ -1354,6 +1379,8 @@ def main(argv: list[str]) -> int:
         version = version_file.read_text(encoding="utf-8").strip()
         print(f"kilix-rollout-resume {version}")
         return 0
+    if command == "log":
+        return _cmd_log(arguments, as_json)
     if command == "status":
         if arguments:
             raise RuntimeError("status takes no positional arguments")
