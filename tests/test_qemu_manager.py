@@ -724,7 +724,16 @@ class BackendTests(Sandbox):
         Path(vm.pidfile).parent.mkdir(parents=True, exist_ok=True)
         Path(vm.pidfile).write_text(f"{os.getpid()}\n")     # not a QEMU
         self.assertEqual(self.manager().pid_of(vm), 0)
+        # A live QEMU of this user, but another VM's: its argv opens none of
+        # Alpha's files, so the stale pidfile must not make Alpha live.
+        other = self.define("Other")
+        process = self.start_outside(other)
+        self.wait_for(lambda: self.qmp_up(other))
+        Path(vm.pidfile).write_text(f"{process.pid}\n")
+        self.assertEqual(self.manager().pid_of(other), process.pid)
+        self.assertEqual(self.manager().pid_of(vm), 0)
         self.assertEqual(self.manager().status(vm).state, "stopped")
+        self.assertTrue(self.manager().launch(vm).ok)
 
     def test_enter_on_a_running_vm_focuses_only_its_own_tab(self):
         alpha = self.define("Alpha")
@@ -805,6 +814,15 @@ class TuiTests(Sandbox):
         if state.pending:
             raise AssertionError("background operation did not complete")
 
+    def choose(self, state, ident: str) -> None:
+        """Move the action cursor to `ident` with Down, as a user would."""
+        for _ in range(len(state.actions) + 1):
+            if state.actions and state.actions[state.action_index].ident == ident:
+                return
+            tui.handle(258, state)
+        self.fail(f"no {ident} action offered: "
+                  f"{[action.ident for action in state.actions]}")
+
     def test_enter_launches_a_stopped_vm_then_focuses_it(self):
         vm = self.define("Alpha")
         state = tui.State(self.manager(), refresh_seconds=0)
@@ -857,8 +875,7 @@ class TuiTests(Sandbox):
             with self.subTest(ident):
                 tui.handle(ord("a"), state)
                 self.assertEqual(state.modal, "actions")
-                while state.actions[state.action_index].ident != ident:
-                    tui.handle(258, state)
+                self.choose(state, ident)
                 tui.handle(ENTER, state)
                 self.assertEqual(state.modal, "confirm")
                 self.assertTrue(state.confirm_action.danger)
@@ -872,8 +889,7 @@ class TuiTests(Sandbox):
                 self.assertIn("Cancelled", state.message)
                 self.assertNotIn(command, self.qmp_log())
         tui.handle(ord("a"), state)
-        while state.actions[state.action_index].ident != "poweroff":
-            tui.handle(258, state)
+        self.choose(state, "poweroff")
         tui.handle(ENTER, state)
         tui.handle(ord("y"), state)
         self.wait(state)
