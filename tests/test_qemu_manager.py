@@ -1635,6 +1635,19 @@ class LoaderOwnershipTests(Sandbox):
                     self.assertIn("none of them is loaded", line)
         self.assertEqual([vm.id for vm in store.load_all()[0]], ["first"])
 
+    def test_the_recorded_paths_count_even_where_the_argv_hides_them(self):
+        alpha = self.define("Alpha")
+        path = hand_clone(alpha, "bravo", "Bravo", share=())
+        data = json.loads(path.read_text())
+        data["pidfile"] = alpha.pidfile           # what status would read
+        data["argv"] += ["-name", alpha.pidfile]  # only to pass from_json
+        model.VmDefinition.from_json(data)
+        path.write_text(json.dumps(data))
+        machines, problems = store.load_all()
+        self.assertEqual([vm.id for vm in machines], ["alpha"])
+        self.assertIn(f"{alpha.pidfile}, the manager's pidfile for VM alpha",
+                      problems[0])
+
     def test_a_socket_two_vms_link_through_is_not_a_control_file(self):
         link = str(self.tmp / "link.sock")
         self.define("Left", "-chardev", f"socket,id=l,path={link},server=on")
