@@ -139,7 +139,42 @@ class ToolContractTests(unittest.TestCase):
         self.assertIn("Open full volume control", frame)
 
 
+def _installer_isolation(base: Path) -> dict[str, str]:
+    """Keep an installer run in a test out of the caller's Start menu.
+
+    install.sh writes XDG application entries under $XDG_DATA_HOME unless
+    KILIX_TUI_UTILS_SYNC_MENU=0; a test must not inherit either from the
+    shell that runs the suite.
+    """
+    return {"XDG_DATA_HOME": str(base / "data"),
+            "KILIX_TUI_UTILS_SYNC_MENU": "0"}
+
+
+INSTALLER_TESTS = (
+    "test_installer_refuses_a_symlinked_command_directory",
+    "test_installer_replaces_launcher_symlink_instead_of_following_it",
+    "test_installed_launcher_quotes_the_checkout_path_as_data",
+)
+
+
 class SafetyTests(unittest.TestCase):
+    def test_installer_tests_never_write_the_callers_start_menu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            callers = Path(directory) / "callers-data"
+            callers.mkdir()
+            result = subprocess.run(
+                [sys.executable, "-m", "unittest",
+                 *[f"test_tools.SafetyTests.{name}" for name in INSTALLER_TESTS]],
+                cwd=str(ROOT / "tests"),
+                env=dict(os.environ, XDG_DATA_HOME=str(callers),
+                         KILIX_TUI_UTILS_SYNC_MENU="1",
+                         PYTHONDONTWRITEBYTECODE="1"),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sorted(str(path.relative_to(callers))
+                                    for path in callers.rglob("*")), [])
+
     """Properties that make a tool safe to put one keystroke from a menu."""
 
     @staticmethod
@@ -285,6 +320,7 @@ class SafetyTests(unittest.TestCase):
                     os.environ,
                     HOME=str(base / "home"),
                     KILIX_TUI_UTILS_PREFIX=str(prefix),
+                    **_installer_isolation(base),
                 ),
                 capture_output=True,
                 text=True,
@@ -317,6 +353,7 @@ class SafetyTests(unittest.TestCase):
                     HOME=str(base / "home"),
                     KILIX_HOME=str(base / "missing-kilix"),
                     KILIX_TUI_UTILS_PREFIX=str(prefix),
+                    **_installer_isolation(base),
                 ),
                 capture_output=True,
                 text=True,
@@ -347,6 +384,7 @@ class SafetyTests(unittest.TestCase):
                     HOME=str(base / "home"),
                     KILIX_HOME=str(base / "missing-kilix"),
                     KILIX_TUI_UTILS_PREFIX=str(prefix),
+                    **_installer_isolation(base),
                 ),
                 capture_output=True,
                 text=True,
