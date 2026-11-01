@@ -36,6 +36,10 @@ LAUNCH_MARKER_SECONDS = 30.0
 _LOCK_START, _LOCK_LENGTH = 100, 200
 
 
+class NotReached(qmp.QmpError):
+    """A control path the manager must not read or connect to (model.reach)."""
+
+
 @dataclass(frozen=True)
 class OperationResult:
     ok: bool
@@ -196,10 +200,12 @@ class QemuManager:
         except OSError:
             return False
 
-    def pid_of(self, vm: VmDefinition) -> int:
-        """The live QEMU named by the pidfile, verified against its argv."""
+    def pid_of(self, vm: VmDefinition, where: str | None = None) -> int:
+        """The live QEMU named by the pidfile, verified against its argv.
+
+        `where` is the checked path to read it through (model.reach)."""
         try:
-            with open(vm.pidfile, encoding="ascii") as handle:
+            with open(where or vm.pidfile, encoding="ascii") as handle:
                 pid = int(handle.read().strip() or 0)
         except (OSError, ValueError):
             return 0
@@ -225,10 +231,33 @@ class QemuManager:
 
     def _launching(self, vm: VmDefinition) -> bool:
         try:
-            age = time.time() - os.stat(self._marker(vm)).st_mtime
-        except OSError:
+            with model.reach(self._marker(vm)) as where:
+                if where is None:
+                    return False
+                age = time.time() - os.stat(where).st_mtime
+        except OSError:                 # RuntimeDirError included
             return False
         return 0 <= age < LAUNCH_MARKER_SECONDS
+
+    def _read_pid(self, vm: VmDefinition, refused: list[str]) -> int:
+        try:
+            with model.reach(vm.pidfile) as where:
+                return self.pid_of(vm, where) if where else 0
+        except model.RuntimeDirError as error:
+            refused.append(str(error))
+            return 0
+
+    def _qmp(self, path: str, command: str, **options: Any) -> Any:
+        """qmp.execute through a checked path; NotReached when it may not."""
+        try:
+            with model.reach(path) as where:
+                if where is None:
+                    raise qmp.QmpError("no QMP socket")
+                if command == "query-status":
+                    return qmp.status(where, **options)
+                return qmp.execute(where, command, **options)
+        except model.RuntimeDirError as error:
+            raise NotReached(str(error)) from error
 
     def tree(self) -> tuple[Any | None, str]:
         """Kilix's page/pane tree, or None with the reason it is unknown."""
@@ -250,17 +279,17 @@ class QemuManager:
                               if row["id"] == vm.id), ""),
             tabs_known=tree is not None if tabs_known is None else tabs_known,
         )
-        # A runtime directory that is not safely this user's may hold
-        # planted pidfiles and sockets: nothing in it is read or trusted.
-        unsafe = model.runtime_dir_problem()
-        readable = (lambda path: not (unsafe and model.in_runtime_dir(path)))
-        result.pid = self.pid_of(vm) if readable(vm.pidfile) else 0
+        # Nothing named in a runtime directory that is not safely this
+        # user's is read, and no symlink there is followed (model.reach).
+        refused: list[str] = []
+        result.pid = self._read_pid(vm, refused)
         try:
-            if not readable(vm.qmp):
-                raise qmp.QmpError(f"not asked: {unsafe}")
-            result.state = qmp.status(vm.qmp, timeout=self.qmp_timeout)
+            result.state = self._qmp(vm.qmp, "query-status",
+                                     timeout=self.qmp_timeout)
             result.qmp_ok = True
         except qmp.QmpError as error:
+            if isinstance(error, NotReached):
+                refused.append(str(error))
             qmp_problem = str(error)
             result.disk_locked = self.locked_disk(vm)
             if result.pid:
@@ -269,13 +298,13 @@ class QemuManager:
             elif result.disk_locked:
                 result.state = "live"
                 result.detail = f"disk in use: {result.disk_locked}"
-            elif not unsafe and self._launching(vm):
+            elif self._launching(vm):
                 result.state = "starting"
             else:
                 result.state = "stopped"
-                if unsafe:
-                    result.detail = (f"{unsafe}; its pidfile and QMP socket "
-                                     "were not read")
+                if refused:
+                    result.detail = ("; ".join(dict.fromkeys(refused))
+                                     + "; not read")
         pane = find_pane(tree, vm.qmp)
         result.pane_id = int(getattr(pane, "id", 0) or 0) if pane else 0
         if result.state == "stopped" and result.pane_id:
@@ -399,6 +428,10 @@ class QemuManager:
         except model.RuntimeDirError as error:
             return OperationResult(
                 False, f"Not launching {vm.name}: {error}.", command)
+        for path in (vm.pidfile, vm.qmp):
+            if problem := model.reach_problem(path):
+                return OperationResult(
+                    False, f"Not launching {vm.name}: {problem}.", command)
         if not self._claim_launch(vm):
             return OperationResult(
                 False, f"{vm.name} is already being launched.", command)
@@ -413,7 +446,8 @@ class QemuManager:
             deadline = time.monotonic() + self.launch_wait_seconds
             while True:
                 try:
-                    state = qmp.status(vm.qmp, timeout=self.qmp_timeout)
+                    state = self._qmp(vm.qmp, "query-status",
+                                      timeout=self.qmp_timeout)
                 except qmp.QmpError:
                     state = ""
                 if state:
@@ -437,13 +471,12 @@ class QemuManager:
             raise ValueError(f"unsupported QMP action: {action}")
         command, label = QMP_ACTIONS[action]
         preview = self.preview(vm, action)
-        if (unsafe := model.runtime_dir_problem()) and model.in_runtime_dir(
-                vm.qmp):
-            return OperationResult(
-                False, f"Not sent to {vm.name}: {unsafe}.", preview)
         try:
-            qmp.execute(vm.qmp, command, timeout=max(self.qmp_timeout, 2.0),
-                        allow_hangup=(command == "quit"))
+            self._qmp(vm.qmp, command, timeout=max(self.qmp_timeout, 2.0),
+                      allow_hangup=(command == "quit"))
+        except NotReached as error:
+            return OperationResult(
+                False, f"Not sent to {vm.name}: {error}.", preview)
         except qmp.QmpError as error:
             return OperationResult(False, f"{vm.name}: {error}", preview)
         return OperationResult(True, f"{label} {vm.name}.", preview)

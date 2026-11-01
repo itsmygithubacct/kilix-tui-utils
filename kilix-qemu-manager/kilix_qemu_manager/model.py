@@ -33,13 +33,15 @@ option values that are themselves options this module acts on.
 """
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
 import re
 import stat
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 SCHEMA = 1
 ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,47}\Z")
@@ -132,6 +134,10 @@ def _runtime_dir_problem(path: str, *, missing_ok: bool) -> str:
         return "" if missing_ok else f"runtime directory {path} is missing"
     except OSError as error:
         return f"cannot use runtime directory {path}: {error}"
+    return _dir_info_problem(path, info)
+
+
+def _dir_info_problem(path: str, info: os.stat_result) -> str:
     if not stat.S_ISDIR(info.st_mode):
         return f"runtime directory {path} is not a directory (or is a symlink)"
     if info.st_uid != os.getuid():
@@ -145,16 +151,104 @@ def _runtime_dir_problem(path: str, *, missing_ok: bool) -> str:
 def canonical(path: str) -> str:
     """One spelling per file, for comparing control paths.
 
-    Symlinked directories (``/var/run`` for ``/run``), ``.`` and ``..``
-    all resolve, so two spellings of one socket or pidfile compare equal.
-    A missing final component is fine; it is kept as written.
+    Symlinks resolve, in the directories (``/var/run`` for ``/run``) and in
+    the final component, and so do ``.`` and ``..``, so two spellings of one
+    socket or pidfile compare equal. A missing final component is kept as
+    written. This is for telling whether two paths are one file (import and
+    the loader); where a name lives is :func:`in_runtime_dir`'s question.
     """
     return os.path.realpath(path)
 
 
 def in_runtime_dir(path: str) -> bool:
-    """True when `path` names a file directly in the manager's runtime dir."""
-    return (os.path.dirname(canonical(path)) == canonical(runtime_dir()))
+    """True when `path`, as written, names a file directly in the runtime dir.
+
+    The directory that contains the path is resolved; the final component
+    is not. A symlink in the runtime directory is therefore still "in" it,
+    wherever it points: what decides is where the name lives, because that
+    is who could have put it there.
+    """
+    head, tail = os.path.split(path)
+    if tail in ("", ".", ".."):         # names a directory, not a file in one
+        return os.path.dirname(canonical(path)) == canonical(runtime_dir())
+    return canonical(head or ".") == canonical(runtime_dir())
+
+
+@contextlib.contextmanager
+def reach(path: str) -> Iterator[str | None]:
+    """Where to open or connect to `path` for a status read or a control.
+
+    Yields the path to use, or None when there is nothing there to read.
+    Raises :class:`RuntimeDirError` with the reason when it must not be
+    used at all.
+
+    A path outside the runtime directory is the user's (or a build's) and is
+    yielded as written. A path in it (judged by :func:`in_runtime_dir`, so
+    by the directory that contains the name) is used only when:
+
+    * the directory, opened ``O_DIRECTORY|O_NOFOLLOW`` and checked by
+      ``fstat``, is a real directory of this user's, mode 0700 — the rule
+      :func:`ensure_runtime_dir` applies to writes. The file is then reached
+      through that open directory (``/proc/self/fd/N/<name>``), so the
+      directory cannot be swapped between the check and the use;
+    * the name is not a symlink. The manager makes none there (only
+      sockets, pidfiles and launch markers), so one it finds is not its own
+      and is never followed, even in a safe directory.
+
+    A path outside the runtime directory whose final component is a symlink
+    into it is refused for the same reason.
+    """
+    if not in_runtime_dir(path):
+        if in_runtime_dir(canonical(path)):
+            raise RuntimeDirError(
+                f"{path} is a symlink into the runtime directory "
+                f"{runtime_dir()}; the manager does not follow it")
+        yield path
+        return
+    directory = runtime_dir()
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                     | os.O_CLOEXEC)
+    except FileNotFoundError:
+        fd = -1                         # no directory: nothing to read
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise RuntimeDirError(f"runtime directory {directory} is not a "
+                                  "directory (or is a symlink)") from error
+        raise RuntimeDirError(f"cannot use runtime directory {directory}: "
+                              f"{error.strerror or error}") from error
+    if fd < 0:
+        yield None
+        return
+    try:
+        if problem := _dir_info_problem(directory, os.fstat(fd)):
+            raise RuntimeDirError(problem)
+        name = os.path.basename(path)
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        except OSError as error:
+            raise RuntimeDirError(f"cannot read {path}: "
+                                  f"{error.strerror or error}") from error
+        if info is not None and stat.S_ISLNK(info.st_mode):
+            raise RuntimeDirError(
+                f"{path} is a symlink; the manager makes none in its runtime "
+                "directory, so it does not follow one")
+        through = f"/proc/self/fd/{fd}"
+        yield (None if info is None
+               else f"{through}/{name}" if os.path.isdir(through) else path)
+    finally:
+        os.close(fd)
+
+
+def reach_problem(path: str) -> str:
+    """Why `path` may not be read or connected to; '' when it may."""
+    try:
+        with reach(path):
+            return ""
+    except RuntimeDirError as error:
+        return str(error)
 
 
 def qmp_path(vm_id: str) -> str:
@@ -430,9 +524,26 @@ class Normalised:
     name: str = ""
 
 
+def text_problem(value: str) -> str:
+    """Why `value` cannot be a path, an argv word or a shown name; '' if it can.
+
+    The OS cannot take a NUL in a path (``os.path.realpath`` raises
+    ValueError), and text that is not UTF-8 cannot be printed or rendered.
+    """
+    if "\0" in value:
+        return "contains a NUL byte"
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "is not valid UTF-8 text"
+    return ""
+
+
 def check_binary(binary: str) -> None:
     if not binary:
         raise DefinitionError("no QEMU binary was given")
+    if problem := text_problem(binary):
+        raise DefinitionError(f"the QEMU binary {problem}")
     if any(char.isspace() for char in binary):
         raise DefinitionError(
             "the QEMU binary contains whitespace; give the command as "
@@ -463,6 +574,8 @@ def normalise(
             raise DefinitionError("every argument must be a string")
         if "\0" in word or "\n" in word:
             raise DefinitionError("an argument contains a NUL or newline")
+        if text_problem(word):
+            raise DefinitionError("an argument is not valid UTF-8 text")
     items = parse_options(list(args))
     kept: list[Option | str] = []
     notes: list[str] = []
@@ -639,7 +752,8 @@ class VmDefinition:
         name = data.get("name")
         qemu = data.get("qemu")
         argv = data.get("argv")
-        if not isinstance(name, str) or not name.strip() or "\n" in name:
+        if (not isinstance(name, str) or not name.strip() or "\n" in name
+                or text_problem(name)):
             raise DefinitionError("invalid display name")
         if not isinstance(qemu, str):
             raise DefinitionError("invalid qemu binary")
@@ -647,7 +761,16 @@ class VmDefinition:
         if not isinstance(argv, list) or not all(
                 isinstance(word, str) for word in argv):
             raise DefinitionError("argv must be a list of strings")
+        # A hand-edited file can hold what import refuses. A NUL makes every
+        # os.path call raise, so it is refused here, as damage to this file.
         pidfile, qmp = data.get("pidfile"), data.get("qmp")
+        for label, value in (("pidfile", pidfile), ("qmp", qmp),
+                             ("cwd", data.get("cwd"))):
+            if isinstance(value, str) and (problem := text_problem(value)):
+                raise DefinitionError(f"{label} {problem}")
+        for index, word in enumerate(argv):
+            if problem := text_problem(word):
+                raise DefinitionError(f"argv word {index + 1} {problem}")
         if not isinstance(pidfile, str) or not os.path.isabs(pidfile):
             raise DefinitionError("pidfile must be an absolute path")
         if not isinstance(qmp, str) or not os.path.isabs(qmp):
@@ -675,7 +798,7 @@ class VmDefinition:
             if not isinstance(user, str) or not USER_PATTERN.fullmatch(user):
                 raise DefinitionError("invalid ssh user")
         notes = data.get("notes") or ""
-        if not isinstance(notes, str):
+        if not isinstance(notes, str) or text_problem(notes):
             raise DefinitionError("notes must be text")
         return cls(vm_id, name.strip(), qemu, list(argv), pidfile, qmp, cwd,
                    port, user, notes)

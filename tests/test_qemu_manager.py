@@ -1758,6 +1758,31 @@ class FocusR3Tests(Sandbox):
         self.assertEqual(backend.find_pane(self.rc.tree(), vm.qmp).id, pane)
 
 
+def pretend_foreign(directory: Path):
+    """Make lstat and fstat report `directory` as another user's."""
+    real_lstat, real_fstat = os.lstat, os.fstat
+
+    def bump(info):
+        fields = list(info)
+        fields[4] = info.st_uid + 1
+        return os.stat_result(fields)
+
+    def lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        return bump(info) if os.fspath(path) == str(directory) else info
+
+    def fstat(fd):
+        info = real_fstat(fd)
+        try:
+            target = real_lstat(directory)
+        except OSError:
+            return info
+        same = (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino)
+        return bump(info) if same else info
+
+    return mock.patch.multiple(model.os, lstat=lstat, fstat=fstat)
+
+
 class StatusRuntimeDirTests(RuntimeDirTests):
     """NB8: status reads trust the runtime directory only as launch does."""
 
@@ -1789,17 +1814,7 @@ class StatusRuntimeDirTests(RuntimeDirTests):
         self.fallback.chmod(0o755)
         self.assert_not_read(vm, server, "it must be 0700")
         self.fallback.chmod(0o700)
-        real = os.lstat
-
-        def foreign_owner(path, *args, **kwargs):
-            info = real(path, *args, **kwargs)
-            if os.fspath(path) != str(self.fallback):
-                return info
-            fields = list(info)
-            fields[4] = info.st_uid + 1
-            return os.stat_result(fields)
-
-        with mock.patch.object(model.os, "lstat", foreign_owner):
+        with pretend_foreign(self.fallback):
             self.assert_not_read(vm, server, "not you")
 
     def test_a_missing_runtime_dir_reads_as_stopped(self):
@@ -1884,6 +1899,348 @@ class SwapAndLockR3Tests(Sandbox):
         writer.join(5)
         self.assertEqual(store.load_state(), {
             "favorites": ["bravo"], "recents": [{"id": "alpha", "at": "t"}]})
+
+
+# ── fix round r4 ─────────────────────────────────────────────────────────────
+
+
+class RuntimeSymlinkR4Tests(RuntimeDirTests):
+    """R3-B1: what decides is the directory that holds the name as written.
+
+    Nothing named in an unsafe runtime directory is read or sent through,
+    symlink or not; and the manager, which makes no symlinks there, never
+    follows one it finds, even in a safe directory."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.other_dir = self.tmp / "other"
+        self.other_dir.mkdir(mode=0o700)
+
+    def start_other(self, *extra: str):
+        """A live QEMU the catalog does not know (started by hand)."""
+        qmp_path = str(self.other_dir / "vm.qmp")
+        process = subprocess.Popen(
+            [self.qemu, "-m", "256", "-nodefaults", *extra,
+             "-pidfile", str(self.other_dir / "vm.pid"),
+             "-qmp", model.qmp_spec(qmp_path)],
+            env=dict(os.environ), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        self.started.append(process)
+        answers = lambda: self.answers(qmp_path)        # noqa: E731
+        self.wait_for(lambda: answers() and (self.other_dir / "vm.pid")
+                      .exists())
+        return process, qmp_path
+
+    @staticmethod
+    def answers(path: str) -> bool:
+        try:
+            qmp.status(path, timeout=0.3)
+            return True
+        except qmp.QmpError:
+            return False
+
+    def plant_links(self, vm, other_qmp: str) -> None:
+        """alpha.qmp, alpha.pid and alpha.launch, all symlinks out."""
+        self.fallback.mkdir(mode=0o700, exist_ok=True)
+        marker = self.other_dir / "fresh-marker"
+        marker.write_text("1\n")
+        for name, target in ((vm.qmp, other_qmp),
+                             (vm.pidfile, str(self.other_dir / "vm.pid")),
+                             (str(self.fallback / f"{vm.id}.launch"),
+                              str(marker))):
+            if os.path.lexists(name):
+                os.unlink(name)
+            os.symlink(target, name)
+
+    def test_status_and_control_never_go_through_a_planted_symlink(self):
+        vm = self.define("Alpha")
+        # The other QEMU names Alpha's pidfile path, so a reader that
+        # followed alpha.pid would accept its pid as Alpha's.
+        process, other_qmp = self.start_other("-name", vm.pidfile)
+        self.plant_links(vm, other_qmp)
+        # The links are live: anything that followed them would see a VM.
+        self.assertTrue(self.answers(vm.qmp))
+        self.assertEqual(self.manager().pid_of(vm), process.pid)
+        for mode, reason in ((0o755, "it must be 0700"),
+                             (0o700, "is a symlink")):
+            with self.subTest(mode=oct(mode)):
+                self.fallback.chmod(mode)
+                Path(self.env["FAKE_QEMU_LOG"]).unlink(missing_ok=True)
+                manager = self.manager()
+                status = manager.status(vm)
+                self.assertEqual((status.state, status.qmp_ok, status.pid),
+                                 ("stopped", False, 0), status.detail)
+                self.assertIn(reason, status.detail)
+                result = manager.control(vm, "poweroff")
+                self.assertFalse(result.ok, result.message)
+                self.assertIn("Not sent to Alpha", result.message)
+                self.assertEqual(self.qmp_log(), [])
+                self.assertIsNone(process.poll())
+        self.fallback.chmod(0o700)
+        result = self.manager().launch(vm)
+        self.assertFalse(result.ok)
+        self.assertIn("Not launching Alpha", result.message)
+        self.assertIn("is a symlink", result.message)
+        self.assertEqual(self.rc.launched, [])
+        self.assertTrue(os.path.islink(vm.qmp))     # never removed for you
+
+    def test_power_off_confirmed_in_the_picker_never_reaches_another_qemu(self):
+        """The modal is shown for the real Alpha; then alpha.qmp becomes a
+        symlink to another live QEMU (and, in one case, the directory loses
+        its 0700) before y. Nothing is sent to either QEMU."""
+        vm = self.define("Alpha")
+        for mode in (0o755, 0o700):
+            with self.subTest(mode=oct(mode)):
+                alpha = self.start_outside(vm)
+                self.wait_for(lambda: self.qmp_up(vm))
+                process, other_qmp = self.start_other()
+                state = tui.State(self.manager(), refresh_seconds=0)
+                state.select_id(vm.id)
+                tui.handle(ord("a"), state)
+                TuiTests.choose(self, state, "poweroff")
+                tui.handle(ENTER, state)
+                frame = app.render_to_text(tui.render, state, height=24,
+                                           width=120)
+                self.assertIn("Confirm: Power off — Alpha", frame)
+                os.unlink(vm.qmp)
+                os.symlink(other_qmp, vm.qmp)
+                self.fallback.chmod(mode)
+                Path(self.env["FAKE_QEMU_LOG"]).unlink(missing_ok=True)
+                tui.handle(ord("y"), state)
+                TuiTests.wait(state)
+                time.sleep(0.2)
+                self.assertIn("Not sent to Alpha", state.message)
+                self.assertNotIn("quit", self.qmp_log())
+                self.assertIsNone(process.poll(), state.message)
+                self.assertIsNone(alpha.poll(), state.message)
+                for started in (process, alpha):
+                    started.terminate()
+                    started.wait(5)
+                for leftover in (vm.qmp, vm.pidfile,
+                                 str(self.other_dir / "vm.qmp"),
+                                 str(self.other_dir / "vm.pid")):
+                    Path(leftover).unlink(missing_ok=True)
+                self.fallback.chmod(0o700)
+
+    def test_a_symlink_from_outside_into_the_runtime_dir_is_not_followed(self):
+        old = self.tmp / "old-run"
+        old.mkdir(mode=0o700)
+        os.environ["XDG_RUNTIME_DIR"] = str(old)
+        vm = self.define("Alpha")                   # recorded under old/
+        os.environ.pop("XDG_RUNTIME_DIR")
+        self.fallback.mkdir(mode=0o700)
+        inside = str(self.fallback / "planted.qmp")
+        server = FakeQmpServer(inside, {"query-status": {
+            "return": {"status": "running", "running": True}}})
+        self.addCleanup(server.close)
+        os.makedirs(os.path.dirname(vm.qmp), mode=0o700)
+        os.symlink(inside, vm.qmp)
+        status = self.manager().status(vm)
+        self.assertEqual((status.state, status.qmp_ok), ("stopped", False))
+        self.assertIn("symlink into the runtime directory", status.detail)
+        self.assertFalse(self.manager().control(vm, "poweroff").ok)
+        self.assertEqual(server.seen, [])
+
+
+class UnsafeDirR4Tests(RuntimeDirTests):
+    """NB-R3-4: the guard is per path; X4 and X10 of QM-R3."""
+
+    def test_a_build_vm_with_its_pidfile_outside_is_guarded_on_its_qmp(self):
+        build = self.tmp / "build"
+        build.mkdir()
+        vm = self.define("Build", "-pidfile", str(build / "qemu.pid"))
+        self.assertFalse(model.in_runtime_dir(vm.pidfile))
+        self.assertTrue(model.in_runtime_dir(vm.qmp))
+        self.fallback.mkdir(mode=0o700)
+        server = FakeQmpServer(vm.qmp, {"query-status": {
+            "return": {"status": "running", "running": True}}})
+        self.addCleanup(server.close)
+        self.assertTrue(self.manager().status(vm).qmp_ok)
+        server.seen.clear()
+        self.fallback.chmod(0o755)
+        result = self.manager().control(vm, "poweroff")
+        self.assertFalse(result.ok, result.message)
+        self.assertIn("Not sent to Build", result.message)
+        self.assertFalse(self.manager().status(vm).qmp_ok)
+        self.assertEqual(server.seen, [])
+
+    def test_a_live_pidfile_in_an_unsafe_dir_is_not_read(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        process = self.start_outside(vm, FAKE_QEMU_NO_QMP="1")
+        self.wait_for(lambda: self.manager().status(vm).pid == process.pid)
+        self.assertEqual(self.manager().status(vm).state, "live")
+        self.fallback.chmod(0o755)
+        status = self.manager().status(vm)
+        self.assertEqual((status.state, status.pid), ("stopped", 0))
+        self.assertIn("it must be 0700", status.detail)
+
+
+class DamagedDefinitionR4Tests(Sandbox):
+    """R3-B2: one damaged definition never takes down the others."""
+
+    def damaged(self, ident: str, **change) -> Path:
+        base = self.define(ident.title(), save=False)
+        data = base.as_json()
+        data.update(id=ident)
+        for key, value in change.items():
+            if key in ("pidfile", "qmp"):
+                spelled = (data[key] if key == "pidfile"
+                           else model.qmp_spec(data[key]))
+                new = value if key == "pidfile" else model.qmp_spec(value)
+                data["argv"][data["argv"].index(spelled)] = new
+            data[key] = value
+        path = Path(store._definition_path(ident))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_from_json_refuses_what_os_path_cannot_take(self):
+        good = self.define("Alpha", save=False).as_json()
+        bad_path = str(self.tmp / "bad\u0000.pid")
+        for field, value, words in (
+                ("pidfile", bad_path, "pidfile contains a NUL byte"),
+                ("qmp", str(self.tmp / "b\u0000.qmp"), "qmp contains a NUL"),
+                ("cwd", "/tmp/x\u0000", "cwd contains a NUL byte"),
+                ("argv", ["-name", "x\u0000"], r"argv word \d+ contains a NUL"),
+                ("argv", ["-name", "\ud800"], r"argv word \d+ is not valid UTF"),
+                ("pidfile", str(self.tmp / "\ud800.pid"), "pidfile is not "),
+                ("qemu", "/usr/bin/qemu-system-x86_64\u0000", "binary contains"),
+                ("name", "Al\ud800pha", "invalid display name"),
+                ("notes", "\ud800", "notes must be text")):
+            with self.subTest(field=field, value=value):
+                data = json.loads(json.dumps(good))
+                if field == "argv":
+                    data["argv"] = data["argv"] + value
+                elif field == "pidfile":
+                    data["argv"][data["argv"].index(data["pidfile"])] = value
+                    data["pidfile"] = value
+                elif field == "qmp":
+                    data["argv"][data["argv"].index(
+                        model.qmp_spec(data["qmp"]))] = model.qmp_spec(value)
+                    data["qmp"] = value
+                else:
+                    data[field] = value
+                with self.assertRaisesRegex(model.DefinitionError, words):
+                    model.VmDefinition.from_json(data)
+
+    def test_every_reader_of_the_catalog_survives_a_damaged_file(self):
+        self.define("Alpha")
+        self.damaged("nul", pidfile=str(self.tmp / "bad\u0000.pid"))
+        self.damaged("odd", notes="\ud800")
+        machines, problems = store.load_all()
+        self.assertEqual([vm.id for vm in machines], ["alpha"])
+        self.assertEqual(sorted(line.split(":")[0] for line in problems),
+                         ["nul.json", "odd.json"])
+        self.assertIn("pidfile contains a NUL byte", "\n".join(problems))
+        code, out, err = self.run_cli("--status")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Alpha", out)
+        self.assertIn("skipped nul.json", err)
+        code, out, err = self.run_cli("list")
+        self.assertEqual(code, 0, err)
+        self.assertIn("alpha", out)
+        code, out, err = self.run_cli("list", "--json")
+        self.assertEqual(len(json.loads(out)["problems"]), 2)
+        self.assertEqual(self.run_cli("favorite", "Alpha")[0], 0)
+        code, _out, err = self.run_cli(
+            "import", "Bravo", "--", self.qemu, "-m", "256", "-nodefaults")
+        self.assertEqual(code, 0, err)
+        lab = Path(self.env["PLEBIAN_OS_SESSION_HOME"]) / "qemu-vms" / "lab"
+        lab.mkdir(parents=True)
+        (lab / "disk.qcow2").write_bytes(b"")
+        code, out, err = self.run_cli("discover", "--no-processes")
+        self.assertEqual(code, 0, err)
+        self.assertIn("plebian:lab", out)
+        code, _out, err = self.run_cli("discover", "--no-processes",
+                                       "--accept", "plebian:lab")
+        self.assertEqual(code, 0, err)
+        state = tui.State(self.manager(), refresh_seconds=0)
+        self.assertEqual(state.error, "")
+        self.assertEqual(sorted(s.vm.id for s in state.machines),
+                         ["alpha", "bravo", "lab"])
+        tui.handle(ord("f"), state)
+        self.assertEqual(state.error, "")
+
+    def test_an_unexpected_error_in_one_file_is_that_files_problem(self):
+        self.define("Alpha")
+        self.define("Odd")
+        real_from_json = model.VmDefinition.from_json
+        real_paths = model.control_paths
+
+        def from_json(data):
+            if data.get("id") == "odd":
+                raise LookupError("planted")
+            return real_from_json(data)
+
+        def control_paths(args, cwd):
+            if "odd" in " ".join(args):
+                raise TypeError("planted")
+            return real_paths(args, cwd)
+
+        for target, name, fake in ((model.VmDefinition, "from_json", from_json),
+                                   (model, "control_paths", control_paths)):
+            with self.subTest(patched=name), \
+                    mock.patch.object(target, name, fake):
+                machines, problems = store.load_all()
+                self.assertEqual([vm.id for vm in machines], ["alpha"])
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith("odd.json: "))
+                self.assertIn("planted", problems[0])
+
+
+class LoaderOwnershipR4Tests(Sandbox):
+    """NB-R3-1..3: QM-R3's surviving loader mutants X1, X2 and X3."""
+
+    def test_the_recorded_qmp_counts_even_where_the_argv_hides_it(self):
+        alpha = self.define("Alpha")
+        path = hand_clone(alpha, "bravo", "Bravo", share=())
+        data = json.loads(path.read_text())
+        data["qmp"] = alpha.qmp                        # what status would use
+        data["argv"] += ["-name", model.qmp_spec(alpha.qmp)]  # passes from_json
+        model.VmDefinition.from_json(data)
+        path.write_text(json.dumps(data))
+        machines, problems = store.load_all()
+        self.assertEqual([vm.id for vm in machines], ["alpha"])
+        self.assertIn(f"{alpha.qmp}, the manager's QMP socket for VM alpha",
+                      problems[0])
+
+    def test_a_qmp_shared_outside_the_runtime_dir_refuses_every_claimant(self):
+        old = self.tmp / "old-run"
+        old.mkdir(mode=0o700)
+        for ident, name in (("second", "Second"), ("aaa", "Aaa")):
+            with self.subTest(clone=ident):
+                os.environ["XDG_RUNTIME_DIR"] = str(old)
+                first = self.define("First")
+                path = hand_clone(first, ident, name, share=("qmp",))
+                os.environ["XDG_RUNTIME_DIR"] = self.env["XDG_RUNTIME_DIR"]
+                self.assertFalse(model.in_runtime_dir(first.qmp))
+                try:
+                    machines, problems = store.load_all()
+                finally:
+                    path.unlink()
+                    os.unlink(store._definition_path("first"))
+                self.assertEqual(machines, [])
+                self.assertEqual(sorted(line.split(":")[0] for line in problems),
+                                 sorted([f"{ident}.json", "first.json"]))
+                for line in problems:
+                    self.assertIn(f"it opens {first.qmp}, which ", line)
+                    self.assertIn("none of them is loaded", line)
+
+    def test_a_clone_whose_id_is_a_prefix_of_the_original_is_refused(self):
+        alpha = self.define("Alpha")
+        for share in LoaderOwnershipTests.SHAPES:
+            with self.subTest(shares=share):
+                path = hand_clone(alpha, "alph", "Alph", share)
+                try:
+                    machines, problems = store.load_all()
+                finally:
+                    path.unlink()
+                self.assertEqual([vm.id for vm in machines], ["alpha"])
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith(
+                    "alph.json: not loaded: it opens "), problems)
 
 
 if __name__ == "__main__":

@@ -69,8 +69,18 @@ def load_all() -> tuple[list[VmDefinition], list[str]]:
         except (OSError, ValueError) as error:
             problems.append(f"{name}: {error}")
             continue
+        except Exception as error:      # damage in one file stays in it
+            problems.append(f"{name}: cannot be read "
+                            f"({type(error).__name__}: {error})")
+            continue
         if f"{vm.id}.json" != name:
             problems.append(f"{name}: id {vm.id!r} does not match the file")
+            continue
+        try:
+            opened_paths(vm)            # every path must be one os can take
+        except Exception as error:
+            problems.append(f"{name}: a path cannot be used "
+                            f"({type(error).__name__}: {error})")
             continue
         found.append(vm)
     clean: list[VmDefinition] = []
