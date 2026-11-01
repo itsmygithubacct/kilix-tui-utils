@@ -94,6 +94,9 @@ class State:
         self.modal = ""
         self.action_index = 0
         self.confirm_action: Action | None = None
+        # The VM an open modal was opened for. A refresh can move the
+        # selection under a modal; what the modal runs acts on this VM only.
+        self.target: VirtualMachine | None = None
         self.message = ""
         self.error = ""
         self.pending = ""
@@ -110,8 +113,16 @@ class State:
         return self.machines[self.selected]
 
     @property
+    def modal_vm(self) -> VirtualMachine | None:
+        """The latest state of the VM the open modal is bound to."""
+        if self.target is None:
+            return None
+        return next((vm for vm in self.machines
+                     if vm.uuid == self.target.uuid), None)
+
+    @property
     def actions(self) -> list[Action]:
-        vm = self.selected_vm
+        vm = self.modal_vm if self.modal else self.selected_vm
         return actions_for(vm) if vm else []
 
     def refresh(self) -> None:
@@ -173,10 +184,46 @@ class State:
             self.action_index = 0
 
     def open_actions(self) -> None:
-        if self.selected_vm and self.actions and not self.pending:
+        vm = self.selected_vm
+        if vm and actions_for(vm) and not self.pending:
+            self.target = vm
             self.modal = "actions"
             self.action_index = min(
                 self.action_index, max(0, len(self.actions) - 1))
+
+    def close_modal(self) -> None:
+        self.modal, self.confirm_action, self.target = "", None, None
+
+    def _check_target(
+        self, *, fresh: bool,
+    ) -> tuple[str, VirtualMachine | None]:
+        """(why the modal's VM may not be acted on, its current record).
+
+        With ``fresh``, VirtualBox is asked again, so a VM unregistered or
+        replaced since the last refresh is caught too.
+        """
+        target = self.target
+        if target is None:
+            return "no VM was chosen", None
+        machines = self.machines
+        if fresh:
+            try:
+                machines = self.client.inventory()
+            except Exception as error:
+                return f"VirtualBox could not be asked again ({error})", None
+        current = next((vm for vm in machines if vm.uuid == target.uuid), None)
+        if current is None:
+            return f"{target.name} is no longer registered", None
+        if (current.name, current.config_file) != (
+                target.name, target.config_file):
+            return f"{target.name} changed since it was shown", None
+        return "", current
+
+    def _refuse(self, action: Action, problem: str) -> None:
+        self.close_modal()
+        self.error = self.message = (
+            f"Not done: {action.label} — {problem}; nothing was sent. "
+            "Choose the VM and the action again.")
 
     def primary(self) -> None:
         """Enter: launch a stopped VM, focus an active one's existing tab."""
@@ -199,24 +246,36 @@ class State:
         if not actions or not (0 <= self.action_index < len(actions)):
             return
         action = actions[self.action_index]
+        problem, current = self._check_target(fresh=False)
+        if problem:
+            self._refuse(action, problem)
+            return
         if action.confirm:
             self.confirm_action = action
             self.modal = "confirm"
         else:
-            self.modal = ""
-            self._begin(action)
+            self.close_modal()
+            self._begin(action, current)
 
     def confirm(self, yes: bool) -> None:
         action = self.confirm_action
-        self.confirm_action = None
-        self.modal = ""
-        if yes and action:
-            self._begin(action)
-        elif action:
-            self.message = f"Cancelled: {action.label}."
+        if not yes or action is None or self.target is None:
+            self.close_modal()
+            if action:
+                self.message = f"Cancelled: {action.label}."
+            return
+        # The confirmation was shown for the target; act on it or on nothing.
+        problem, current = self._check_target(fresh=True)
+        if problem:
+            self._refuse(action, problem)
+            return
+        self.close_modal()
+        self._begin(action, current)
 
-    def _begin(self, action: Action) -> None:
-        vm = self.selected_vm
+    def _begin(self, action: Action,
+               vm: VirtualMachine | None = None) -> None:
+        if vm is None:
+            vm = self.selected_vm
         if vm is None or self.pending:
             return
         self.pending = f"{action.label}: {vm.name}"
@@ -248,7 +307,8 @@ class State:
         ).start()
 
     def preview(self, action: Action) -> str:
-        vm = self.selected_vm
+        vm = (self.target if self.modal and self.target is not None
+              else self.selected_vm)
         if vm is None:
             return ""
         return shlex.join(self.client.preview(
@@ -513,9 +573,16 @@ def _draw_modal(
     height: int,
     width: int,
 ) -> None:
-    vm = state.selected_vm
+    vm = state.target
     if vm is None or height <= 0 or width <= 0:
         return
+    if state.modal_vm is None:
+        _put(
+            surface, top + height - 1, left,
+            f"{vm.name} is no longer listed; nothing will be run"[:width],
+            tango.attr("alert"),
+        )
+        height -= 1
     if state.modal == "actions":
         _put(
             surface, top, left, f"ACTIONS · {vm.name}"[:width],
@@ -669,7 +736,7 @@ def handle(key: int, state: State) -> bool:
         return True
     if state.modal == "actions":
         if key in (27, ord("q"), ord("Q"), ord("a")):
-            state.modal = ""
+            state.close_modal()
         elif step := keymap.direction(key):
             state.move(step)
         elif key in keymap.SELECT:

@@ -1,6 +1,7 @@
 """VirtualBox manager tests; no VM is launched or controlled."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -313,6 +314,58 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(state.modal, "confirm")
         self.assertEqual(state.confirm_action.ident, "poweroff")
         self.assertIn("VBoxManage poweroff", state.preview(state.confirm_action))
+
+    def test_a_confirmation_acts_only_on_the_vm_it_was_shown_for(self):
+        first = running_vm()
+        second = dataclasses.replace(
+            running_vm(), uuid="0f2b6c1e-6f4b-4a8e-9a55-3c1d2e4f5a6b",
+            name="second-running-vm")
+        fake = FakeClient([first, second])
+        state = tui.State(fake, refresh_seconds=0)
+
+        def confirm_poweroff_for_first():
+            state.selected = 0
+            tui.handle(ord("a"), state)
+            state.action_index = next(
+                index for index, action in enumerate(state.actions)
+                if action.ident == "poweroff")
+            tui.handle(10, state)
+            self.assertEqual(state.modal, "confirm")
+            frame = app.render_to_text(tui.render, state, height=24, width=100)
+            self.assertIn(f"Confirm: Power off — {first.name}", frame)
+
+        # The first VM is unregistered while its confirmation is open; the
+        # refresh moves the selection to the second one.
+        confirm_poweroff_for_first()
+        fake.machines = [second]
+        state.refresh()
+        self.assertEqual(state.selected_vm.uuid, second.uuid)
+        self.assertIn(first.name, app.render_to_text(
+            tui.render, state, height=24, width=100))
+        tui.handle(ord("y"), state)
+        self._wait(state)
+        self.assertEqual(fake.calls, [])
+        self.assertIn("no longer registered", state.error)
+
+        # Replaced under the same UUID (another name): refused as well.
+        fake.machines = [first, second]
+        state.refresh()
+        confirm_poweroff_for_first()
+        fake.machines = [dataclasses.replace(first, name="renamed"), second]
+        tui.handle(ord("y"), state)
+        self._wait(state)
+        self.assertEqual(fake.calls, [])
+        self.assertIn("changed since it was shown", state.error)
+
+        # Unchanged: y acts on the VM it was shown for, wherever the
+        # selection has moved since.
+        fake.machines = [first, second]
+        state.refresh()
+        confirm_poweroff_for_first()
+        state.selected = 1
+        tui.handle(ord("y"), state)
+        self._wait(state)
+        self.assertEqual(fake.calls, [(first.uuid, "poweroff")])
 
     @staticmethod
     def _wait(state):
