@@ -771,6 +771,50 @@ class SharedShellTests(unittest.TestCase):
         self.assertEqual(fired, [state])     # once, then the q quits as ever
         self.assertEqual(timeouts, [1000])   # the loop wakes to check idleness
 
+    def test_standalone_managers_use_the_shared_shell_and_have_tips(self):
+        # The applications install.sh publishes beside tools/: each renders
+        # the same frame, carries a tip, and quits on q.
+        managers = {
+            "kilix-virtualbox-manager": "VirtualBox",
+            "kilix-qemu-manager": "QEMU VMs",
+        }
+        installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+        for directory, title in managers.items():
+            with self.subTest(manager=directory):
+                self.assertIn(f'"{directory}:{directory}"', installer)
+                self.assertIn(title, shell.TIPS)
+                path = ROOT / directory / "main.py"
+                source = path.read_text(encoding="utf-8")
+                self.assertIn("from kilix_tui import app", (
+                    ROOT / directory / directory.replace("-", "_")
+                    / "cli.py").read_text(encoding="utf-8"))
+                self.assertIn("handle, render", source)
+        with tempfile.TemporaryDirectory() as home:
+            environment = {"KILIX_QEMU_HOME": home,
+                           "XDG_RUNTIME_DIR": home,
+                           "XDG_STATE_HOME": home}
+            with mock.patch.dict(os.environ, environment):
+                spec = importlib.util.spec_from_file_location(
+                    "qemu_manager_main", ROOT / "kilix-qemu-manager/main.py")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                class NoKilix:
+                    @staticmethod
+                    def available():
+                        return False
+
+                from kilix_qemu_manager.backend import QemuManager
+                state = module.State(QemuManager(rc=NoKilix()),
+                                     refresh_seconds=0)
+                frame = app.render_to_text(module.render, state,
+                                           height=24, width=100)
+                self.assertFalse(module.handle(ord("q"), state))
+        lines = frame.splitlines()
+        self.assertIn("KILIX TUI", lines[0])
+        self.assertIn("▶1", lines[1])
+        self.assertTrue(lines[2].startswith("─"))
+
     def test_every_tool_title_that_draws_a_frame_has_a_tip(self):
         titles = set()
         for path in sorted(glob.glob(os.path.join(ROOT, "tools", "*",

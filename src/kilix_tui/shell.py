@@ -49,6 +49,7 @@ TIPS: dict[str, str] = {
     "Temperatures": "green below 80°C, yellow to 89°C, red above",
     "Memory": "pressure matters more than free bytes — watch the stall lines",
     "VirtualBox": "machines launch into their own Kilix tab",
+    "QEMU VMs": "Enter launches or focuses; f pins a favorite to the top",
 }
 
 # What the last frame drew, so the `?` overlay can explain the keys the user is

@@ -32,6 +32,7 @@ FOCUSED_APPS: dict[str, tuple[str, tuple[str, ...], dict[str, str]]] = {
             "packages": "Packages",
             "cameras": "Cameras",
             "virtualbox": "VirtualBox VPN",
+            "qemu": "QEMU VMs",
         },
     ),
     "settings": (

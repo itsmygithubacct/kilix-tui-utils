@@ -1650,6 +1650,32 @@ class ResolutionTests(unittest.TestCase):
         self.assertTrue(
             plan.argv[1].endswith("kilix-virtualbox-manager/main.py"))
 
+    def test_qemu_manager_sits_beside_virtualbox_and_resolves_here(self):
+        labels = [item.label for item in registry.MACHINE]
+        self.assertEqual(labels.index("QEMU VMs"),
+                         labels.index("VirtualBox VPN") + 1)
+        # The launcher catalog reads Programs, so it is offered there too.
+        self.assertIn("QEMU VMs", [item.label for item in registry.PROGRAMS])
+        for section in (registry.MACHINE, registry.PROGRAMS):
+            item = next(item for item in section if item.label == "QEMU VMs")
+            with mock.patch("shutil.which", return_value=None):
+                plan = registry.resolve(item)
+            self.assertIsNotNone(plan)
+            self.assertTrue(
+                plan.argv[1].endswith("kilix-qemu-manager/main.py"))
+            with mock.patch.object(registry.shutil, "which",
+                                   return_value="/usr/bin/kilix-qemu-manager"):
+                self.assertEqual(registry.resolve(item).argv,
+                                 ("/usr/bin/kilix-qemu-manager",))
+
+    def test_system_center_routes_to_the_qemu_manager(self):
+        module = load_entry()
+        state, action, action_input = module._focused_state(
+            ["--app", "system", "--action", "qemu"])
+        with mock.patch("shutil.which", return_value=None):
+            module._apply_action(state, "system", action, action_input)
+            self.assertEqual(state.entries()[state.selected].label, "QEMU VMs")
+
     def test_sibling_tool_backs_up_a_missing_install(self):
         item = registry.Item("x", command="kilix-calculator",
                              sibling="calculator")

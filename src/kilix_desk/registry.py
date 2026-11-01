@@ -85,6 +85,10 @@ PROGRAMS = (
     Item("Music", command="kilix-music", sibling="music", verb="tab"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
+    # Also under Machine beside VirtualBox; listed here as well so the
+    # launcher catalog, which reads Programs, offers the VM picker too.
+    Item("QEMU VMs", command="kilix-qemu-manager",
+         source="kilix-qemu-manager"),
     Item("Voice Studio", submenu="voice"),
     Item("Read aloud", command="kilix-tts"),
     Item("Dictation", command="kilix-stt"),
@@ -114,6 +118,8 @@ MACHINE = (
          kilix=("temps",), verb="tab"),
     Item("VirtualBox VPN", command="kilix-virtualbox-manager",
          source="kilix-virtualbox-manager"),
+    Item("QEMU VMs", command="kilix-qemu-manager",
+         source="kilix-qemu-manager"),
     Item("Cameras", command="kilix-cameras", sibling="cameras"),
     Item("Disk", command="kilix-disk", sibling="disk"),
     Item("System facts", command="kilix-system", sibling="system"),

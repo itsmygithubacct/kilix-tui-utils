@@ -38,6 +38,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-find-files` | Bounded filename/glob search that does not follow directory symlinks |
 | `kilix-temps` | Live temperature, fan, and thermal-headroom [dashboard](tools/temps/README.md) |
 | `kilix-virtualbox-manager` | Discover, launch, focus, and control VirtualBox VPN machines in Kilix tabs |
+| `kilix-qemu-manager` | Keep a catalog of QEMU VMs with favorites; launch, focus, and control them over QMP in Kilix tabs |
 | `kilix-tui` | **The text-native desktop** — see below |
 
 The shared Programs registry includes **PDF Conversion** as a direct tab/pane

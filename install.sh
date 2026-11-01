@@ -43,6 +43,7 @@ TOOLS=(
 # utilities under tools/.
 APPLICATIONS=(
     "kilix-virtualbox-manager:kilix-virtualbox-manager"
+    "kilix-qemu-manager:kilix-qemu-manager"
 )
 
 # command name : focused application route in the shared desktop state
@@ -176,6 +177,19 @@ if [ "${KILIX_TUI_UTILS_SYNC_MENU:-1}" != "0" ] && \
         printf 'kilix-tui-utils: synced Kilix-95 start-menu entries\n'
     else
         printf 'kilix-tui-utils: note — could not sync start-menu entries\n'
+    fi
+fi
+
+# The QEMU manager reaches Kilix 95's Start > Programs > System through the
+# same XDG discovery: one Terminal=true entry naming the launcher just written.
+# A relocatable runtime has no fixed launcher path, so it writes no entry.
+if [ "${KILIX_TUI_UTILS_SYNC_MENU:-1}" != "0" ] && [ "$RELOCATABLE" = 0 ] && \
+        [ -x "$BIN/kilix-qemu-manager" ]; then
+    if python3 "$HERE/kilix-qemu-manager/main.py" install-desktop-entry \
+            --command "$BIN/kilix-qemu-manager" >/dev/null 2>&1; then
+        printf 'kilix-tui-utils: synced the QEMU manager start-menu entry\n'
+    else
+        printf 'kilix-tui-utils: note — could not write the QEMU manager start-menu entry\n'
     fi
 fi
 
