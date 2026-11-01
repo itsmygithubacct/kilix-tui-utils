@@ -2235,7 +2235,12 @@ class LoaderOwnershipR4Tests(Sandbox):
         path = hand_clone(alpha, "bravo", "Bravo", share=())
         data = json.loads(path.read_text())
         data["qmp"] = alpha.qmp                        # what status would use
-        data["argv"] += ["-name", model.qmp_spec(alpha.qmp)]  # passes from_json
+        # A unix: value counts as a socket under any option, so only a
+        # positional word hides the spec from the argv (from_json needs it).
+        data["argv"].append(model.qmp_spec(alpha.qmp))
+        self.assertNotIn(model.canonical(alpha.qmp), {
+            model.canonical(path) for path in model.control_paths(
+                data["argv"], data["cwd"] or "/")})
         model.VmDefinition.from_json(data)
         path.write_text(json.dumps(data))
         machines, problems = store.load_all()
