@@ -2043,6 +2043,43 @@ class RuntimeSymlinkR4Tests(RuntimeDirTests):
         self.assertEqual(server.seen, [])
 
 
+class RuntimeDirectoryFdR4Tests(RuntimeDirTests):
+    """NB-R3-6: the runtime directory is checked and used through one fd."""
+
+    RUNNING = {"query-status": {"return": {"status": "running",
+                                           "running": True}}}
+
+    def test_a_directory_swapped_in_after_the_check_is_never_used(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        mine = FakeQmpServer(vm.qmp, self.RUNNING)
+        self.addCleanup(mine.close)
+        with model.reach(vm.qmp) as where:
+            # After the check: the checked directory is moved away, and an
+            # open one with a planted socket takes its name.
+            os.rename(self.fallback, self.shared / "moved")
+            self.fallback.mkdir(mode=0o755)
+            planted = FakeQmpServer(vm.qmp, {"query-status": {
+                "return": {"status": "paused", "running": False}}})
+            self.addCleanup(planted.close)
+            self.assertEqual(qmp.status(where, timeout=0.5), "running")
+        self.assertEqual(planted.seen, [])
+        self.assertEqual(mine.seen, ["qmp_capabilities", "query-status"])
+
+    def test_a_symlinked_runtime_dir_is_never_read(self):
+        vm = self.define("Alpha")
+        real = self.tmp / "real-run"
+        real.mkdir(mode=0o700)                      # ours, 0700, but linked
+        self.fallback.symlink_to(real, target_is_directory=True)
+        server = FakeQmpServer(str(real / "alpha.qmp"), self.RUNNING)
+        self.addCleanup(server.close)
+        status = self.manager().status(vm)
+        self.assertEqual((status.state, status.qmp_ok), ("stopped", False))
+        self.assertIn("or is a symlink", status.detail)
+        self.assertFalse(self.manager().control(vm, "poweroff").ok)
+        self.assertEqual(server.seen, [])
+
+
 class UnsafeDirR4Tests(RuntimeDirTests):
     """NB-R3-4: the guard is per path; X4 and X10 of QM-R3."""
 
