@@ -32,6 +32,9 @@ _STATE_LOCK = threading.RLock()
 # ...and, across processes (the CLI beside a running TUI), an flock on a
 # lock file next to the state file. Taken once per outermost holder.
 _flock = {"depth": 0, "fd": -1}
+# An update holds the flock for milliseconds. A peer that holds it longer
+# was stopped (Ctrl-Z) or hung; waiting for it would freeze the picker.
+LOCK_WAIT_SECONDS = 5.0
 # A swap file is in flight for milliseconds. One older than this was left by
 # a writer that crashed between mkstemp and replace.
 STALE_SWAP_SECONDS = 600.0
@@ -184,11 +187,35 @@ def find(value: str) -> VmDefinition | None:
     return None
 
 
+class StateBusy(OSError):
+    """Another process has held the state lock for over LOCK_WAIT_SECONDS."""
+
+
+def _take_flock(fd: int, path: str) -> bool:
+    """Lock `fd` within LOCK_WAIT_SECONDS. False when flock cannot be used
+    here at all; StateBusy when a peer holds it for longer."""
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise StateBusy(
+                    f"another kilix-qemu-manager has held {path} for over "
+                    f"{LOCK_WAIT_SECONDS:g}s") from None
+            time.sleep(0.02)
+        except OSError:
+            return False
+
+
 @contextlib.contextmanager
 def state_lock():
     """Serialise a read-modify-write of the state file, in and across
     processes. A lock file that cannot be opened degrades to the thread
-    lock alone; it never stops the manager."""
+    lock alone; it never stops the manager. A peer that holds the lock for
+    over LOCK_WAIT_SECONDS raises StateBusy, an OSError, rather than freeze
+    the caller: that update is not made, and strict callers say so."""
     with _STATE_LOCK:
         if _flock["depth"] == 0:
             path = model.state_path() + ".lock"
@@ -200,8 +227,11 @@ def state_lock():
                 fd = -1
             if fd >= 0:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                except OSError:
+                    taken = _take_flock(fd, path)
+                except StateBusy:
+                    os.close(fd)
+                    raise
+                if not taken:
                     os.close(fd)
                     fd = -1
             _flock["fd"] = fd
@@ -215,22 +245,45 @@ def state_lock():
                 _flock["fd"] = -1
 
 
+def _swap_target_ok(directory: str):
+    """Which swap targets `directory` may hold, as a test on the name.
+
+    Only the manager's own two directories are cleaned, and only for files
+    it writes there: ``<id>.json`` in the vms directory, ``state.json`` in
+    the state directory. KILIX_QEMU_HOME may be any directory, and the state
+    file then sits directly in it, beside files that are not the manager's.
+    """
+    here = os.path.abspath(directory)
+    if here == os.path.abspath(model.vms_dir()):
+        return lambda target: bool(model.ID_PATTERN.fullmatch(
+            target[: -len(".json")]))
+    if here == os.path.abspath(os.path.dirname(model.state_path())):
+        return lambda target: target == os.path.basename(model.state_path())
+    return None
+
+
 def clean_stale_swaps(directory: str, *, now: float | None = None) -> list[str]:
     """Remove swap files a crashed writer left behind; return their names.
 
-    Only names this module's mkstemp makes (``.<name>.json.XXXXXXXX.tmp``)
-    are considered, and only regular files (never a symlink) owned by this
-    user and older than STALE_SWAP_SECONDS, so a write in progress in
-    another process keeps its swap file.
+    Only in the manager's own vms and state directories, and only names
+    this module's mkstemp makes for a file it writes there
+    (``.<id>.json.XXXXXXXX.tmp``, ``.state.json.XXXXXXXX.tmp``); only
+    regular files (never a symlink) owned by this user and older than
+    STALE_SWAP_SECONDS, so a write in progress in another process keeps its
+    swap file.
     """
     moment = time.time() if now is None else now
     removed: list[str] = []
+    target_ok = _swap_target_ok(directory)
+    if target_ok is None:
+        return removed
     try:
         names = os.listdir(directory)
     except OSError:
         return removed
     for name in names:
-        if not _SWAP_NAME.fullmatch(name):
+        match = _SWAP_NAME.fullmatch(name)
+        if not match or not target_ok(match.group("target")):
             continue
         path = os.path.join(directory, name)
         try:
@@ -275,13 +328,16 @@ def remove(vm_id: str) -> str:
     """Delete one definition file. Disks and every other file stay."""
     path = _definition_path(vm_id)
     os.unlink(path)
-    with state_lock():
-        record = load_state()
-        record["favorites"] = [item for item in record["favorites"]
-                               if item != vm_id]
-        record["recents"] = [row for row in record["recents"]
-                             if row["id"] != vm_id]
-        save_state(record)
+    try:
+        with state_lock():
+            record = load_state()
+            record["favorites"] = [item for item in record["favorites"]
+                                   if item != vm_id]
+            record["recents"] = [row for row in record["recents"]
+                                 if row["id"] != vm_id]
+            save_state(record)
+    except OSError:
+        pass        # a mark for an id with no definition is never shown
     return path
 
 
@@ -336,15 +392,15 @@ def save_state(record: dict, *, strict: bool = False) -> bool:
     """
     clean = {"favorites": _ids(record.get("favorites")),
              "recents": _recents(record.get("recents"))}
-    with state_lock():
-        if clean == load_state():
-            return False
-        try:
+    try:
+        with state_lock():
+            if clean == load_state():
+                return False
             _write_json(model.state_path(), clean)
-        except OSError:
-            if strict:
-                raise
-            return False
+    except OSError:                     # StateBusy included
+        if strict:
+            raise
+        return False
     return True
 
 
@@ -388,12 +444,15 @@ def recents() -> list[dict]:
 
 def remember_launch(vm_id: str, when: datetime | None = None) -> None:
     moment = (when or datetime.now(timezone.utc)).replace(microsecond=0)
-    with state_lock():
-        record = load_state()
-        record["recents"] = [{"id": vm_id, "at": moment.isoformat()}] + [
-            row for row in record["recents"] if row["id"] != vm_id
-        ][:MAX_RECENTS - 1]
-        save_state(record)
+    try:
+        with state_lock():
+            record = load_state()
+            record["recents"] = [{"id": vm_id, "at": moment.isoformat()}] + [
+                row for row in record["recents"] if row["id"] != vm_id
+            ][:MAX_RECENTS - 1]
+            save_state(record)
+    except OSError:
+        pass        # a launch that worked is not undone by a busy state file
 
 
 def ordered(machines: list[VmDefinition]) -> list[VmDefinition]:

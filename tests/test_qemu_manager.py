@@ -2243,5 +2243,64 @@ class LoaderOwnershipR4Tests(Sandbox):
                     "alph.json: not loaded: it opens "), problems)
 
 
+class StateFileR4Tests(Sandbox):
+    """NB-R3-8 (swap cleanup scope) and NB-R3-7 (a bounded lock wait)."""
+
+    def test_swap_cleanup_touches_only_the_managers_own_files(self):
+        home = Path(self.env["KILIX_QEMU_HOME"])     # the state dir, too
+        vms = Path(model.vms_dir())
+        elsewhere = self.tmp / "elsewhere"
+        for directory in (home, vms, elsewhere):
+            directory.mkdir(parents=True, exist_ok=True)
+        old = time.time() - store.STALE_SWAP_SECONDS - 60
+        files = {
+            "state": home / ".state.json.abcd1234.tmp",
+            "foreign-name": home / ".notes.json.abcd1234.tmp",
+            "vm": vms / ".alpha.json.efgh5678.tmp",
+            "not-an-id": vms / ".Not_An_Id.json.efgh5678.tmp",
+            "other-dir": elsewhere / ".state.json.ijkl9012.tmp",
+        }
+        for path in files.values():
+            path.write_text("{")
+            os.utime(path, (old, old))
+        self.assertEqual(store.clean_stale_swaps(str(elsewhere)), [])
+        store.set_favorite("alpha", True)
+        self.define("Alpha")
+        self.assertFalse(files["state"].exists())
+        self.assertFalse(files["vm"].exists())
+        for key in ("foreign-name", "not-an-id", "other-dir"):
+            self.assertTrue(files[key].exists(), key)
+
+    def test_a_peer_holding_the_lock_never_freezes_an_update(self):
+        self.define("Alpha")
+        child = subprocess.Popen(
+            [sys.executable, "-c", (
+                "import sys; sys.path.insert(0, sys.argv[1])\n"
+                "from kilix_qemu_manager import store\n"
+                "with store.state_lock():\n"
+                "    print('held', flush=True)\n"
+                "    sys.stdin.readline()\n"), str(MANAGER)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait, 5)
+        self.addCleanup(child.stdin.close)
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        with mock.patch.object(store, "LOCK_WAIT_SECONDS", 0.3):
+            started = time.monotonic()
+            with self.assertRaisesRegex(OSError, "has held"):
+                store.set_favorite("alpha", True)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertFalse(store.save_state({"favorites": ["alpha"]}))
+            store.remember_launch("alpha")              # degrades, no raise
+            code, _out, err = self.run_cli("favorite", "Alpha")
+            self.assertEqual(code, 1)
+            self.assertIn("could not save favorites", err)
+        self.assertEqual(store._flock, {"depth": 0, "fd": -1})
+        child.stdin.write("\n")
+        child.stdin.flush()
+        self.assertEqual(child.wait(5), 0)
+        self.assertTrue(store.set_favorite("alpha", True))
+
+
 if __name__ == "__main__":
     unittest.main()
