@@ -1571,26 +1571,10 @@ class LoaderOwnershipTests(Sandbox):
         for ident, name in self.CLONES:
             with self.subTest(clone=ident):
                 path = hand_clone(alpha, ident, name)
-                self.addCleanup(path.unlink, True)
-                code, out, err = self.run_cli("--status")
-                self.assertEqual(code, 0, err)
-                self.assertIn(f"skipped {ident}.json: not loaded", err)
-                self.assertNotIn(name, out)
-                self.assertEqual(self.run_cli("--vm", name)[0], 1)
-                state = tui.State(self.manager(), refresh_seconds=0)
-                listed = [status.vm.id for status in state.machines]
-                self.assertEqual(listed, ["alpha"])
-                # Every other VM the picker offers: Power off, confirmed.
-                for other in (vm_id for vm_id in listed if vm_id != "alpha"):
-                    state.select_id(other)
-                    tui.handle(ord("a"), state)
-                    TuiTests.choose(self, state, "poweroff")
-                    tui.handle(ENTER, state)
-                    tui.handle(ord("y"), state)
-                    TuiTests.wait(state)
-                self.assertNotIn("quit", self.qmp_log())
-                self.assertTrue(self.qmp_up(alpha))
-                path.unlink()
+                try:
+                    self.power_off_everything_but(alpha, ident, name)
+                finally:
+                    path.unlink()
         # The original itself is still controlled, and named, as itself.
         state = tui.State(self.manager(), refresh_seconds=0)
         state.select_id("alpha")
@@ -1603,6 +1587,33 @@ class LoaderOwnershipTests(Sandbox):
         TuiTests.wait(state)
         self.assertEqual(state.message, "Powered off Alpha.")
         self.wait_for(lambda: not self.qmp_up(alpha))
+
+    def power_off_everything_but(self, alpha, ident: str, name: str) -> None:
+        if not self.qmp_up(alpha):              # each order on its own
+            self.start_outside(alpha)
+            self.wait_for(lambda: self.qmp_up(alpha))
+            Path(self.env["FAKE_QEMU_LOG"]).unlink(missing_ok=True)
+        state = tui.State(self.manager(), refresh_seconds=0)
+        listed = [status.vm.id for status in state.machines]
+        # Every VM the picker offers besides Alpha: Power off, confirmed.
+        for other in (vm_id for vm_id in listed if vm_id != "alpha"):
+            state.select_id(other)
+            tui.handle(ord("a"), state)
+            TuiTests.choose(self, state, "poweroff")
+            tui.handle(ENTER, state)
+            tui.handle(ord("y"), state)
+            TuiTests.wait(state)
+        time.sleep(0.2)
+        self.assertTrue(self.qmp_up(alpha), f"Alpha's QEMU was quit; "
+                        f"listed={listed} message={state.message!r}")
+        self.assertNotIn("quit", self.qmp_log())
+        self.assertEqual(listed, ["alpha"])
+        code, out, err = self.run_cli("--status")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(name, out)
+        self.assertEqual(self.run_cli("--vm", name)[0], 1)
+        self.assertIn(f"skipped {ident}.json: not loaded", err)
+        self.assertNotIn("alpha.json", err)
 
     def test_a_shared_path_no_id_derives_refuses_every_claimant(self):
         build = self.tmp / "build"
