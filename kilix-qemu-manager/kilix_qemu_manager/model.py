@@ -111,27 +111,21 @@ def ensure_runtime_dir() -> str:
     except OSError as error:
         raise RuntimeDirError(f"cannot create runtime directory {path}: "
                               f"{error.strerror or error}") from error
-    if problem := _runtime_dir_problem(path, missing_ok=False):
+    if problem := _runtime_dir_problem(path):
         raise RuntimeDirError(problem)
     return path
 
 
-def runtime_dir_problem() -> str:
-    """Why the runtime directory must not be read; '' when it may be.
+def _runtime_dir_problem(path: str) -> str:
+    """Why `path` is not safely this user's runtime directory; '' if it is.
 
-    Status reads (pidfiles, QMP sockets, launch markers) use the same rule
-    as :func:`ensure_runtime_dir` uses for writes, without creating
-    anything: a directory that is missing holds nothing to read and is
-    fine; one that exists must be a real directory, this user's, mode 0700.
+    Status reads apply the same rule through an open descriptor, in
+    :func:`reach`, and treat a missing directory as holding nothing.
     """
-    return _runtime_dir_problem(runtime_dir(), missing_ok=True)
-
-
-def _runtime_dir_problem(path: str, *, missing_ok: bool) -> str:
     try:
         info = os.lstat(path)
     except FileNotFoundError:
-        return "" if missing_ok else f"runtime directory {path} is missing"
+        return f"runtime directory {path} is missing"
     except OSError as error:
         return f"cannot use runtime directory {path}: {error}"
     return _dir_info_problem(path, info)
