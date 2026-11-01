@@ -19,7 +19,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import model
+from . import model, store
 from .model import DefinitionError, VmDefinition
 
 DEFAULT_RAM_MB = 4096
@@ -168,10 +168,19 @@ def definition_from(
     vm_id: str | None = None,
     ssh: tuple[int, str] | None = None,
     notes: str = "",
+    catalog: list[VmDefinition] | None = None,
 ) -> tuple[VmDefinition, list[str]]:
-    """Normalise an argv into a definition; return it with the change notes."""
+    """Normalise an argv into a definition; return it with the change notes.
+
+    The other catalogued VMs (``catalog``, by default the stored one) own
+    their pidfiles and QMP sockets; normalise never lets this VM keep them.
+    """
     ident = vm_id or model.slug(proposal_name)
-    normal = model.normalise(ident, qemu, args, cwd=cwd or os.getcwd())
+    if catalog is None:
+        catalog, _problems = store.load_all()
+    claimed = store.claimed_paths([vm for vm in catalog if vm.id != ident])
+    normal = model.normalise(ident, qemu, args, cwd=cwd or os.getcwd(),
+                             claimed=claimed)
     port, user = ssh if ssh else (None, "")
     vm = VmDefinition(
         id=ident,

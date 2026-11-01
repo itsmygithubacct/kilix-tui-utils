@@ -18,6 +18,7 @@ import fcntl
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import time
@@ -82,13 +83,20 @@ def disk_locked(path: str) -> bool:
     """True when another open file description holds a QEMU image lock.
 
     F_OFD_GETLK only asks; it takes no lock, so probing cannot disturb a
-    running VM or one that is starting.
+    running VM or one that is starting. Only regular files and block devices
+    are opened, and without blocking: a FIFO would hang the refresh, and
+    opening some character devices has side effects.
     """
+    if not probe_safe(path):
+        return False
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+                     | os.O_NONBLOCK)
     except OSError:
         return False
     try:
+        if not _image_mode(os.fstat(fd).st_mode):
+            return False
         request = struct.pack("hhqqi4x", fcntl.F_WRLCK, os.SEEK_SET,
                               _LOCK_START, _LOCK_LENGTH, 0)
         answer = fcntl.fcntl(fd, fcntl.F_OFD_GETLK, request)
@@ -99,6 +107,21 @@ def disk_locked(path: str) -> bool:
         os.close(fd)
 
 
+def _image_mode(mode: int) -> bool:
+    return stat.S_ISREG(mode) or stat.S_ISBLK(mode)
+
+
+def probe_safe(path: str) -> bool:
+    """True for a path that is a regular file or block device right now."""
+    try:
+        return _image_mode(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+QMP_WORDS = ("-qmp", "--qmp")
+
+
 def find_pane(tree: Any, qmp_path: str) -> Any | None:
     """The pane whose foreground command opens exactly this QMP socket.
 
@@ -106,7 +129,9 @@ def find_pane(tree: Any, qmp_path: str) -> Any | None:
     QEMU argv appears in ``kilix run``'s launcher and in its Python host, not
     necessarily in the last process kitty lists. The socket path is compared
     whole after QEMU's own key splitting, never as a substring and never by
-    the (mutable) tab title.
+    the (mutable) tab title. The path must be the value of a ``-qmp``
+    option, so a pane that merely mentions the socket (``socat - unix:…``)
+    is not mistaken for the VM's tab.
     """
     if tree is None:
         return None
@@ -114,8 +139,9 @@ def find_pane(tree: Any, qmp_path: str) -> Any | None:
         argvs = [process.argv for process in getattr(pane, "processes", ())]
         argvs.append(tuple(getattr(pane, "argv", ())))
         for argv in argvs:
-            for word in argv:
-                if model.unix_path(word) == qmp_path:
+            for index, word in enumerate(argv):
+                if (index and argv[index - 1] in QMP_WORDS
+                        and model.unix_path(word) == qmp_path):
                     return pane
     return None
 
@@ -243,6 +269,13 @@ class QemuManager:
                 result.state = "stopped"
         pane = find_pane(tree, vm.qmp)
         result.pane_id = int(getattr(pane, "id", 0) or 0) if pane else 0
+        if result.state == "stopped" and result.pane_id:
+            # A Kilix tab still runs this VM's command, though no other
+            # witness is up yet (QEMU is starting, or slow to open QMP).
+            # Opening a second copy beside it is never right.
+            result.state = "starting"
+            result.detail = (f"its Kilix tab (pane {result.pane_id}) is open; "
+                             "QMP does not answer yet")
         return result
 
     def inventory(self) -> tuple[list[VmStatus], list[str], str]:
@@ -310,7 +343,7 @@ class QemuManager:
     def _claim_launch(self, vm: VmDefinition) -> bool:
         """Create the launch marker exclusively; False if another holds it."""
         marker = self._marker(vm)
-        os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
+        model.ensure_runtime_dir()
         if os.path.exists(marker) and not self._launching(vm):
             try:
                 os.unlink(marker)       # a stale claim from a crashed launch
@@ -336,8 +369,10 @@ class QemuManager:
         tree, _problem = self.tree()
         current = self.status(vm, tree)
         if current.state == "starting":
+            where = f" ({current.detail})" if current.detail else ""
             return OperationResult(
-                False, f"{vm.name} is already being launched.", command)
+                False, f"{vm.name} is already being launched{where}; not "
+                       "opening a second copy.", command)
         if current.live:
             if current.pane_id:
                 return self.focus(vm)
@@ -350,7 +385,11 @@ class QemuManager:
             return OperationResult(
                 False, "Open this manager inside Kilix before launching a VM.",
                 command)
-        os.makedirs(model.runtime_dir(), mode=0o700, exist_ok=True)
+        try:
+            model.ensure_runtime_dir()
+        except model.RuntimeDirError as error:
+            return OperationResult(
+                False, f"Not launching {vm.name}: {error}.", command)
         if not self._claim_launch(vm):
             return OperationResult(
                 False, f"{vm.name} is already being launched.", command)
@@ -420,6 +459,10 @@ class QemuManager:
         rows: list[dict[str, Any]] = []
         for path in vm.disks:
             row: dict[str, Any] = {"path": path}
+            if os.path.lexists(path) and not probe_safe(path):
+                row["error"] = "not a regular file or block device; not probed"
+                rows.append(row)
+                continue
             try:
                 done = self._runner(self.qemu_img_argv(path), 10)
             except (OSError, subprocess.SubprocessError) as error:

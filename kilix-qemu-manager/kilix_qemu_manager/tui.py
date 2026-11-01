@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import curses
+import json
 import queue
 import shlex
 import textwrap
@@ -15,7 +16,7 @@ from kilix_tui import keys as keymap, shell
 
 from . import store
 from .backend import DESTRUCTIVE, OperationResult, QemuManager
-from .model import VmStatus
+from .model import VmDefinition, VmStatus
 
 TITLE = "QEMU VMs"
 DETAIL_TABS = ("Overview", "Disks", "Help")
@@ -34,6 +35,27 @@ LAUNCH = Action("launch", "Launch in a Kilix tab",
                 "Run the VM through kilix run in a new tab titled QEMU: <name>.")
 FOCUS = Action("focus", "Focus its Kilix tab",
                "Switch to the tab whose command owns this VM's QMP socket.")
+
+
+@dataclass(frozen=True)
+class Target:
+    """The VM a modal was opened for, and proof of which definition it was.
+
+    A modal outlives refreshes, and a refresh can move the selection (the
+    VM's file was removed, or stopped loading). Every action chosen or
+    confirmed in a modal acts on this VM, never on whatever is selected, and
+    only while its definition on disk is still exactly this one.
+    """
+    vm: VmDefinition
+    fingerprint: str
+
+    @classmethod
+    def of(cls, vm: VmDefinition) -> "Target":
+        return cls(vm, fingerprint(vm))
+
+
+def fingerprint(vm: VmDefinition) -> str:
+    return json.dumps(vm.as_json(), sort_keys=True)
 
 
 def actions_for(status: VmStatus) -> list[Action]:
@@ -88,6 +110,7 @@ class State:
         self.modal = ""
         self.action_index = 0
         self.confirm_action: Action | None = None
+        self.target: Target | None = None
         self.message = ""
         self.error = ""
         self.pending = ""
@@ -105,8 +128,16 @@ class State:
         return self.machines[self.selected]
 
     @property
+    def modal_status(self) -> VmStatus | None:
+        """The latest status of the VM the open modal is bound to."""
+        if self.target is None:
+            return None
+        return next((status for status in self.machines
+                     if status.vm.id == self.target.vm.id), None)
+
+    @property
     def actions(self) -> list[Action]:
-        status = self.selected_vm
+        status = self.modal_status if self.modal else self.selected_vm
         return actions_for(status) if status else []
 
     def refresh(self) -> None:
@@ -160,7 +191,13 @@ class State:
         status = self.selected_vm
         if status is None:
             return
-        now = store.toggle_favorite(status.vm.id)
+        try:
+            now = store.toggle_favorite(status.vm.id)
+        except OSError as error:
+            self.error = self.message = (
+                f"Could not save favorites ({error}); {status.vm.name} is "
+                "unchanged.")
+            return
         self.message = (f"{status.vm.name} is a favorite." if now
                         else f"{status.vm.name} is no longer a favorite.")
         self.error = ""
@@ -168,10 +205,35 @@ class State:
         self.select_id(status.vm.id)
 
     def open_actions(self) -> None:
-        if self.selected_vm and self.actions and not self.pending:
+        status = self.selected_vm
+        if status and actions_for(status) and not self.pending:
+            self.target = Target.of(status.vm)
             self.modal = "actions"
             self.action_index = min(self.action_index,
                                     max(0, len(self.actions) - 1))
+
+    def close_modal(self) -> None:
+        self.modal, self.confirm_action, self.target = "", None, None
+
+    def target_problem(self) -> str:
+        """Why the modal's VM may no longer be acted on; '' when it may.
+
+        The catalog is read again from disk, so a definition removed or
+        edited since the last refresh is caught too.
+        """
+        target = self.target
+        if target is None:
+            return "no VM was chosen"
+        try:
+            machines, _problems = store.load_all()
+        except Exception as error:
+            return f"the catalog could not be read ({error})"
+        current = next((vm for vm in machines if vm.id == target.vm.id), None)
+        if current is None:
+            return f"{target.vm.name} is no longer in the catalog"
+        if fingerprint(current) != target.fingerprint:
+            return f"{target.vm.name}'s definition changed since it was shown"
+        return ""
 
     def primary(self) -> None:
         """Enter: launch a stopped VM, focus a live one's existing tab."""
@@ -193,30 +255,50 @@ class State:
                 f"{status.vm.name} is live, no Kilix tab — not opening a "
                 "second copy.")
 
+    def _refuse(self, action: Action, problem: str) -> None:
+        self.close_modal()
+        self.error = self.message = (
+            f"Not done: {action.label} — {problem}; nothing was sent. "
+            "Choose the VM and the action again.")
+
     def choose_action(self) -> None:
         actions = self.actions
         if not actions or not 0 <= self.action_index < len(actions):
             return
         action = actions[self.action_index]
+        if problem := self.target_problem():
+            self._refuse(action, problem)
+            return
         if action.confirm or action.ident in DESTRUCTIVE:
             self.confirm_action = action
             self.modal = "confirm"
         else:
-            self.modal = ""
-            self._begin(action)
+            target = self.target
+            self.close_modal()
+            self._begin(action, target.vm)
 
     def confirm(self, yes: bool) -> None:
-        action, self.confirm_action, self.modal = self.confirm_action, None, ""
-        if yes and action:
-            self._begin(action)
-        elif action:
-            self.message = f"Cancelled: {action.label}."
-
-    def _begin(self, action: Action) -> None:
-        status = self.selected_vm
-        if status is None or self.pending:
+        action, target = self.confirm_action, self.target
+        if not yes or action is None or target is None:
+            self.close_modal()
+            if action:
+                self.message = f"Cancelled: {action.label}."
             return
-        vm = status.vm
+        # The confirmation was shown for target; act on it or on nothing.
+        if problem := self.target_problem():
+            self._refuse(action, problem)
+            return
+        self.close_modal()
+        self._begin(action, target.vm)
+
+    def _begin(self, action: Action, vm: VmDefinition | None = None) -> None:
+        if vm is None:
+            status = self.selected_vm
+            if status is None:
+                return
+            vm = status.vm
+        if self.pending:
+            return
         self.pending = f"{action.label}: {vm.name}"
         self.message = self.error = ""
 
@@ -231,11 +313,16 @@ class State:
                          daemon=True).start()
 
     def preview(self, action: Action) -> str:
-        status = self.selected_vm
-        if status is None:
-            return ""
-        command = self.manager.preview(status.vm, action.ident, self.size,
-                                       pane_id=status.pane_id)
+        if self.modal and self.target is not None:
+            vm = self.target.vm
+            status = self.modal_status
+        else:
+            status = self.selected_vm
+            if status is None:
+                return ""
+            vm = status.vm
+        command = self.manager.preview(vm, action.ident, self.size,
+                                       pane_id=status.pane_id if status else 0)
         if command and command[0] == "qmp":
             return f"QMP unix:{command[1]} ← {command[2]}"
         return shlex.join(command)
@@ -450,11 +537,16 @@ def _draw_details(surface, state: State, top: int, left: int, height: int,
 
 def _draw_modal(surface, state: State, top: int, left: int, height: int,
                 width: int) -> None:
-    status = state.selected_vm
-    if status is None or height <= 0 or width <= 0:
+    target = state.target
+    if target is None or height <= 0 or width <= 0:
         return
+    if state.modal_status is None:
+        _put(surface, top + height - 1, left,
+             f"{target.vm.name} is gone from the catalog; nothing will be "
+             "run"[:width], tango.attr("alert"))
+        height -= 1
     if state.modal == "actions":
-        _put(surface, top, left, f"ACTIONS · {status.vm.name}"[:width],
+        _put(surface, top, left, f"ACTIONS · {target.vm.name}"[:width],
              tango.attr("title"))
         row = top + 2
         for index, action in enumerate(state.actions):
@@ -478,7 +570,7 @@ def _draw_modal(surface, state: State, top: int, left: int, height: int,
     action = state.confirm_action
     if action is None:
         return
-    _put(surface, top, left, f"Confirm: {action.label} — {status.vm.name}"[:width],
+    _put(surface, top, left, f"Confirm: {action.label} — {target.vm.name}"[:width],
          tango.attr("danger"))
     row = top + 2
     for line in textwrap.wrap(action.description, max(1, width)):
@@ -570,7 +662,7 @@ def handle(key: int, state: State) -> bool:
         return True
     if state.modal == "actions":
         if key in (27, ord("q"), ord("Q"), ord("a")):
-            state.modal = ""
+            state.close_modal()
         elif step := keymap.direction(key):
             state.move(step)
         elif key in keymap.SELECT:

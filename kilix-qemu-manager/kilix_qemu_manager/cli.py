@@ -271,7 +271,12 @@ def main(argv: list[str] | None = None) -> int:
         vm = _lookup(args.name)
         if vm is None:
             return 1
-        changed = store.set_favorite(vm.id, args.command == "favorite")
+        try:
+            changed = store.set_favorite(vm.id, args.command == "favorite")
+        except OSError as error:
+            print(f"{PROG}: could not save favorites ({error}); nothing "
+                  "changed", file=sys.stderr)
+            return 1
         state = "a favorite" if args.command == "favorite" else "not a favorite"
         print(f"{vm.name} is {'now' if changed else 'already'} {state}.")
         return 0

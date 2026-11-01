@@ -11,7 +11,14 @@ Import is the one place an argv is changed, and every change is reported:
 * a ``-display`` other than gtk or sdl is removed, because only a window can
   be streamed into a tab;
 * an existing ``-pidfile`` is kept, otherwise one is assigned;
-* a per-VM QMP socket is added under ``$XDG_RUNTIME_DIR/kilix-qemu``.
+* a per-VM QMP socket is added under ``$XDG_RUNTIME_DIR/kilix-qemu``;
+* another VM's control files are never kept. A ``-pidfile`` or a QMP/monitor
+  socket that belongs to another catalogued VM, or that lies in the manager's
+  runtime directory under another VM's name, is replaced by this VM's own (a
+  pidfile) or removed (a socket), with a note. A ``-chardev`` or other device
+  bound to such a socket is refused, because other options refer to it by id.
+  A pidfile or socket that belongs to no catalogued VM and lies outside the
+  runtime directory is the user's (or a build's) own and is kept.
 
 Anything the manager cannot represent faithfully is refused rather than
 guessed at: stdio-bound monitors and serial ports, ``-nographic``,
@@ -23,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
@@ -64,10 +72,52 @@ def state_path() -> str:
 
 
 def runtime_dir() -> str:
+    """Where QMP sockets, assigned pidfiles and launch markers live.
+
+    ``$XDG_RUNTIME_DIR/kilix-qemu``; without an absolute XDG_RUNTIME_DIR, the
+    fallback is ``<tmp>/kilix-qemu-<uid>``. Either one is used for a launch
+    only after :func:`ensure_runtime_dir` has proved it is this user's own.
+    """
     base = os.environ.get("XDG_RUNTIME_DIR", "")
     if base and os.path.isabs(base):
         return os.path.join(base, "kilix-qemu")
     return os.path.join(tempfile.gettempdir(), f"kilix-qemu-{os.getuid()}")
+
+
+class RuntimeDirError(OSError):
+    """The runtime directory exists but is not safely this user's."""
+
+
+def ensure_runtime_dir() -> str:
+    """Create the runtime directory 0700, or prove an existing one is safe.
+
+    A shared temporary directory lets another user create the fallback
+    first and plant sockets in it, so the directory must be a real directory
+    (not a symlink), owned by this user, with no group or other access.
+    """
+    path = runtime_dir()
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise RuntimeDirError(f"cannot create runtime directory {path}: "
+                              f"{error.strerror or error}") from error
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise RuntimeDirError(f"cannot use runtime directory {path}: {error}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeDirError(
+            f"runtime directory {path} is not a directory (or is a symlink)")
+    if info.st_uid != os.getuid():
+        raise RuntimeDirError(
+            f"runtime directory {path} belongs to uid {info.st_uid}, not you")
+    if info.st_mode & 0o077:
+        raise RuntimeDirError(
+            f"runtime directory {path} is mode "
+            f"{stat.S_IMODE(info.st_mode):04o}; it must be 0700")
+    return path
 
 
 def qmp_path(vm_id: str) -> str:
@@ -104,7 +154,7 @@ FLAGS = frozenset({
     "daemonize", "preconfig", "usb", "sdl", "alt-grab", "ctrl-grab",
     "semihosting", "only-migratable", "enable-fips", "old-param", "no-frame",
     "rtc-td-hack", "enable-sync-profile", "perfmap", "jitdump",
-    "async-teardown", "localtime", "no-quit", "singlestep",
+    "async-teardown", "localtime", "no-quit", "singlestep", "mem-prealloc",
 })
 # Options this module acts on. A value that spells one of these is refused:
 # it means the option table above disagreed with the argv's author, and a
@@ -115,8 +165,11 @@ ACTED_ON = frozenset({
     "chardev", "curses", "drive", "hda", "hdb", "hdc", "hdd", "blockdev",
 })
 STDIO_OPTIONS = frozenset({
-    "serial", "monitor", "qmp", "qmp-pretty", "parallel", "debugcon",
+    "serial", "monitor", "qmp", "qmp-pretty", "parallel", "debugcon", "gdb",
 })
+# Monitors that are whole on one option, so one bound to another VM's socket
+# can be dropped without breaking a reference elsewhere in the argv.
+MONITOR_OPTIONS = frozenset({"qmp", "qmp-pretty", "monitor"})
 REFUSED_FLAGS = {
     "nographic": "-nographic puts the serial console and monitor on stdio, "
                  "which a Kilix tab does not connect to the guest",
@@ -257,23 +310,78 @@ def disk_files(args: Sequence[str], cwd: str) -> list[str]:
             if ":" in path and not os.path.isabs(path):
                 continue            # a protocol (nbd:, json:), not a file
             files.append(_absolute(path, cwd))
+        elif item.name == "pflash":
+            files.append(_absolute(item.value, cwd))
         elif item.name == "blockdev":
-            path = ""
             if item.value.lstrip().startswith("{"):
                 try:
                     data = json.loads(item.value)
-                except ValueError:
+                except (ValueError, RecursionError):
                     data = {}
-                if isinstance(data, dict) and data.get("read-only") is not True:
-                    path = str(data.get("filename") or "")
+                paths = _json_blockdev_files(data)
             else:
-                keys = _keys(item.value)
-                if keys.get("read-only") not in ("on", "yes", "true"):
-                    path = keys.get("filename", "")
-            if path:
-                files.append(_absolute(path, cwd))
+                paths = _dotted_blockdev_files(_keys(item.value))
+            files.extend(_absolute(path, cwd) for path in paths)
     seen: set[str] = set()
     return [path for path in files if not (path in seen or seen.add(path))]
+
+
+_TRUE = ("on", "yes", "true")
+
+
+def _json_blockdev_files(node: Any, depth: int = 0) -> list[str]:
+    """File names in a JSON -blockdev and the "file" nodes nested under it."""
+    if not isinstance(node, dict) or depth > 8 or node.get("read-only") is True:
+        return []
+    found = []
+    if isinstance(node.get("filename"), str) and node["filename"]:
+        found.append(node["filename"])
+    return found + _json_blockdev_files(node.get("file"), depth + 1)
+
+
+def _dotted_blockdev_files(keys: dict[str, str]) -> list[str]:
+    """``filename=`` and ``file.filename=`` (any depth) of a dotted -blockdev."""
+    found = []
+    for key, value in keys.items():
+        if key != "filename" and not key.endswith(".filename"):
+            continue
+        prefix = key[: -len("filename")]
+        # A read-only node, or one under a read-only parent, takes no write lock.
+        parts = prefix.rstrip(".").split(".") if prefix else []
+        ancestors = [".".join(parts[:index]) for index in range(len(parts) + 1)]
+        if any(keys.get(f"{scope}.read-only" if scope else "read-only") in _TRUE
+               for scope in ancestors):
+            continue
+        if value:
+            found.append(value)
+    return found
+
+
+def control_paths(args: Sequence[str], cwd: str) -> set[str]:
+    """Every pidfile and unix socket path an argv opens, made absolute."""
+    found: set[str] = set()
+    try:
+        items = parse_options(args)
+    except DefinitionError:
+        return found
+    for item in items:
+        if not isinstance(item, Option) or item.value is None:
+            continue
+        if item.name == "pidfile":
+            found.add(_absolute(item.value, cwd))
+        elif (path := _socket_path(item.name, item.value)):
+            found.add(_absolute(path, cwd))
+    return found
+
+
+def _socket_path(name: str, value: str) -> str | None:
+    """The unix socket an option binds: ``unix:PATH`` or a chardev ``path=``."""
+    if name == "chardev":
+        parts = split_keys(value)
+        if parts and parts[0] == "socket":
+            return _keys(value).get("path") or None
+        return None
+    return unix_path(value)
 
 
 @dataclass
@@ -303,8 +411,13 @@ def normalise(
     args: Sequence[str],
     *,
     cwd: str,
+    claimed: dict[str, str] | None = None,
 ) -> Normalised:
-    """Return the argv this manager will launch, with every change noted."""
+    """Return the argv this manager will launch, with every change noted.
+
+    ``claimed`` maps the pidfile and QMP paths of the other catalogued VMs to
+    their ids; see the module notes for what happens to them.
+    """
     check_binary(binary)
     if not ID_PATTERN.fullmatch(vm_id):
         raise DefinitionError(f"{vm_id!r} is not a valid VM id")
@@ -318,9 +431,25 @@ def normalise(
     notes: list[str] = []
     pidfile = ""
     name = ""
-    own_qmp = qmp_path(vm_id)
+    own_qmp = os.path.normpath(qmp_path(vm_id))
+    own_pid = os.path.normpath(pid_path(vm_id))
     own_spec = qmp_spec(own_qmp)
     has_own_qmp = False
+    claimed = {os.path.normpath(path): owner
+               for path, owner in (claimed or {}).items() if owner != vm_id}
+    runtime = os.path.normpath(runtime_dir())
+
+    def foreign(path: str) -> str:
+        """Whose control file `path` is, when it is not this VM's; else ''."""
+        path = os.path.normpath(_absolute(path, cwd))
+        if path in (own_qmp, own_pid):
+            return ""
+        if path in claimed:
+            return f"VM {claimed[path]}'s"
+        if os.path.dirname(path) == runtime:
+            return "another VM's"      # the manager's own namespace
+        return ""
+
     for item in items:
         if isinstance(item, str):
             kept.append(item)
@@ -357,21 +486,49 @@ def normalise(
             if pidfile:
                 raise DefinitionError("the argv names more than one -pidfile")
             pidfile = _absolute(item.value or "", cwd)
-            kept.append(Option(item.word, item.name, pidfile))
-            if pidfile != item.value:
+            if owner := foreign(pidfile):
+                notes.append(f"replaced -pidfile {pidfile}: it is {owner} "
+                             f"pidfile; assigned {own_pid}")
+                pidfile = own_pid
+            elif pidfile != item.value:
                 notes.append(f"made -pidfile absolute: {pidfile}")
             else:
                 notes.append(f"kept -pidfile {pidfile}")
+            kept.append(Option(item.word, item.name, pidfile))
             continue
-        if item.name == "qmp" and item.value == own_spec:
-            has_own_qmp = True
+        socket_path = (_socket_path(item.name, item.value)
+                       if item.value is not None else None)
+        if socket_path:
+            absolute = os.path.normpath(_absolute(socket_path, cwd))
+            if absolute == own_qmp and item.name == "qmp":
+                if has_own_qmp:
+                    notes.append(f"removed a second -qmp on {own_qmp}")
+                    continue
+                has_own_qmp = True
+                if item.value != own_spec:
+                    notes.append(f"rewrote -qmp {item.value} as {own_spec}")
+                kept.append(Option(item.word, item.name, own_spec))
+                continue
+            if absolute == own_qmp:
+                raise DefinitionError(
+                    f"{item.word} {item.value} binds this VM's QMP socket path, "
+                    "which the manager's own -qmp needs")
+            if owner := foreign(absolute):
+                if item.name in MONITOR_OPTIONS:
+                    notes.append(f"removed {item.word} {item.value}: it is "
+                                 f"{owner} socket; this VM gets its own")
+                    continue
+                raise DefinitionError(
+                    f"{item.word} {item.value} binds {owner} socket {absolute}; "
+                    "other options may refer to it, so it cannot simply be "
+                    "dropped — edit the argv")
         if item.name == "name" and item.value:
             name = split_keys(item.value)[0]
             if name.startswith("guest="):
                 name = name[len("guest="):]
         kept.append(item)
     if not pidfile:
-        pidfile = pid_path(vm_id)
+        pidfile = own_pid
         kept.append(Option("-pidfile", "pidfile", pidfile))
         notes.append(f"assigned -pidfile {pidfile}")
     if len(own_qmp.encode()) >= UNIX_PATH_MAX:

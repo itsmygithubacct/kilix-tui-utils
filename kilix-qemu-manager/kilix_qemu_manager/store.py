@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 from datetime import datetime, timezone
 
 from . import model
 from .model import DefinitionError, VmDefinition
 
 MAX_RECENTS = 5
+# A deeply nested file makes json raise RecursionError, which is not a
+# ValueError; it is damage like any other.
+DAMAGE = (OSError, ValueError, RecursionError)
+# The TUI writes state from its main thread (f) and from its worker thread
+# (a launch records a recent); every read-modify-write holds this lock.
+_STATE_LOCK = threading.RLock()
 
 
 # ── definitions ──────────────────────────────────────────────────────────────
@@ -43,6 +51,9 @@ def load_all() -> tuple[list[VmDefinition], list[str]]:
         try:
             with open(path, encoding="utf-8") as handle:
                 vm = VmDefinition.from_json(json.load(handle))
+        except RecursionError:
+            problems.append(f"{name}: nested too deeply to read")
+            continue
         except (OSError, ValueError) as error:
             problems.append(f"{name}: {error}")
             continue
@@ -50,14 +61,38 @@ def load_all() -> tuple[list[VmDefinition], list[str]]:
             problems.append(f"{name}: id {vm.id!r} does not match the file")
             continue
         found.append(vm)
-    return found, problems
+    # Each VM's status and controls go through its own pidfile and QMP
+    # socket. A definition whose argv opens another's (a hand edit, or a
+    # clone made before import refused that) would act on the other VM.
+    owners = claimed_paths(found)
+    clean: list[VmDefinition] = []
+    for vm in found:
+        shared = sorted({owners[path] for path in
+                         model.control_paths(vm.argv, vm.cwd or "/")
+                         if owners.get(path, vm.id) != vm.id})
+        if shared:
+            problems.append(
+                f"{vm.id}.json: its argv opens the pidfile or QMP socket of "
+                f"{', '.join(shared)}; re-import it to give it its own")
+            continue
+        clean.append(vm)
+    return clean, problems
+
+
+def claimed_paths(machines: list[VmDefinition]) -> dict[str, str]:
+    """Each catalogued VM's pidfile and QMP socket path, mapped to its id."""
+    owners: dict[str, str] = {}
+    for vm in machines:
+        owners[os.path.normpath(vm.pidfile)] = vm.id
+        owners[os.path.normpath(vm.qmp)] = vm.id
+    return owners
 
 
 def get(vm_id: str) -> VmDefinition | None:
     try:
         with open(_definition_path(vm_id), encoding="utf-8") as handle:
             return VmDefinition.from_json(json.load(handle))
-    except (OSError, ValueError):
+    except DAMAGE:
         return None
 
 
@@ -75,10 +110,13 @@ def find(value: str) -> VmDefinition | None:
 
 
 def _write_json(path: str, data: object) -> None:
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    swap = f"{path}.tmp.{os.getpid()}"
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    # A unique swap file per write, so two writers never share one.
+    fd, swap = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.",
+                                suffix=".tmp", dir=directory)
     try:
-        with open(swap, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
             handle.write("\n")
         os.replace(swap, path)
@@ -100,10 +138,13 @@ def remove(vm_id: str) -> str:
     """Delete one definition file. Disks and every other file stay."""
     path = _definition_path(vm_id)
     os.unlink(path)
-    record = load_state()
-    record["favorites"] = [item for item in record["favorites"] if item != vm_id]
-    record["recents"] = [row for row in record["recents"] if row["id"] != vm_id]
-    save_state(record)
+    with _STATE_LOCK:
+        record = load_state()
+        record["favorites"] = [item for item in record["favorites"]
+                               if item != vm_id]
+        record["recents"] = [row for row in record["recents"]
+                             if row["id"] != vm_id]
+        save_state(record)
     return path
 
 
@@ -141,7 +182,7 @@ def load_state() -> dict:
     try:
         with open(model.state_path(), encoding="utf-8") as handle:
             record = json.load(handle)
-    except (OSError, ValueError):
+    except DAMAGE:
         record = {}
     if not isinstance(record, dict):
         record = {}
@@ -149,16 +190,24 @@ def load_state() -> dict:
             "recents": _recents(record.get("recents"))}
 
 
-def save_state(record: dict) -> bool:
-    """Write atomically, and only when the record changed. True if written."""
+def save_state(record: dict, *, strict: bool = False) -> bool:
+    """Write atomically, and only when the record changed. True if written.
+
+    An unwritable state file returns False (a manager that cannot persist
+    still runs), unless ``strict``: then the OSError reaches the caller, so a
+    user who asked for a change can be told it was not saved.
+    """
     clean = {"favorites": _ids(record.get("favorites")),
              "recents": _recents(record.get("recents"))}
-    if clean == load_state():
-        return False
-    try:
-        _write_json(model.state_path(), clean)
-    except OSError:
-        return False            # a manager that cannot persist still runs
+    with _STATE_LOCK:
+        if clean == load_state():
+            return False
+        try:
+            _write_json(model.state_path(), clean)
+        except OSError:
+            if strict:
+                raise
+            return False
     return True
 
 
@@ -167,23 +216,32 @@ def favorites() -> list[str]:
 
 
 def set_favorite(vm_id: str, wanted: bool) -> bool:
-    """Make `vm_id` a favorite or not; True when that changed anything."""
-    record = load_state()
-    present = vm_id in record["favorites"]
-    if present == wanted:
-        return False
-    if wanted:
-        record["favorites"].append(vm_id)
-    else:
-        record["favorites"].remove(vm_id)
-    save_state(record)
+    """Make `vm_id` a favorite or not; True when that changed anything.
+
+    Raises OSError when the change could not be saved, rather than report a
+    favorite that the next start would not show.
+    """
+    with _STATE_LOCK:
+        record = load_state()
+        present = vm_id in record["favorites"]
+        if present == wanted:
+            return False
+        if wanted:
+            record["favorites"].append(vm_id)
+        else:
+            record["favorites"].remove(vm_id)
+        save_state(record, strict=True)
     return True
 
 
 def toggle_favorite(vm_id: str) -> bool:
-    """Flip the favorite mark; True when it is now a favorite."""
-    now = vm_id not in favorites()
-    set_favorite(vm_id, now)
+    """Flip the favorite mark; True when it is now a favorite.
+
+    Raises OSError, as set_favorite does, when the flip was not saved.
+    """
+    with _STATE_LOCK:
+        now = vm_id not in favorites()
+        set_favorite(vm_id, now)
     return now
 
 
@@ -193,11 +251,12 @@ def recents() -> list[dict]:
 
 def remember_launch(vm_id: str, when: datetime | None = None) -> None:
     moment = (when or datetime.now(timezone.utc)).replace(microsecond=0)
-    record = load_state()
-    record["recents"] = [{"id": vm_id, "at": moment.isoformat()}] + [
-        row for row in record["recents"] if row["id"] != vm_id
-    ][:MAX_RECENTS - 1]
-    save_state(record)
+    with _STATE_LOCK:
+        record = load_state()
+        record["recents"] = [{"id": vm_id, "at": moment.isoformat()}] + [
+            row for row in record["recents"] if row["id"] != vm_id
+        ][:MAX_RECENTS - 1]
+        save_state(record)
 
 
 def ordered(machines: list[VmDefinition]) -> list[VmDefinition]:

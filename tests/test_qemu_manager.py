@@ -943,6 +943,7 @@ class IntegrationTests(Sandbox):
         prefix = self.tmp / "prefix"
         environment = dict(os.environ, HOME=str(self.tmp / "home-dir"),
                            KILIX_TUI_UTILS_PREFIX=str(prefix),
+                           KILIX_TUI_UTILS_SYNC_MENU="1",
                            PYTHONDONTWRITEBYTECODE="1")
         done = subprocess.run(["bash", str(stage / "install.sh")],
                               env=environment, capture_output=True, text=True,
@@ -988,6 +989,522 @@ class IntegrationTests(Sandbox):
             with self.subTest(path=path.name):
                 self.assertNotIn("shell=True", text)
                 self.assertNotIn("os.system", text)
+
+
+
+# ── fix round r2: findings of review QM-R1 ───────────────────────────────────
+
+
+def _proc_entry(root: Path, pid: int, argv: list[str]) -> str:
+    """A synthetic /proc/<pid>/cmdline under `root`; returns the proc root."""
+    (root / str(pid)).mkdir(parents=True, exist_ok=True)
+    (root / str(pid) / "cmdline").write_bytes(
+        b"\0".join(word.encode() for word in argv) + b"\0")
+    return str(root)
+
+
+class ConfirmTargetTests(Sandbox):
+    """B1: a confirmation acts on the VM it was shown for, or on nothing."""
+
+    def two_running(self):
+        alpha, bravo = self.define("Alpha"), self.define("Bravo")
+        self.start_outside(alpha)
+        self.start_outside(bravo)
+        self.wait_for(lambda: self.qmp_up(alpha) and self.qmp_up(bravo))
+        state = tui.State(self.manager(), refresh_seconds=0)
+        state.select_id(alpha.id)
+        return alpha, bravo, state
+
+    def confirm_poweroff_for_alpha(self, state, alpha):
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "poweroff")
+        tui.handle(ENTER, state)
+        self.assertEqual(state.modal, "confirm")
+        frame = app.render_to_text(tui.render, state, height=24, width=120)
+        self.assertIn("Confirm: Power off — Alpha", frame)
+
+    def test_y_after_the_confirmed_vm_vanished_refuses_and_spares_the_next(self):
+        alpha, bravo, state = self.two_running()
+        self.confirm_poweroff_for_alpha(state, alpha)
+        os.unlink(store._definition_path(alpha.id))
+        state.refresh()                       # what the 3 s timer does
+        self.assertEqual(state.selected_vm.vm.id, bravo.id)
+        frame = app.render_to_text(tui.render, state, height=24, width=120)
+        self.assertIn("Confirm: Power off — Alpha", frame)    # never Bravo
+        self.assertIn(alpha.qmp, frame.replace("\n ", ""))
+        self.assertIn("Alpha is gone from the catalog", frame)
+        tui.handle(ord("y"), state)
+        TuiTests.wait(state)
+        self.assertEqual(state.modal, "")
+        self.assertIn("Not done: Power off — Alpha is no longer in the catalog",
+                      state.error)
+        self.assertNotIn("quit", self.qmp_log())
+        self.assertTrue(self.qmp_up(alpha) and self.qmp_up(bravo))
+
+    def test_y_after_the_definition_changed_refuses(self):
+        alpha, bravo, state = self.two_running()
+        self.confirm_poweroff_for_alpha(state, alpha)
+        alpha.notes = "edited in another tab"
+        store.save(alpha, replace=True)        # same id, other definition
+        tui.handle(ord("y"), state)
+        TuiTests.wait(state)
+        self.assertIn("definition changed since it was shown", state.error)
+        self.assertNotIn("quit", self.qmp_log())
+        self.assertTrue(self.qmp_up(alpha) and self.qmp_up(bravo))
+
+    def test_y_on_an_unchanged_vm_acts_on_it_even_if_selection_moved(self):
+        alpha, bravo, state = self.two_running()
+        self.confirm_poweroff_for_alpha(state, alpha)
+        state.selected = [s.vm.id for s in state.machines].index(bravo.id)
+        tui.handle(ord("y"), state)
+        TuiTests.wait(state)
+        self.assertEqual(state.message, "Powered off Alpha.")
+        self.wait_for(lambda: not self.qmp_up(alpha))
+        self.assertTrue(self.qmp_up(bravo))
+
+    def test_the_actions_menu_is_bound_to_its_vm_too(self):
+        alpha, bravo, state = self.two_running()
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "pause")
+        os.unlink(store._definition_path(alpha.id))
+        state.refresh()
+        self.assertEqual(state.actions, [])    # Alpha's actions, now none
+        tui.handle(ENTER, state)
+        TuiTests.wait(state)
+        self.assertNotIn("stop", self.qmp_log())
+        self.assertEqual(manager_state(self, bravo), "running")
+
+
+def manager_state(case, vm) -> str:
+    return case.manager().status(vm).state
+
+
+class ForeignControlFileTests(Sandbox):
+    """B2: import never keeps another VM's pidfile or QMP socket."""
+
+    def test_a_cloned_argv_gets_its_own_pidfile_and_qmp_and_says_so(self):
+        alpha = self.define("Alpha")
+        code, out, err = self.run_cli("import", "Bravo", "--", self.qemu,
+                                      *alpha.argv)
+        self.assertEqual(code, 0, err)
+        bravo = store.get("bravo")
+        self.assertNotIn(alpha.pidfile, bravo.argv)
+        self.assertFalse(any(alpha.qmp in word for word in bravo.argv))
+        self.assertEqual(bravo.argv.count("-qmp"), 1)
+        self.assertEqual(bravo.argv.count("-pidfile"), 1)
+        self.assertEqual((bravo.pidfile, bravo.qmp),
+                         (model.pid_path("bravo"), model.qmp_path("bravo")))
+        self.assertIn(f"replaced -pidfile {alpha.pidfile}: it is VM alpha's",
+                      out)
+        self.assertIn("it is VM alpha's socket", out)
+
+    def test_the_clone_running_never_makes_the_original_read_live(self):
+        alpha = self.define("Alpha")
+        bravo, _notes = discovery.definition_from(
+            "Bravo", self.qemu, list(alpha.argv), cwd=str(self.tmp))
+        store.save(bravo)
+        self.start_outside(bravo)
+        self.wait_for(lambda: self.qmp_up(bravo))
+        manager = self.manager()
+        self.assertEqual(manager.status(alpha).state, "stopped")
+        self.assertFalse(manager.control(alpha, "poweroff").ok)
+        self.assertTrue(self.qmp_up(bravo))
+
+    def test_files_in_the_runtime_dir_named_for_another_vm_are_replaced(self):
+        ghost_pid = model.pid_path("ghost")      # no VM "ghost" is catalogued
+        ghost_qmp = model.qmp_path("ghost")
+        normal = model.normalise(
+            "scratch", "qemu-system-x86_64",
+            ["-pidfile", ghost_pid, "-qmp", f"unix:{ghost_qmp},server,nowait",
+             "-monitor", f"unix:{ghost_qmp}.hmp,server,nowait"],
+            cwd=str(self.tmp))
+        self.assertEqual(normal.pidfile, model.pid_path("scratch"))
+        self.assertFalse(any("ghost" in word for word in normal.argv))
+        self.assertEqual(normal.argv.count("-qmp"), 1)
+        self.assertNotIn("-monitor", normal.argv)
+
+    def test_a_catalogued_vms_files_outside_the_runtime_dir_are_replaced(self):
+        build = self.tmp / "build"
+        build.mkdir()
+        first = self.define("First", "-pidfile", str(build / "qemu.pid"))
+        self.assertEqual(first.pidfile, str(build / "qemu.pid"))   # kept
+        second, notes = discovery.definition_from(
+            "Second", self.qemu, ["-pidfile", str(build / "qemu.pid")],
+            cwd=str(self.tmp))
+        self.assertEqual(second.pidfile, model.pid_path("second"))
+        self.assertIn("it is VM first's pidfile", "\n".join(notes))
+
+    def test_unclaimed_files_outside_the_runtime_dir_are_the_users_and_kept(self):
+        mine = str(self.tmp / "mine.pid")
+        normal = model.normalise(
+            "scratch", "qemu-system-x86_64",
+            ["-pidfile", mine, "-qmp", "unix:/elsewhere/build.sock,server=on"],
+            cwd=str(self.tmp))
+        self.assertEqual(normal.pidfile, mine)
+        self.assertIn("unix:/elsewhere/build.sock,server=on", normal.argv)
+
+    def test_a_chardev_on_another_vms_socket_is_refused(self):
+        alpha = self.define("Alpha")
+        for args in (["-chardev", f"socket,id=m0,path={alpha.qmp},server=on",
+                      "-mon", "chardev=m0,mode=control"],
+                     ["-serial", f"unix:{alpha.qmp},server=on"]):
+            with self.subTest(args=args[0]):
+                with self.assertRaisesRegex(model.DefinitionError,
+                                            "VM alpha's socket"):
+                    discovery.definition_from("Bravo", self.qemu, args,
+                                              cwd=str(self.tmp))
+
+    def test_a_definition_that_opens_another_vms_files_does_not_load(self):
+        alpha = self.define("Alpha")
+        clone = alpha.as_json()           # what an r1 import would have kept
+        clone.update(id="bravo", name="Bravo", pidfile=model.pid_path("bravo"),
+                     qmp=model.qmp_path("bravo"))
+        clone["argv"] = [*alpha.argv[:-4], "-pidfile", model.pid_path("bravo"),
+                         "-qmp", model.qmp_spec(alpha.qmp),
+                         "-qmp", model.qmp_spec(model.qmp_path("bravo"))]
+        model.VmDefinition.from_json(clone)          # valid on its own
+        Path(store._definition_path("bravo")).write_text(json.dumps(clone))
+        machines, problems = store.load_all()
+        self.assertEqual([vm.id for vm in machines], ["alpha"])
+        self.assertIn("bravo.json: its argv opens the pidfile or QMP socket "
+                      "of alpha", problems[0])
+
+    def test_own_qmp_in_the_old_spelling_is_recognised_not_doubled(self):
+        own = model.qmp_path("scratch")
+        normal = model.normalise(
+            "scratch", "qemu-system-x86_64",
+            ["-qmp", f"unix:{own},server,nowait"], cwd=str(self.tmp))
+        self.assertEqual(normal.argv, [
+            "-qmp", model.qmp_spec(own), "-pidfile", model.pid_path("scratch")])
+        self.assertIn("rewrote -qmp", "\n".join(normal.notes))
+        with self.assertRaisesRegex(model.DefinitionError, "this VM's QMP"):
+            model.normalise("scratch", "qemu-system-x86_64",
+                            ["-monitor", f"unix:{own},server,nowait"],
+                            cwd=str(self.tmp))
+
+
+class GrammarTests(Sandbox):
+    """N3, N4 and the import mutants that survived r1 (R02-R04)."""
+
+    # The no-value options of QEMU 10.0's invocation docs. (The docs also
+    # list -iscsi without one; it takes a value, so it is not a flag.)
+    QEMU_10_FLAGS = (
+        "S", "daemonize", "enable-kvm", "enable-sync-profile", "full-screen",
+        "h", "jitdump", "mem-prealloc", "no-fd-bootchk", "no-reboot",
+        "no-shutdown", "no-user-config", "nodefaults", "nographic",
+        "old-param", "only-migratable", "perfmap", "s", "semihosting",
+        "snapshot", "usb", "version", "win2k-hack", "xen-attach")
+
+    def normalise(self, *args):
+        return model.normalise("t", "qemu-system-x86_64", list(args),
+                               cwd=str(self.tmp))
+
+    def test_every_documented_no_value_option_is_a_flag(self):
+        self.assertEqual(set(self.QEMU_10_FLAGS) - model.FLAGS, set())
+
+    def test_mem_prealloc_takes_no_value(self):
+        normal = self.normalise("-mem-prealloc", "-drive", "file=d.qcow2")
+        self.assertEqual(normal.argv[:3], ["-mem-prealloc", "-drive",
+                                           "file=d.qcow2"])
+        self.assertEqual(model.disk_files(
+            ["-mem-path", "/dev/hugepages", "-mem-prealloc", "-m", "4096",
+             "-drive", "file=d.qcow2"], "/vm"), ["/vm/d.qcow2"])
+        self.assertNotIn("-daemonize",
+                         self.normalise("-mem-prealloc", "-daemonize").argv)
+
+    def test_gdb_on_stdio_is_refused(self):
+        with self.assertRaises(model.DefinitionError):
+            self.normalise("-gdb", "stdio")
+
+    def test_double_dash_daemonize_and_curses_are_removed(self):
+        normal = self.normalise("--daemonize", "-m", "256", "-curses")
+        self.assertEqual(normal.argv[:2], ["-m", "256"])
+        self.assertNotIn("--daemonize", normal.argv)
+        self.assertNotIn("-curses", normal.argv)
+        self.assertIn("removed -curses", "\n".join(normal.notes))
+
+    def test_run_with_chroot_is_refused(self):
+        with self.assertRaises(model.DefinitionError):
+            self.normalise("-run-with", "chroot=/srv/x")
+
+    def test_dotted_and_nested_blockdevs_and_pflash_are_lock_checked(self):
+        self.assertEqual(model.disk_files([
+            "-blockdev", "driver=qcow2,node-name=a,file.driver=file,"
+                         "file.filename=/vm/a.qcow2",
+            "-blockdev", "driver=qcow2,file.driver=file,file.read-only=on,"
+                         "file.filename=/vm/ro.qcow2",
+            "-blockdev", json.dumps({"driver": "qcow2", "file": {
+                "driver": "file", "filename": "/vm/n.qcow2"}}),
+            "-pflash", "/fw/VARS.fd",
+        ], "/vm"), ["/vm/a.qcow2", "/vm/n.qcow2", "/fw/VARS.fd"])
+
+
+class RuntimeDirTests(Sandbox):
+    """N7: a runtime directory is used only when it is safely this user's."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ.pop("XDG_RUNTIME_DIR")          # restored by patch.dict
+        self.shared = self.tmp / "shared-tmp"
+        self.shared.mkdir()
+        patcher = mock.patch.object(model.tempfile, "gettempdir",
+                                    return_value=str(self.shared))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.fallback = self.shared / f"kilix-qemu-{os.getuid()}"
+
+    def refused(self, vm, reason: str) -> None:
+        result = self.manager().launch(vm)
+        self.assertFalse(result.ok)
+        self.assertIn(reason, result.message)
+        self.assertEqual(self.rc.launched, [])
+
+    def test_the_fallback_is_used_only_when_it_is_ours_and_0700(self):
+        vm = self.define("Alpha")
+        self.assertEqual(model.runtime_dir(), str(self.fallback))
+        self.fallback.mkdir()
+        self.fallback.chmod(0o755)                    # pre-created, open
+        self.refused(vm, "it must be 0700")
+        self.fallback.chmod(0o700)
+        real = os.lstat
+
+        def foreign_owner(path, *args, **kwargs):
+            info = real(path, *args, **kwargs)
+            if os.fspath(path) != str(self.fallback):
+                return info
+            fields = list(info)
+            fields[4] = info.st_uid + 1
+            return os.stat_result(fields)
+
+        with mock.patch.object(model.os, "lstat", foreign_owner):
+            self.refused(vm, "not you")
+        self.fallback.rmdir()
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        self.fallback.symlink_to(elsewhere, target_is_directory=True)
+        self.refused(vm, "symlink")
+        self.fallback.unlink()
+        result = self.manager().launch(vm)            # created 0700 by us
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(self.fallback.stat().st_mode & 0o777, 0o700)
+
+
+    def test_a_runtime_dir_that_cannot_be_created_refuses_the_launch(self):
+        os.environ["XDG_RUNTIME_DIR"] = str(self.tmp / "missing" / "run")
+        vm = self.define("Alpha")
+        self.refused(vm, "cannot create runtime directory")
+
+
+class StateStoreTests(Sandbox):
+    """N1, N6, N8 and the store mutants that survived r1 (R18-R21)."""
+
+    def test_deeply_nested_files_degrade_instead_of_crashing(self):
+        path = Path(model.state_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[" * 100000)
+        self.assertEqual(store.load_state(), {"favorites": [], "recents": []})
+        directory = Path(model.vms_dir())
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "deep.json").write_text("{\"a\":" * 100000)
+        self.assertIsNone(store.get("deep"))
+        machines, problems = store.load_all()
+        self.assertEqual((machines, len(problems)), ([], 1))
+        code, _out, err = self.run_cli("list")
+        self.assertEqual(code, 0, err)
+
+    def test_a_favorite_that_could_not_be_saved_is_reported(self):
+        self.define("Alpha")
+        with mock.patch.object(store, "_write_json",
+                               side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(OSError):
+                store.set_favorite("alpha", True)
+            code, out, err = self.run_cli("favorite", "Alpha")
+            self.assertEqual(code, 1)
+            self.assertIn("could not save favorites", err)
+            self.assertNotIn("now a favorite", out)
+            state = tui.State(self.manager(), refresh_seconds=0)
+            tui.handle(ord("f"), state)
+            self.assertIn("Could not save favorites", state.error)
+            self.assertFalse(state.selected_vm.favorite)
+        self.assertEqual(store.favorites(), [])
+
+    def test_concurrent_writers_never_lose_or_tear_an_update(self):
+        real_dump = json.dump
+        paused, release = threading.Event(), threading.Event()
+
+        def slow_dump(data, handle, **kwargs):
+            if threading.current_thread().name == "launcher":
+                paused.set()
+                release.wait(5)
+            return real_dump(data, handle, **kwargs)
+
+        with mock.patch.object(store.json, "dump", slow_dump):
+            launcher = threading.Thread(
+                target=store.remember_launch, args=("alpha",), name="launcher")
+            launcher.start()
+            self.assertTrue(paused.wait(5))
+            favorite = threading.Thread(target=store.set_favorite,
+                                        args=("bravo", True))
+            favorite.start()
+            favorite.join(0.3)              # the TUI's main thread, meanwhile
+            release.set()
+            launcher.join(5)
+            favorite.join(5)
+        record = json.loads(Path(model.state_path()).read_text())
+        self.assertEqual(record["favorites"], ["bravo"])
+        self.assertEqual([row["id"] for row in record["recents"]], ["alpha"])
+        leftovers = [name for name in os.listdir(os.path.dirname(
+            model.state_path())) if name != "state.json"]
+        self.assertEqual(leftovers, [])
+
+    def test_state_is_written_through_a_swap_file_and_one_replace(self):
+        replaced = []
+        real = os.replace
+
+        def spy(source, target):
+            replaced.append((os.fspath(source), os.fspath(target)))
+            real(source, target)
+
+        with mock.patch.object(store.os, "replace", spy):
+            store.set_favorite("alpha", True)
+        self.assertEqual(len(replaced), 1)
+        self.assertEqual(replaced[0][1], model.state_path())
+        self.assertNotEqual(replaced[0][0], model.state_path())
+
+    def test_remove_forgets_the_favorite_and_the_recent(self):
+        vm = self.define("Alpha")
+        store.set_favorite(vm.id, True)
+        store.remember_launch(vm.id)
+        store.remove(vm.id)
+        self.assertEqual(store.load_state(), {"favorites": [], "recents": []})
+
+    def test_damage_in_one_field_keeps_the_other_and_caps_recents(self):
+        path = Path(model.state_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"favorites": "alpha", "recents": [
+            {"id": f"vm{index}", "at": "t"} for index in range(9)]}))
+        self.assertEqual([row["id"] for row in store.recents()],
+                         [f"vm{index}" for index in range(store.MAX_RECENTS)])
+
+
+class LivenessGapTests(Sandbox):
+    """N9, N10, N13 and the liveness and focus mutants of r1 (R08-R12, R22)."""
+
+    def stale_pidfile(self, vm, pid: int = 4242) -> None:
+        Path(vm.pidfile).parent.mkdir(parents=True, exist_ok=True)
+        Path(vm.pidfile).write_text(f"{pid}\n")
+
+    def test_a_pidfile_witness_must_be_this_users_qemu(self):
+        vm = self.define("Alpha")
+        self.stale_pidfile(vm)
+        proc = _proc_entry(self.tmp / "proc", 4242, [self.qemu, *vm.argv])
+        self.assertEqual(self.manager(proc_root=proc).pid_of(vm), 4242)
+        with mock.patch.object(backend.os, "getuid",
+                               return_value=os.getuid() + 1):
+            self.assertEqual(self.manager(proc_root=proc).pid_of(vm), 0)
+        proc = _proc_entry(self.tmp / "proc2", 4242,
+                           ["/usr/bin/tail", "-f", vm.pidfile])
+        self.assertEqual(self.manager(proc_root=proc).pid_of(vm), 0)
+
+    def test_a_held_launch_claim_reads_starting_and_is_exclusive(self):
+        vm = self.define("Alpha")
+        manager = self.manager()
+        self.assertTrue(manager._claim_launch(vm))
+        self.assertFalse(manager._claim_launch(vm))
+        self.assertEqual(manager.status(vm).state, "starting")
+        result = manager.launch(vm)
+        self.assertFalse(result.ok)
+        self.assertIn("already being launched", result.message)
+        self.assertEqual(self.rc.launched, [])
+
+    def test_an_open_tab_with_silent_qmp_blocks_a_second_launch(self):
+        vm = self.define("Alpha")
+        pane = self.rc.add_window("QEMU: Alpha", [
+            ["/bin/bash", KILIX, "run", *vm.command]])
+        manager = self.manager()
+        status = manager.status(vm, self.rc.tree())
+        self.assertEqual((status.state, status.pane_id), ("starting", pane))
+        result = manager.launch(vm)
+        self.assertFalse(result.ok)
+        self.assertIn(f"pane {pane}", result.message)
+        state = tui.State(manager, refresh_seconds=0)
+        tui.handle(ENTER, state)
+        TuiTests.wait(state)
+        self.assertEqual((self.rc.launched, self.rc.focused), ([], [pane]))
+
+    def test_focus_needs_the_whole_path_as_a_qmp_value(self):
+        alpha = self.define("Alpha")
+        self.rc.add_window("debugging", [["socat", "-", f"unix:{alpha.qmp}"]])
+        self.rc.add_window("same name", [[
+            "qemu-system-x86_64", "-qmp",
+            f"unix:/somewhere/else/{os.path.basename(alpha.qmp)},server=on"]])
+        self.assertIsNone(backend.find_pane(self.rc.tree(), alpha.qmp))
+
+    def test_a_lock_in_the_shared_permission_bytes_is_seen(self):
+        disk = self.tmp / "d.img"
+        disk.write_bytes(b"\0" * 512)
+        fd = os.open(disk, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.fcntl(fd, fcntl.F_OFD_SETLK,
+                    struct.pack("hhqqi4x", fcntl.F_RDLCK, 0, 250, 1, 0))
+        self.assertTrue(backend.disk_locked(str(disk)))
+
+    def test_a_fifo_named_as_a_disk_never_blocks_the_refresh(self):
+        fifo = self.tmp / "pipe.img"
+        os.mkfifo(fifo)
+        vm = self.define("Alpha", "-drive", f"file={fifo},format=raw")
+        self.assertEqual(vm.disks, [str(fifo)])
+        answers = []
+        probe = threading.Thread(
+            target=lambda: answers.append(backend.disk_locked(str(fifo))),
+            daemon=True)
+        probe.start()
+        probe.join(3)
+        self.assertEqual(answers, [False], "the lock probe blocked on a FIFO")
+        rows = self.manager().disk_info(vm)
+        self.assertIn("not probed", rows[0]["error"])
+        self.assertFalse(Path(self.env["FAKE_QEMU_IMG_LOG"]).exists())
+
+
+class GateGapTests(Sandbox):
+    """The confirmation and desktop-entry mutants of r1 (R14, R15, R26)."""
+
+    def running(self):
+        vm = self.define("Alpha")
+        self.start_outside(vm, FAKE_QEMU_ACPI="ignore")
+        self.wait_for(lambda: self.qmp_up(vm))
+        return vm, tui.State(self.manager(), refresh_seconds=0)
+
+    def test_acpi_shutdown_asks_first(self):
+        _vm, state = self.running()
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "shutdown")
+        tui.handle(ENTER, state)
+        self.assertEqual(state.modal, "confirm")
+        self.assertNotIn("system_powerdown", self.qmp_log())
+
+    def test_only_y_confirms(self):
+        vm, state = self.running()
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "poweroff")
+        tui.handle(ENTER, state)
+        for key in (ENTER, 13, 343, ord(" "), ord("a"), ord("f")):
+            tui.handle(key, state)
+        self.assertEqual((state.modal, state.pending), ("confirm", ""))
+        self.assertNotIn("quit", self.qmp_log())
+        self.assertTrue(self.qmp_up(vm))
+
+    def test_a_symlinked_entry_is_never_replaced_even_with_the_marker(self):
+        apps = self.tmp / "apps"
+        apps.mkdir()
+        theirs = self.tmp / "theirs.desktop"
+        body = f"[Desktop Entry]\n{desktop_entry.MARKER}\n"
+        theirs.write_text(body)
+        (apps / desktop_entry.FILENAME).symlink_to(theirs)
+        with self.assertRaises(FileExistsError):
+            desktop_entry.install("/x/kilix-qemu-manager", str(apps))
+        self.assertTrue((apps / desktop_entry.FILENAME).is_symlink())
+        self.assertEqual(theirs.read_text(), body)
 
 
 if __name__ == "__main__":
