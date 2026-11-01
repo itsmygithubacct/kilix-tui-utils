@@ -357,6 +357,18 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(fake.calls, [])
         self.assertIn("changed since it was shown", state.error)
 
+        # Same UUID and name, another settings file (re-registered from
+        # another .vbox): refused as well.
+        fake.machines = [first, second]
+        state.refresh()
+        confirm_poweroff_for_first()
+        fake.machines = [dataclasses.replace(
+            first, config_file="/elsewhere/vm/vm.vbox"), second]
+        tui.handle(ord("y"), state)
+        self._wait(state)
+        self.assertEqual(fake.calls, [])
+        self.assertIn("changed since it was shown", state.error)
+
         # Unchanged: y acts on the VM it was shown for, wherever the
         # selection has moved since.
         fake.machines = [first, second]

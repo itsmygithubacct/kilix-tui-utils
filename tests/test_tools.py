@@ -158,6 +158,8 @@ INSTALLER_TESTS = (
 
 
 class SafetyTests(unittest.TestCase):
+    """Properties that make a tool safe to put one keystroke from a menu."""
+
     def test_installer_tests_never_write_the_callers_start_menu(self):
         with tempfile.TemporaryDirectory() as directory:
             callers = Path(directory) / "callers-data"
@@ -174,8 +176,6 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(sorted(str(path.relative_to(callers))
                                     for path in callers.rglob("*")), [])
-
-    """Properties that make a tool safe to put one keystroke from a menu."""
 
     @staticmethod
     def commands_invoked(relative: str) -> set[str]:
