@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import io
+import itertools
 import json
 import os
 import shlex
@@ -1166,8 +1167,9 @@ class ForeignControlFileTests(Sandbox):
         Path(store._definition_path("bravo")).write_text(json.dumps(clone))
         machines, problems = store.load_all()
         self.assertEqual([vm.id for vm in machines], ["alpha"])
-        self.assertIn("bravo.json: its argv opens the pidfile or QMP socket "
-                      "of alpha", problems[0])
+        self.assertEqual(len(problems), 1)
+        self.assertIn(f"bravo.json: not loaded: it opens {alpha.qmp}, the "
+                      "manager's QMP socket for VM alpha", problems[0])
 
     def test_own_qmp_in_the_old_spelling_is_recognised_not_doubled(self):
         own = model.qmp_path("scratch")
@@ -1354,7 +1356,8 @@ class StateStoreTests(Sandbox):
         self.assertEqual(record["favorites"], ["bravo"])
         self.assertEqual([row["id"] for row in record["recents"]], ["alpha"])
         leftovers = [name for name in os.listdir(os.path.dirname(
-            model.state_path())) if name != "state.json"]
+            model.state_path())) if name not in ("state.json",
+                                                 "state.json.lock")]
         self.assertEqual(leftovers, [])
 
     def test_state_is_written_through_a_swap_file_and_one_replace(self):
@@ -1505,6 +1508,358 @@ class GateGapTests(Sandbox):
             desktop_entry.install("/x/kilix-qemu-manager", str(apps))
         self.assertTrue((apps / desktop_entry.FILENAME).is_symlink())
         self.assertEqual(theirs.read_text(), body)
+
+
+# ── fix round r3 ─────────────────────────────────────────────────────────────
+
+
+def hand_clone(original, ident: str, name: str, share=("pidfile", "qmp")):
+    """Copy a definition file under another id, as a user would by hand.
+
+    ``share`` names the control files the copy keeps from the original;
+    the others become the copy's own, so the copy still loads on its own.
+    """
+    data = json.loads(Path(store._definition_path(original.id)).read_text())
+    data.update(id=ident, name=name)
+    argv = data["argv"]
+    if "pidfile" not in share:
+        argv[argv.index(original.pidfile)] = data["pidfile"] = (
+            model.pid_path(ident))
+    if "qmp" not in share:
+        data["qmp"] = model.qmp_path(ident)
+        argv[argv.index(model.qmp_spec(original.qmp))] = model.qmp_spec(
+            data["qmp"])
+    model.VmDefinition.from_json(data)              # valid on its own
+    path = Path(store._definition_path(ident))
+    path.write_text(json.dumps(data))
+    return path
+
+
+class LoaderOwnershipTests(Sandbox):
+    """R2-B1: who keeps a pidfile or QMP socket never depends on load order."""
+
+    SHAPES = (("pidfile", "qmp"), ("qmp",), ("pidfile",))
+    # "bravo" loads after "alpha"; "aaclone" loads before it.
+    CLONES = (("bravo", "Bravo"), ("aaclone", "AA clone"))
+
+    def test_the_vm_whose_id_names_the_files_keeps_them_in_either_order(self):
+        alpha = self.define("Alpha")
+        for (ident, name), share in itertools.product(self.CLONES,
+                                                      self.SHAPES):
+            with self.subTest(clone=ident, shares=share):
+                path = hand_clone(alpha, ident, name, share)
+                try:
+                    machines, problems = store.load_all()
+                finally:
+                    path.unlink()
+                self.assertEqual([vm.id for vm in machines], ["alpha"])
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith(
+                    f"{ident}.json: not loaded: it opens "), problems)
+                for kind in share:
+                    shared, what = ((alpha.qmp, "QMP socket") if kind == "qmp"
+                                   else (alpha.pidfile, "pidfile"))
+                    self.assertIn(f"{shared}, the manager's {what} for VM "
+                                  "alpha", problems[0])
+                self.assertIn("not its own.", problems[0])
+                self.assertIn(f"Edit or delete {path}", problems[0])
+
+    def test_power_off_through_the_picker_never_reaches_the_original(self):
+        alpha = self.define("Alpha")
+        self.start_outside(alpha)
+        self.wait_for(lambda: self.qmp_up(alpha))
+        for ident, name in self.CLONES:
+            with self.subTest(clone=ident):
+                path = hand_clone(alpha, ident, name)
+                self.addCleanup(path.unlink, True)
+                code, out, err = self.run_cli("--status")
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"skipped {ident}.json: not loaded", err)
+                self.assertNotIn(name, out)
+                self.assertEqual(self.run_cli("--vm", name)[0], 1)
+                state = tui.State(self.manager(), refresh_seconds=0)
+                listed = [status.vm.id for status in state.machines]
+                self.assertEqual(listed, ["alpha"])
+                # Every other VM the picker offers: Power off, confirmed.
+                for other in (vm_id for vm_id in listed if vm_id != "alpha"):
+                    state.select_id(other)
+                    tui.handle(ord("a"), state)
+                    TuiTests.choose(self, state, "poweroff")
+                    tui.handle(ENTER, state)
+                    tui.handle(ord("y"), state)
+                    TuiTests.wait(state)
+                self.assertNotIn("quit", self.qmp_log())
+                self.assertTrue(self.qmp_up(alpha))
+                path.unlink()
+        # The original itself is still controlled, and named, as itself.
+        state = tui.State(self.manager(), refresh_seconds=0)
+        state.select_id("alpha")
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "poweroff")
+        tui.handle(ENTER, state)
+        frame = app.render_to_text(tui.render, state, height=24, width=120)
+        self.assertIn("Confirm: Power off — Alpha", frame)
+        tui.handle(ord("y"), state)
+        TuiTests.wait(state)
+        self.assertEqual(state.message, "Powered off Alpha.")
+        self.wait_for(lambda: not self.qmp_up(alpha))
+
+    def test_a_shared_path_no_id_derives_refuses_every_claimant(self):
+        build = self.tmp / "build"
+        build.mkdir()
+        first = self.define("First", "-pidfile", str(build / "qemu.pid"))
+        self.assertEqual(first.pidfile, str(build / "qemu.pid"))
+        for ident, name in (("second", "Second"), ("aaa", "Aaa")):
+            with self.subTest(clone=ident):
+                path = hand_clone(first, ident, name, share=("pidfile",))
+                try:
+                    machines, problems = store.load_all()
+                finally:
+                    path.unlink()
+                self.assertEqual(machines, [])
+                self.assertEqual(sorted(line.split(":")[0] for line in problems),
+                                 sorted([f"{ident}.json", "first.json"]))
+                for line in problems:
+                    self.assertIn(f"it opens {first.pidfile}, which ", line)
+                    self.assertIn("none of them is loaded", line)
+        self.assertEqual([vm.id for vm in store.load_all()[0]], ["first"])
+
+    def test_a_socket_two_vms_link_through_is_not_a_control_file(self):
+        link = str(self.tmp / "link.sock")
+        self.define("Left", "-chardev", f"socket,id=l,path={link},server=on")
+        self.define("Right", "-chardev", f"socket,id=r,path={link}")
+        machines, problems = store.load_all()
+        self.assertEqual(([vm.id for vm in machines], problems),
+                         (["left", "right"], []))
+
+    def test_runtime_dir_names_belong_to_their_id_even_when_uncatalogued(self):
+        alpha = self.define("Alpha")
+        data = alpha.as_json()
+        data["argv"] += ["-monitor",
+                         f"unix:{model.qmp_path('ghost')},server=on,wait=off"]
+        Path(store._definition_path("alpha")).write_text(json.dumps(data))
+        machines, problems = store.load_all()
+        self.assertEqual(machines, [])
+        self.assertIn(f"it opens {model.qmp_path('ghost')}, the manager's QMP "
+                      "socket for VM ghost", problems[0])
+
+    def test_a_symlinked_spelling_of_the_runtime_dir_is_the_same_file(self):
+        """NB6, in the loader and on import."""
+        alpha = self.define("Alpha")
+        alias = self.tmp / "alias"
+        alias.symlink_to(os.environ["XDG_RUNTIME_DIR"],
+                         target_is_directory=True)
+        aliased = str(alias / "kilix-qemu" / "alpha.qmp")
+        # Import: removed, as the plain spelling is.
+        normal = model.normalise(
+            "bravo", "qemu-system-x86_64",
+            ["-qmp", f"unix:{aliased},server=on,wait=off"], cwd=str(self.tmp),
+            claimed=store.claimed_paths([alpha]))
+        self.assertFalse(any(aliased in word for word in normal.argv))
+        self.assertIn("it is VM alpha's socket", "\n".join(normal.notes))
+        # The VM's own socket through the alias is recognised, not doubled.
+        own = model.normalise(
+            "alpha", "qemu-system-x86_64",
+            ["-qmp", f"unix:{alias}/kilix-qemu/alpha.qmp,server,nowait"],
+            cwd=str(self.tmp))
+        self.assertEqual(own.argv.count("-qmp"), 1)
+        # Loader: a hand clone that spells Alpha's socket through the alias.
+        path = hand_clone(alpha, "bravo", "Bravo", share=())
+        data = json.loads(path.read_text())
+        data["argv"] += ["-monitor", f"unix:{aliased},server=on,wait=off"]
+        path.write_text(json.dumps(data))
+        machines, problems = store.load_all()
+        self.assertEqual([vm.id for vm in machines], ["alpha"])
+        self.assertIn("the manager's QMP socket for VM alpha", problems[0])
+
+    def test_a_pidfile_on_the_vms_own_qmp_path_is_replaced(self):
+        """NB7."""
+        normal = model.normalise(
+            "bravo", "qemu-system-x86_64",
+            ["-pidfile", model.qmp_path("bravo")], cwd=str(self.tmp))
+        self.assertEqual(normal.pidfile, model.pid_path("bravo"))
+        self.assertIn("it is this VM's QMP socket path", "\n".join(normal.notes))
+        self.assertEqual(normal.argv.count(model.qmp_path("bravo")), 0)
+
+
+class TargetBindingR3Tests(ConfirmTargetTests):
+    """NB1, NB2: the binding covers the argv, and every action in the menu."""
+
+    def test_y_after_an_argv_edit_refuses(self):
+        alpha, bravo, state = self.two_running()
+        self.confirm_poweroff_for_alpha(state, alpha)
+        alpha.argv[alpha.argv.index("256")] = "512"
+        store.save(alpha, replace=True)        # only the argv changed
+        tui.handle(ord("y"), state)
+        TuiTests.wait(state)
+        self.assertIn("definition changed since it was shown", state.error)
+        self.assertNotIn("quit", self.qmp_log())
+        self.assertTrue(self.qmp_up(alpha))
+
+    def test_an_unconfirmed_action_from_the_menu_rechecks_its_vm(self):
+        alpha, _bravo, state = self.two_running()
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "pause")
+        alpha.argv[alpha.argv.index("256")] = "512"
+        store.save(alpha, replace=True)
+        tui.handle(ENTER, state)
+        TuiTests.wait(state)
+        self.assertIn("Not done: Pause — Alpha's definition changed", state.error)
+        self.assertNotIn("stop", self.qmp_log())
+        # Launch, on a stopped VM, likewise never runs a stale argv.
+        idle = self.define("Idle")
+        state.refresh()
+        state.select_id(idle.id)
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "launch")
+        idle.argv[idle.argv.index("256")] = "512"
+        store.save(idle, replace=True)
+        tui.handle(ENTER, state)
+        TuiTests.wait(state)
+        self.assertIn("Not done: Launch in a Kilix tab — Idle's definition "
+                      "changed", state.error)
+        self.assertEqual(self.rc.launched, [])
+
+
+class FocusR3Tests(Sandbox):
+    """NB4: --qmp is QEMU's other spelling of -qmp, for import and focus."""
+
+    def test_a_double_dash_qmp_is_kept_and_its_tab_is_found(self):
+        vm = self.define("Alpha", "--qmp",
+                         f"unix:{model.qmp_path('alpha')},server,nowait")
+        self.assertIn("--qmp", vm.argv)
+        self.assertNotIn("-qmp", vm.argv)
+        pane = self.rc.add_window("QEMU: Alpha", [
+            ["/bin/bash", KILIX, "run", *vm.command]])
+        self.assertEqual(backend.find_pane(self.rc.tree(), vm.qmp).id, pane)
+
+
+class StatusRuntimeDirTests(RuntimeDirTests):
+    """NB8: status reads trust the runtime directory only as launch does."""
+
+    def plant(self, vm):
+        self.fallback.mkdir(mode=0o700, exist_ok=True)
+        server = FakeQmpServer(vm.qmp, {"query-status": {
+            "return": {"status": "running", "running": True}}})
+        self.addCleanup(server.close)
+        Path(vm.pidfile).write_text(f"{os.getpid()}\n")
+        Path(self.fallback / f"{vm.id}.launch").write_text("1\n")
+        return server
+
+    def assert_not_read(self, vm, server, reason: str) -> None:
+        manager = self.manager()
+        status = manager.status(vm)
+        self.assertEqual((status.state, status.qmp_ok, status.pid),
+                         ("stopped", False, 0))
+        self.assertIn(reason, status.detail)
+        result = manager.control(vm, "poweroff")
+        self.assertFalse(result.ok)
+        self.assertIn(f"Not sent to {vm.name}", result.message)
+        self.assertEqual(server.seen, [])
+
+    def test_status_never_reads_a_runtime_dir_that_is_not_safely_ours(self):
+        vm = self.define("Alpha")
+        server = self.plant(vm)
+        self.assertEqual(self.manager().status(vm).state, "running")
+        server.seen.clear()
+        self.fallback.chmod(0o755)
+        self.assert_not_read(vm, server, "it must be 0700")
+        self.fallback.chmod(0o700)
+        real = os.lstat
+
+        def foreign_owner(path, *args, **kwargs):
+            info = real(path, *args, **kwargs)
+            if os.fspath(path) != str(self.fallback):
+                return info
+            fields = list(info)
+            fields[4] = info.st_uid + 1
+            return os.stat_result(fields)
+
+        with mock.patch.object(model.os, "lstat", foreign_owner):
+            self.assert_not_read(vm, server, "not you")
+
+    def test_a_missing_runtime_dir_reads_as_stopped(self):
+        vm = self.define("Alpha")
+        self.assertFalse(self.fallback.exists())
+        status = self.manager().status(vm)
+        self.assertEqual((status.state, status.detail), ("stopped", ""))
+        self.assertFalse(self.fallback.exists())     # a read creates nothing
+
+
+class SwapAndLockR3Tests(Sandbox):
+    """NB12 (stale swap files) and N8's cross-process residual."""
+
+    def test_stale_swap_files_of_ours_are_cleaned_and_nothing_else(self):
+        state_dir = Path(model.state_path()).parent
+        state_dir.mkdir(parents=True)
+        vms = Path(model.vms_dir())
+        vms.mkdir(parents=True)
+        old = time.time() - store.STALE_SWAP_SECONDS - 60
+        outside = self.tmp / "outside.txt"
+        outside.write_text("keep")
+        files = {
+            "stale": state_dir / ".state.json.abcd1234.tmp",
+            "fresh": state_dir / ".state.json.efgh5678.tmp",
+            "link": state_dir / ".state.json.ijkl9012.tmp",
+            "foreign": state_dir / ".state.json.mnop3456.tmp",
+            "other": state_dir / ".notes.tmp",
+            "stale-vm": vms / ".alpha.json.qrst7890.tmp",
+        }
+        for key, path in files.items():
+            if key == "link":
+                path.symlink_to(outside)
+                os.utime(path, (old, old), follow_symlinks=False)
+                continue
+            path.write_text("{")
+            if key != "fresh":
+                os.utime(path, (old, old))
+        real = os.lstat
+
+        def foreign(path, *args, **kwargs):
+            info = real(path, *args, **kwargs)
+            if os.fspath(path) != str(files["foreign"]):
+                return info
+            fields = list(info)
+            fields[4] = info.st_uid + 1
+            return os.stat_result(fields)
+
+        with mock.patch.object(store.os, "lstat", foreign):
+            store.set_favorite("alpha", True)
+        self.define("Alpha")
+        self.assertFalse(files["stale"].exists())
+        self.assertFalse(files["stale-vm"].exists())
+        for key in ("fresh", "link", "foreign", "other"):
+            self.assertTrue(os.path.lexists(files[key]), key)
+        self.assertEqual(outside.read_text(), "keep")
+        self.assertEqual(store.favorites(), ["alpha"])
+
+    def test_a_second_process_never_loses_an_update(self):
+        child = subprocess.Popen(
+            [sys.executable, "-c", (
+                "import sys; sys.path.insert(0, sys.argv[1])\n"
+                "from kilix_qemu_manager import store\n"
+                "with store.state_lock():\n"
+                "    record = store.load_state()\n"
+                "    print('held', flush=True)\n"
+                "    sys.stdin.readline()\n"
+                "    record['recents'] = [{'id': 'alpha', 'at': 't'}]\n"
+                "    store.save_state(record)\n"), str(MANAGER)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait, 5)
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        writer = threading.Thread(target=store.set_favorite,
+                                  args=("bravo", True))
+        writer.start()
+        writer.join(0.4)
+        self.assertTrue(writer.is_alive(), "wrote while another process "
+                                           "held the state")
+        child.stdin.write("\n")
+        child.stdin.close()
+        self.assertEqual(child.wait(5), 0)
+        writer.join(5)
+        self.assertEqual(store.load_state(), {
+            "favorites": ["bravo"], "recents": [{"id": "alpha", "at": "t"}]})
 
 
 if __name__ == "__main__":

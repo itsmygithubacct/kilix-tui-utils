@@ -56,8 +56,22 @@ fixed on import, and each change is printed:
 | `-chardev`, `-serial` or another device bound to such a socket | refused: other options can refer to it by id, so it cannot simply be dropped |
 | a `-pidfile` or socket outside the runtime directory that no catalogued VM uses | kept: it is the user's or a build's own (for example `build_vm_image.py`'s `qemu.pid`) |
 
-A definition file whose argv opens another catalogued VM's pidfile or QMP
-socket (a hand edit) is not loaded; the picker lists it as a problem.
+Paths are compared after resolving symlinked directories, so
+`/var/run/user/…` and `/run/user/…` name the same socket.
+
+A hand-edited definition (for example `alpha.json` copied to `bravo.json`)
+can still open another VM's files. The loader decides who keeps a control
+file from the path itself, never from the order the files load in:
+
+| A pidfile or QMP socket… | Loaded | Refused, listed as a problem |
+|---|---|---|
+| in the runtime directory, named `<id>.pid` or `<id>.qmp` | the definition with that id | every other definition that opens it, whether or not a VM with that id is catalogued |
+| elsewhere, opened by more than one definition | none | all of them: nothing tells the original from the copy |
+
+Each problem line names the file and the path, and says to edit or delete
+the file and import the VM again. A socket that two VMs share but that is
+neither one's pidfile nor QMP socket (a `-chardev` link between guests) is
+not a control file and does not stop either from loading.
 
 The runtime directory is `$XDG_RUNTIME_DIR/kilix-qemu`. Without an absolute
 `XDG_RUNTIME_DIR` it falls back to `<tmp>/kilix-qemu-<uid>` (`<tmp>` is
@@ -65,7 +79,10 @@ Python's `tempfile.gettempdir()`, normally `/tmp`). Before a launch, either
 directory is created mode 0700 or, if it exists, must be a real directory
 (not a symlink), owned by you, with no group or other access; otherwise the
 launch is refused with the reason, because a shared `/tmp` lets another user
-create the fallback first and plant sockets in it.
+create the fallback first and plant sockets in it. Status reads follow the
+same rule without creating anything: in a runtime directory that exists but
+is not safely yours, no pidfile, QMP socket or launch marker is read, the VM
+shows as stopped with the reason, and no QMP command is sent through it.
 
 ## Keys
 
@@ -103,7 +120,11 @@ kilix-qemu-manager --screenshot /tmp/qemu-manager.txt
 Favorites and the last five launches live in one small state file,
 `$XDG_STATE_HOME/kilix-qemu/state.json`, written atomically and only when it
 changes; a damaged file reads as empty. A favorite that cannot be saved is
-reported, not shown as set.
+reported, not shown as set. Each update holds a lock, across processes too
+(an empty `state.json.lock` beside the state file), so the CLI and a running
+picker never lose each other's change. A write that crashed between its swap
+file and the replace leaves `.<name>.json.XXXXXXXX.tmp`; the next write in
+that directory removes such files of yours that are older than ten minutes.
 
 `install.sh` publishes the manager as `kilix-qemu-manager` and writes a
 `Terminal=true` XDG entry so Kilix 95 lists it under Start > Programs >

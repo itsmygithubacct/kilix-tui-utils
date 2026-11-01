@@ -250,8 +250,14 @@ class QemuManager:
                               if row["id"] == vm.id), ""),
             tabs_known=tree is not None if tabs_known is None else tabs_known,
         )
-        result.pid = self.pid_of(vm)
+        # A runtime directory that is not safely this user's may hold
+        # planted pidfiles and sockets: nothing in it is read or trusted.
+        unsafe = model.runtime_dir_problem()
+        readable = (lambda path: not (unsafe and model.in_runtime_dir(path)))
+        result.pid = self.pid_of(vm) if readable(vm.pidfile) else 0
         try:
+            if not readable(vm.qmp):
+                raise qmp.QmpError(f"not asked: {unsafe}")
             result.state = qmp.status(vm.qmp, timeout=self.qmp_timeout)
             result.qmp_ok = True
         except qmp.QmpError as error:
@@ -263,10 +269,13 @@ class QemuManager:
             elif result.disk_locked:
                 result.state = "live"
                 result.detail = f"disk in use: {result.disk_locked}"
-            elif self._launching(vm):
+            elif not unsafe and self._launching(vm):
                 result.state = "starting"
             else:
                 result.state = "stopped"
+                if unsafe:
+                    result.detail = (f"{unsafe}; its pidfile and QMP socket "
+                                     "were not read")
         pane = find_pane(tree, vm.qmp)
         result.pane_id = int(getattr(pane, "id", 0) or 0) if pane else 0
         if result.state == "stopped" and result.pane_id:
@@ -428,6 +437,10 @@ class QemuManager:
             raise ValueError(f"unsupported QMP action: {action}")
         command, label = QMP_ACTIONS[action]
         preview = self.preview(vm, action)
+        if (unsafe := model.runtime_dir_problem()) and model.in_runtime_dir(
+                vm.qmp):
+            return OperationResult(
+                False, f"Not sent to {vm.name}: {unsafe}.", preview)
         try:
             qmp.execute(vm.qmp, command, timeout=max(self.qmp_timeout, 2.0),
                         allow_hangup=(command == "quit"))

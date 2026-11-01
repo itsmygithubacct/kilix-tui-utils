@@ -18,7 +18,13 @@ Import is the one place an argv is changed, and every change is reported:
   pidfile) or removed (a socket), with a note. A ``-chardev`` or other device
   bound to such a socket is refused, because other options refer to it by id.
   A pidfile or socket that belongs to no catalogued VM and lies outside the
-  runtime directory is the user's (or a build's) own and is kept.
+  runtime directory is the user's (or a build's) own and is kept. Paths are
+  compared canonically (:func:`canonical`), so a symlinked spelling of the
+  runtime directory is still the runtime directory. A ``-pidfile`` on this
+  VM's own QMP socket path is replaced by its own pidfile.
+
+What a hand-edited definition may open is the loader's business
+(``store.control_conflicts``).
 
 Anything the manager cannot represent faithfully is refused rather than
 guessed at: stdio-bound monitors and serial ports, ``-nographic``,
@@ -103,21 +109,52 @@ def ensure_runtime_dir() -> str:
     except OSError as error:
         raise RuntimeDirError(f"cannot create runtime directory {path}: "
                               f"{error.strerror or error}") from error
+    if problem := _runtime_dir_problem(path, missing_ok=False):
+        raise RuntimeDirError(problem)
+    return path
+
+
+def runtime_dir_problem() -> str:
+    """Why the runtime directory must not be read; '' when it may be.
+
+    Status reads (pidfiles, QMP sockets, launch markers) use the same rule
+    as :func:`ensure_runtime_dir` uses for writes, without creating
+    anything: a directory that is missing holds nothing to read and is
+    fine; one that exists must be a real directory, this user's, mode 0700.
+    """
+    return _runtime_dir_problem(runtime_dir(), missing_ok=True)
+
+
+def _runtime_dir_problem(path: str, *, missing_ok: bool) -> str:
     try:
         info = os.lstat(path)
+    except FileNotFoundError:
+        return "" if missing_ok else f"runtime directory {path} is missing"
     except OSError as error:
-        raise RuntimeDirError(f"cannot use runtime directory {path}: {error}")
+        return f"cannot use runtime directory {path}: {error}"
     if not stat.S_ISDIR(info.st_mode):
-        raise RuntimeDirError(
-            f"runtime directory {path} is not a directory (or is a symlink)")
+        return f"runtime directory {path} is not a directory (or is a symlink)"
     if info.st_uid != os.getuid():
-        raise RuntimeDirError(
-            f"runtime directory {path} belongs to uid {info.st_uid}, not you")
+        return f"runtime directory {path} belongs to uid {info.st_uid}, not you"
     if info.st_mode & 0o077:
-        raise RuntimeDirError(
-            f"runtime directory {path} is mode "
-            f"{stat.S_IMODE(info.st_mode):04o}; it must be 0700")
-    return path
+        return (f"runtime directory {path} is mode "
+                f"{stat.S_IMODE(info.st_mode):04o}; it must be 0700")
+    return ""
+
+
+def canonical(path: str) -> str:
+    """One spelling per file, for comparing control paths.
+
+    Symlinked directories (``/var/run`` for ``/run``), ``.`` and ``..``
+    all resolve, so two spellings of one socket or pidfile compare equal.
+    A missing final component is fine; it is kept as written.
+    """
+    return os.path.realpath(path)
+
+
+def in_runtime_dir(path: str) -> bool:
+    """True when `path` names a file directly in the manager's runtime dir."""
+    return (os.path.dirname(canonical(path)) == canonical(runtime_dir()))
 
 
 def qmp_path(vm_id: str) -> str:
@@ -435,14 +472,16 @@ def normalise(
     own_pid = os.path.normpath(pid_path(vm_id))
     own_spec = qmp_spec(own_qmp)
     has_own_qmp = False
-    claimed = {os.path.normpath(path): owner
+    # Paths are compared canonically (symlinked directories resolved), so
+    # another spelling of a file is still that file.
+    claimed = {canonical(path): owner
                for path, owner in (claimed or {}).items() if owner != vm_id}
-    runtime = os.path.normpath(runtime_dir())
+    runtime = canonical(runtime_dir())
 
-    def foreign(path: str) -> str:
-        """Whose control file `path` is, when it is not this VM's; else ''."""
-        path = os.path.normpath(_absolute(path, cwd))
-        if path in (own_qmp, own_pid):
+    def foreign(path: str, mine: str) -> str:
+        """Whose control file `path` is, when it is not this VM's `mine`."""
+        path = canonical(_absolute(path, cwd))
+        if path == canonical(mine):
             return ""
         if path in claimed:
             return f"VM {claimed[path]}'s"
@@ -486,7 +525,11 @@ def normalise(
             if pidfile:
                 raise DefinitionError("the argv names more than one -pidfile")
             pidfile = _absolute(item.value or "", cwd)
-            if owner := foreign(pidfile):
+            if canonical(pidfile) == canonical(own_qmp):
+                notes.append(f"replaced -pidfile {pidfile}: it is this VM's "
+                             f"QMP socket path; assigned {own_pid}")
+                pidfile = own_pid
+            elif owner := foreign(pidfile, own_pid):
                 notes.append(f"replaced -pidfile {pidfile}: it is {owner} "
                              f"pidfile; assigned {own_pid}")
                 pidfile = own_pid
@@ -500,7 +543,8 @@ def normalise(
                        if item.value is not None else None)
         if socket_path:
             absolute = os.path.normpath(_absolute(socket_path, cwd))
-            if absolute == own_qmp and item.name == "qmp":
+            own = canonical(absolute) == canonical(own_qmp)
+            if own and item.name == "qmp":
                 if has_own_qmp:
                     notes.append(f"removed a second -qmp on {own_qmp}")
                     continue
@@ -509,11 +553,11 @@ def normalise(
                     notes.append(f"rewrote -qmp {item.value} as {own_spec}")
                 kept.append(Option(item.word, item.name, own_spec))
                 continue
-            if absolute == own_qmp:
+            if own:
                 raise DefinitionError(
                     f"{item.word} {item.value} binds this VM's QMP socket path, "
                     "which the manager's own -qmp needs")
-            if owner := foreign(absolute):
+            if owner := foreign(absolute, own_qmp):
                 if item.name in MONITOR_OPTIONS:
                     notes.append(f"removed {item.word} {item.value}: it is "
                                  f"{owner} socket; this VM gets its own")

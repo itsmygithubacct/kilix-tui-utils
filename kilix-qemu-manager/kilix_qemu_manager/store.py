@@ -8,10 +8,15 @@ degrades to "nothing remembered" rather than a crash.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
+import re
+import stat
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 
 from . import model
@@ -24,6 +29,13 @@ DAMAGE = (OSError, ValueError, RecursionError)
 # The TUI writes state from its main thread (f) and from its worker thread
 # (a launch records a recent); every read-modify-write holds this lock.
 _STATE_LOCK = threading.RLock()
+# ...and, across processes (the CLI beside a running TUI), an flock on a
+# lock file next to the state file. Taken once per outermost holder.
+_flock = {"depth": 0, "fd": -1}
+# A swap file is in flight for milliseconds. One older than this was left by
+# a writer that crashed between mkstemp and replace.
+STALE_SWAP_SECONDS = 600.0
+_SWAP_NAME = re.compile(r"\.(?P<target>[^/]+\.json)\.[a-z0-9_]{8}\.tmp\Z")
 
 
 # ── definitions ──────────────────────────────────────────────────────────────
@@ -61,30 +73,83 @@ def load_all() -> tuple[list[VmDefinition], list[str]]:
             problems.append(f"{name}: id {vm.id!r} does not match the file")
             continue
         found.append(vm)
-    # Each VM's status and controls go through its own pidfile and QMP
-    # socket. A definition whose argv opens another's (a hand edit, or a
-    # clone made before import refused that) would act on the other VM.
-    owners = claimed_paths(found)
     clean: list[VmDefinition] = []
-    for vm in found:
-        shared = sorted({owners[path] for path in
-                         model.control_paths(vm.argv, vm.cwd or "/")
-                         if owners.get(path, vm.id) != vm.id})
-        if shared:
+    for vm, reason in zip(found, control_conflicts(found)):
+        if reason:
             problems.append(
-                f"{vm.id}.json: its argv opens the pidfile or QMP socket of "
-                f"{', '.join(shared)}; re-import it to give it its own")
+                f"{vm.id}.json: not loaded: {reason}. Edit or delete "
+                f"{_definition_path(vm.id)}, then import the VM again")
             continue
         clean.append(vm)
     return clean, problems
+
+
+def opened_paths(vm: VmDefinition) -> set[str]:
+    """Every pidfile and unix socket `vm` opens or watches, canonically."""
+    paths = model.control_paths(vm.argv, vm.cwd or "/")
+    paths |= {vm.pidfile, vm.qmp}
+    return {model.canonical(path) for path in paths}
+
+
+def control_conflicts(machines: list[VmDefinition]) -> list[str]:
+    """For each definition, why it may not be loaded ('' when it may).
+
+    Each VM's status and controls go through its pidfile and QMP socket, so
+    two definitions that open one of them would read and drive one QEMU.
+    Who keeps such a path never depends on the order the files load in:
+
+    * in the runtime directory the manager names files after VM ids
+      (``<id>.pid``, ``<id>.qmp``), so only the VM with that id may open
+      them. Any other definition that does is refused, whether or not a VM
+      with that id is catalogued;
+    * elsewhere a path has no derived owner. When it is some definition's
+      pidfile or QMP socket and more than one definition opens it, every
+      one of them is refused, because nothing says which is the original.
+    """
+    opened = [opened_paths(vm) for vm in machines]
+    managed: set[str] = set()
+    for vm in machines:
+        managed |= {model.canonical(vm.pidfile), model.canonical(vm.qmp)}
+    openers: dict[str, list[str]] = {}
+    for vm, paths in zip(machines, opened):
+        for path in paths:
+            openers.setdefault(path, []).append(vm.id)
+    reasons: list[str] = []
+    for vm, paths in zip(machines, opened):
+        own = {model.canonical(model.pid_path(vm.id)),
+               model.canonical(model.qmp_path(vm.id))}
+        found: list[str] = []
+        for path in sorted(paths):
+            if model.in_runtime_dir(path):
+                if path in own:
+                    continue
+                stem, kind = os.path.splitext(os.path.basename(path))
+                what = {".pid": "pidfile", ".qmp": "QMP socket"}.get(kind)
+                found.append(f"{path}, the manager's {what} for VM {stem}"
+                             if what else
+                             f"{path} in the manager's runtime directory")
+            elif path in managed and len(openers[path]) > 1:
+                others = sorted(set(openers[path]) - {vm.id})
+                found.append(f"{path}, which {', '.join(others)} "
+                             f"open{'s' if len(others) == 1 else ''} too")
+        if not found:
+            reasons.append("")
+        elif all(", which " not in item for item in found):
+            reasons.append(f"it opens {' and '.join(found)}, not its own")
+        else:
+            reasons.append(
+                f"it opens {' and '.join(found)}; a pidfile or QMP socket "
+                "belongs to one VM, and outside the runtime directory the "
+                "manager cannot tell which, so none of them is loaded")
+    return reasons
 
 
 def claimed_paths(machines: list[VmDefinition]) -> dict[str, str]:
     """Each catalogued VM's pidfile and QMP socket path, mapped to its id."""
     owners: dict[str, str] = {}
     for vm in machines:
-        owners[os.path.normpath(vm.pidfile)] = vm.id
-        owners[os.path.normpath(vm.qmp)] = vm.id
+        owners[model.canonical(vm.pidfile)] = vm.id
+        owners[model.canonical(vm.qmp)] = vm.id
     return owners
 
 
@@ -109,9 +174,71 @@ def find(value: str) -> VmDefinition | None:
     return None
 
 
+@contextlib.contextmanager
+def state_lock():
+    """Serialise a read-modify-write of the state file, in and across
+    processes. A lock file that cannot be opened degrades to the thread
+    lock alone; it never stops the manager."""
+    with _STATE_LOCK:
+        if _flock["depth"] == 0:
+            path = model.state_path() + ".lock"
+            try:
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+                             | os.O_NOFOLLOW, 0o600)
+            except OSError:
+                fd = -1
+            if fd >= 0:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    os.close(fd)
+                    fd = -1
+            _flock["fd"] = fd
+        _flock["depth"] += 1
+        try:
+            yield
+        finally:
+            _flock["depth"] -= 1
+            if _flock["depth"] == 0 and _flock["fd"] >= 0:
+                os.close(_flock["fd"])      # closing releases the flock
+                _flock["fd"] = -1
+
+
+def clean_stale_swaps(directory: str, *, now: float | None = None) -> list[str]:
+    """Remove swap files a crashed writer left behind; return their names.
+
+    Only names this module's mkstemp makes (``.<name>.json.XXXXXXXX.tmp``)
+    are considered, and only regular files (never a symlink) owned by this
+    user and older than STALE_SWAP_SECONDS, so a write in progress in
+    another process keeps its swap file.
+    """
+    moment = time.time() if now is None else now
+    removed: list[str] = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return removed
+    for name in names:
+        if not _SWAP_NAME.fullmatch(name):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            info = os.lstat(path)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or moment - info.st_mtime < STALE_SWAP_SECONDS):
+                continue
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append(name)
+    return removed
+
+
 def _write_json(path: str, data: object) -> None:
     directory = os.path.dirname(path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
+    clean_stale_swaps(directory)
     # A unique swap file per write, so two writers never share one.
     fd, swap = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.",
                                 suffix=".tmp", dir=directory)
@@ -138,7 +265,7 @@ def remove(vm_id: str) -> str:
     """Delete one definition file. Disks and every other file stay."""
     path = _definition_path(vm_id)
     os.unlink(path)
-    with _STATE_LOCK:
+    with state_lock():
         record = load_state()
         record["favorites"] = [item for item in record["favorites"]
                                if item != vm_id]
@@ -199,7 +326,7 @@ def save_state(record: dict, *, strict: bool = False) -> bool:
     """
     clean = {"favorites": _ids(record.get("favorites")),
              "recents": _recents(record.get("recents"))}
-    with _STATE_LOCK:
+    with state_lock():
         if clean == load_state():
             return False
         try:
@@ -221,7 +348,7 @@ def set_favorite(vm_id: str, wanted: bool) -> bool:
     Raises OSError when the change could not be saved, rather than report a
     favorite that the next start would not show.
     """
-    with _STATE_LOCK:
+    with state_lock():
         record = load_state()
         present = vm_id in record["favorites"]
         if present == wanted:
@@ -239,7 +366,7 @@ def toggle_favorite(vm_id: str) -> bool:
 
     Raises OSError, as set_favorite does, when the flip was not saved.
     """
-    with _STATE_LOCK:
+    with state_lock():
         now = vm_id not in favorites()
         set_favorite(vm_id, now)
     return now
@@ -251,7 +378,7 @@ def recents() -> list[dict]:
 
 def remember_launch(vm_id: str, when: datetime | None = None) -> None:
     moment = (when or datetime.now(timezone.utc)).replace(microsecond=0)
-    with _STATE_LOCK:
+    with state_lock():
         record = load_state()
         record["recents"] = [{"id": vm_id, "at": moment.isoformat()}] + [
             row for row in record["recents"] if row["id"] != vm_id
