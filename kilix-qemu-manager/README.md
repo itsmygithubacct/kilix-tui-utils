@@ -56,8 +56,9 @@ fixed on import, and each change is printed:
 | `-chardev`, `-serial` or another device bound to such a socket | refused: other options can refer to it by id, so it cannot simply be dropped |
 | a `-pidfile` or socket outside the runtime directory that no catalogued VM uses | kept: it is the user's or a build's own (for example `build_vm_image.py`'s `qemu.pid`) |
 
-Paths are compared after resolving symlinked directories, so
-`/var/run/user/…` and `/run/user/…` name the same socket.
+To tell whether two paths are one file, import and the loader resolve every
+symlink, in the directories and in the file name itself, so `/var/run/user/…`
+and `/run/user/…` name the same socket.
 
 A hand-edited definition (for example `alpha.json` copied to `bravo.json`)
 can still open another VM's files. The loader decides who keeps a control
@@ -66,7 +67,24 @@ file from the path itself, never from the order the files load in:
 | A pidfile or QMP socket… | Loaded | Refused, listed as a problem |
 |---|---|---|
 | in the runtime directory, named `<id>.pid` or `<id>.qmp` | the definition with that id | every other definition that opens it, whether or not a VM with that id is catalogued |
+| any other file in the runtime directory (for example `<run>/alpha-serial.sock`) | none | every definition that opens it: the manager names everything there after a VM id, and import never puts anything else there |
 | elsewhere, opened by more than one definition | none | all of them: nothing tells the original from the copy |
+
+Three hand-made shapes that the r2 loader accepted are refused by these rules.
+Import never produces any of them:
+
+- a VM renamed by hand (`alpha.json` → `alpha2.json` with the id edited) that
+  keeps `alpha.pid`/`alpha.qmp`. Re-import it under its new id;
+- one VM that also opens another socket in the runtime directory (a
+  `-chardev socket,path=<run>/…` serial port). Put that socket elsewhere;
+- two definitions (two launch profiles) of one build VM that share its
+  `qemu.pid` outside the runtime directory. Keep one, or give each its own
+  pidfile.
+
+A definition file is also refused, as damage to that file alone, when a path
+or argv word holds a NUL byte or text that is not UTF-8 (the OS cannot take
+the first; the second cannot be shown). Any other error reading one file
+becomes that file's problem line; the other VMs still load.
 
 Each problem line names the file and the path, and says to edit or delete
 the file and import the VM again. A socket that two VMs share but that is
@@ -83,6 +101,19 @@ create the fallback first and plant sockets in it. Status reads follow the
 same rule without creating anything: in a runtime directory that exists but
 is not safely yours, no pidfile, QMP socket or launch marker is read, the VM
 shows as stopped with the reason, and no QMP command is sent through it.
+
+Whether a path is in the runtime directory is decided by the directory that
+holds the name as written, never by where a symlink in its last component
+points, because the owner of that directory is who could have put it there.
+For every read and control the directory is opened without following
+symlinks, checked through that open descriptor (yours, mode 0700), and the
+file is reached through it (`/proc/self/fd/N/<name>`), so the directory
+cannot be swapped between the check and the use. The manager creates only
+sockets, pidfiles and launch markers there, never symlinks, so a symlink it
+finds there is not followed even in a safe directory: the VM reads as stopped
+with "… is a symlink", no command is sent through it, and a launch is refused
+until you remove it. A path outside the runtime directory that is a symlink
+into it is refused the same way.
 
 ## Keys
 
@@ -122,9 +153,15 @@ Favorites and the last five launches live in one small state file,
 changes; a damaged file reads as empty. A favorite that cannot be saved is
 reported, not shown as set. Each update holds a lock, across processes too
 (an empty `state.json.lock` beside the state file), so the CLI and a running
-picker never lose each other's change. A write that crashed between its swap
-file and the replace leaves `.<name>.json.XXXXXXXX.tmp`; the next write in
-that directory removes such files of yours that are older than ten minutes.
+picker never lose each other's change. If another manager process holds
+that lock for more than five seconds (it was stopped with Ctrl-Z, say), the
+update is not made: a favorite says it could not be saved, and a recent is
+simply not recorded. A write that crashed between its swap file and the
+replace leaves a swap file behind; the next write in that directory removes
+such files of yours that are older than ten minutes. Only the manager's own
+names are touched: `.<id>.json.XXXXXXXX.tmp` in the `vms` directory and
+`.state.json.XXXXXXXX.tmp` beside the state file, which matters when
+`KILIX_QEMU_HOME` points at a directory that holds other files.
 
 `install.sh` publishes the manager as `kilix-qemu-manager` and writes a
 `Terminal=true` XDG entry so Kilix 95 lists it under Start > Programs >
