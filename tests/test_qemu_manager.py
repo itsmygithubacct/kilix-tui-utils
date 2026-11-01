@@ -2327,6 +2327,8 @@ class StateFileR4Tests(Sandbox):
         self.addCleanup(child.wait, 5)
         self.addCleanup(child.stdin.close)
         self.assertEqual(child.stdout.readline().strip(), "held")
+        open_fds = lambda: len(os.listdir("/proc/self/fd"))  # noqa: E731
+        before = open_fds()
         with mock.patch.object(store, "LOCK_WAIT_SECONDS", 0.3):
             started = time.monotonic()
             with self.assertRaisesRegex(OSError, "has held"):
@@ -2338,6 +2340,7 @@ class StateFileR4Tests(Sandbox):
             self.assertEqual(code, 1)
             self.assertIn("could not save favorites", err)
         self.assertEqual(store._flock, {"depth": 0, "fd": -1})
+        self.assertLessEqual(open_fds(), before, "a busy lock leaked its fd")
         child.stdin.write("\n")
         child.stdin.flush()
         self.assertEqual(child.wait(5), 0)
