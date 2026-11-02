@@ -147,13 +147,32 @@ swapped between the check and the use.
   group is refused ("… which is mode 0775 and writable by group staff,
   which is not your private group"), and so is write by others whatever
   the group.
+- A directory on the way needs search permission only, as it does for the
+  kernel: one you may enter but not list (a root-owned 0711 directory, say)
+  is walked. Any other error on the way (an I/O error, too many open files)
+  is a refusal with its reason, like the rules above; status never fails on
+  one.
 
 Without `/proc/self/fd` (a Linux system without `/proc` mounted, where the
 manager's liveness check, which reads `/proc/<pid>/cmdline`, cannot work
 either) a file cannot be reached through its checked directory. The manager
 then does not fall back to the name: status reads nothing there ("…
 /proc/self/fd is not available, so it is not used"), and no command is sent.
-The checks before a launch need no `/proc` and still apply.
+In full, on such a system:
+
+- the pidfile, the QMP socket and the launch marker are never read, so a VM
+  is seen as live only through its disk lock or its Kilix tab, and every
+  control is refused with the reason;
+- the checks before a launch need no `/proc` and still apply, so a launch
+  goes ahead: Kilix opens the tab and QEMU starts, and then the manager
+  reports that the QMP socket did not answer within the wait, although
+  QEMU is running in that tab;
+- a launch in progress is not seen through its marker, because the marker
+  is not read. It is still created exclusively, but a second launch cannot
+  read its age, takes it for a stale one and replaces it, so two launches
+  started before the first tab appears are not kept apart by the marker.
+  Once the tab is there it is the witness, and QEMU's own lock on the
+  pidfile and on each disk still stops a second copy of the same VM.
 
 ## Keys
 

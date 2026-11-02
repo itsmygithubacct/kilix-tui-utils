@@ -9,6 +9,7 @@ Kilix credentials are removed from the environment before anything imports.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import grp
 import io
@@ -2894,16 +2895,20 @@ class StoreR5Tests(Sandbox):
 
 
 @contextlib.contextmanager
-def group_db(*, name: str | None = None, members=(), other_primary=False):
+def group_db(*, name: str | None = None, members=(), other_primary=False,
+             missing=False):
     """The account database as the manager sees it, for this process's
     group: named `name` (default: the user's own name, as a private group
     is), with `members`, and with `other_primary`, another account whose
-    primary group it is. Other groups are looked up for real."""
+    primary group it is; with `missing`, the group has no entry at all.
+    Other groups are looked up for real."""
     me = pwd.getpwuid(os.getuid())
     gid = os.getgid()
     real_getgrgid = grp.getgrgid
 
     def getgrgid(number):
+        if number == gid and missing:
+            raise KeyError(f"getgrgid(): gid not found: {number}")
         if number == gid:
             return grp.struct_group(
                 (name or me.pw_name, "x", gid, list(members)))
@@ -2920,6 +2925,10 @@ def group_db(*, name: str | None = None, members=(), other_primary=False):
     with mock.patch.object(grp, "getgrgid", getgrgid), \
             mock.patch.object(pwd, "getpwall", getpwall):
         yield
+
+
+def open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
 
 
 class PrivateGroupR6Tests(RuntimeDirTests):
@@ -2958,6 +2967,7 @@ class PrivateGroupR6Tests(RuntimeDirTests):
             ("another account's primary group", {"other_primary": True},
              False),
             ("not this process's group", {}, True),
+            ("no group entry", {"missing": True}, False),
         )
         for index, (label, db, other_gid) in enumerate(cases):
             with self.subTest(label), group_db(**db):
@@ -2975,6 +2985,7 @@ class PrivateGroupR6Tests(RuntimeDirTests):
                     status = self.manager().status(vm)
                 self.assertIn("which is mode 0775 and writable by group",
                               problem)
+                self.assertIn("which is not your private group", problem)
                 self.assertFalse(result.ok)
                 self.assertIn("which is mode 0775", result.message)
                 self.assertFalse(status.pid)
@@ -3028,6 +3039,216 @@ class PrivateGroupR6Tests(RuntimeDirTests):
 
 def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o7777
+
+
+class DescriptorR6Tests(RuntimeDirTests):
+    """NB-R5-1 (QM-R5's Z9): no descriptor outlives a status or control."""
+
+    def test_status_and_controls_leak_no_descriptor(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        server = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(server.close)
+        mine = self.tmp / "mine"
+        mine.mkdir(mode=0o700)
+        outside = FakeQmpServer(str(mine / "x.qmp"), RUNNING_REPLY)
+        self.addCleanup(outside.close)
+        open_dir = self.tmp / "open"
+        open_dir.mkdir()
+        open_dir.chmod(0o777)
+        manager = self.manager()
+        self.assertEqual(manager.status(vm).state, "running")   # warm up
+        before = open_fds()
+        for _ in range(10):
+            self.assertEqual(manager.status(vm).state, "running")
+            self.assertTrue(manager.control(vm, "pause").ok)
+            self.assertEqual(model.reach_problem(vm.pidfile), "")
+            with model.reach(outside.path) as where:
+                self.assertEqual(qmp.status(where, timeout=0.5), "running")
+            self.assertIn("which is mode 0777",
+                          model.reach_problem(str(open_dir / "x.qmp")))
+            with model.reach(str(self.tmp / "missing" / "x.qmp")) as where:
+                self.assertIsNone(where)
+        # The fake servers close their side of each connection on their
+        # own threads, so wait for the count to settle. A leak is one or
+        # more per path per round: dozens here.
+        deadline = time.monotonic() + 5
+        while open_fds() > before and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertLessEqual(open_fds(), before)
+
+
+class DotPathR6Tests(Sandbox):
+    """NB-R5-3: a recorded absolute path may hold '..' (import keeps one
+    as written); the walk goes up as the kernel does (QM-R5's Z2). A path
+    that names a directory is refused, never an IndexError (Z7)."""
+
+    def test_dotdot_goes_up_as_the_kernel_does(self):
+        a, b = self.tmp / "a", self.tmp / "b"
+        a.mkdir(mode=0o700)
+        (a / "sub").mkdir(mode=0o700)
+        (a / "b").mkdir(mode=0o700)
+        b.mkdir(mode=0o700)
+        server = FakeQmpServer(str(b / "x.qmp"), RUNNING_REPLY)
+        self.addCleanup(server.close)
+        decoy = FakeQmpServer(str(a / "b" / "x.qmp"), {"query-status": {
+            "return": {"status": "paused", "running": False}}})
+        self.addCleanup(decoy.close)
+        os.symlink("a/sub", self.tmp / "link")
+        for path in (f"{a}/../b/x.qmp", f"{a}/sub/../../b/x.qmp",
+                     f"{self.tmp}/link/../../b/x.qmp"):
+            with self.subTest(path=path.replace(str(self.tmp), "<t>")):
+                self.assertEqual(qmp.status(path, timeout=0.5), "running")
+                with model.reach(path) as where:
+                    self.assertEqual(qmp.status(where, timeout=0.5),
+                                     "running")
+        self.assertEqual(decoy.seen, [])
+        pidfile = b / "qemu.pid"
+        pidfile.write_text("4242\n")
+        vm = self.define("Alpha", "-pidfile", f"{a}/../b/qemu.pid")
+        self.assertEqual(vm.pidfile, f"{a}/../b/qemu.pid")  # as written
+        with model.reach(vm.pidfile) as where:
+            self.assertEqual(Path(where).read_text(), "4242\n")
+
+    def test_a_path_that_names_a_directory_is_refused(self):
+        (self.tmp / "b").mkdir(mode=0o700)
+        for tail in ("/b/.", "/b/./.", "/.", "/b/..", "/b/./.."):
+            path = str(self.tmp) + tail
+            with self.subTest(tail=tail):
+                with self.assertRaises(model.RuntimeDirError) as caught:
+                    with model.reach(path):
+                        pass
+                self.assertIn("names a directory", str(caught.exception))
+                self.assertIn("names a directory", model.reach_problem(path))
+
+
+class WalkErrorR6Tests(RuntimeDirTests):
+    """NB-R5-5: an OSError inside the walk (EIO, EMFILE, a change of the
+    user's own) is the documented refusal, not a crash of status."""
+
+    def test_an_os_error_in_the_walk_is_a_refusal(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        server = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(server.close)
+        mine = self.tmp / "mine"
+        mine.mkdir(mode=0o700)
+        os.symlink("mine", self.tmp / "rel")
+        outside = str(self.tmp / "rel" / "x.qmp")
+        real = {name: getattr(os, name) for name in ("open", "fstat",
+                                                     "readlink")}
+
+        def failing_open(path, flags, *args, **kwargs):
+            if flags == model._DIR_FLAGS:
+                raise OSError(errno.EIO, "injected I/O error")
+            return real["open"](path, flags, *args, **kwargs)
+
+        def failing_fstat(fd):
+            info = real["fstat"](fd)
+            if model.stat.S_ISDIR(info.st_mode):
+                raise OSError(errno.EIO, "injected I/O error")
+            return info
+
+        def failing_readlink(path, *args, **kwargs):
+            if kwargs.get("dir_fd") is not None:
+                raise OSError(errno.EIO, "injected I/O error")
+            return real["readlink"](path, *args, **kwargs)
+
+        for name, fake, whole in (("open", failing_open, True),
+                                  ("fstat", failing_fstat, True),
+                                  ("readlink", failing_readlink, False)):
+            with self.subTest(name), mock.patch.object(model.os, name, fake):
+                before = open_fds()
+                with self.assertRaises(model.RuntimeDirError) as caught:
+                    with model.reach(outside):
+                        pass
+                self.assertIn("injected I/O error", str(caught.exception))
+                self.assertIn("injected I/O error",
+                              model.reach_problem(outside))
+                if whole:                       # every walk fails
+                    status = self.manager().status(vm)
+                    result = self.manager().control(vm, "poweroff")
+                    self.assertEqual(status.state, "stopped")
+                    self.assertIn("injected I/O error", status.detail)
+                    self.assertFalse(result.ok)
+                    self.assertIn("injected I/O error", result.message)
+                self.assertEqual(open_fds(), before)
+        self.assertEqual(server.seen, [])
+
+    def test_what_the_with_body_raises_is_left_alone(self):
+        mine = self.tmp / "mine"
+        mine.mkdir(mode=0o700)
+        with self.assertRaises(FileNotFoundError):
+            with model.reach(str(mine / "x.pid")) as where:
+                self.assertIsNone(where)
+                raise FileNotFoundError(errno.ENOENT, "the caller's own")
+
+
+class SearchOnlyR6Tests(Sandbox):
+    """NB-R5-6: a directory the user may search but not list is traversed,
+    as the kernel would (a root-owned 0711 dir, say)."""
+
+    def test_a_search_only_directory_on_the_way_is_traversed(self):
+        xonly = self.tmp / "xonly"
+        xonly.mkdir(mode=0o700)
+        server = FakeQmpServer(str(xonly / "x.qmp"), RUNNING_REPLY)
+        self.addCleanup(server.close)
+        xonly.chmod(0o311)
+        self.addCleanup(xonly.chmod, 0o700)
+        self.assertEqual(model.reach_problem(server.path), "")
+        with model.reach(server.path) as where:
+            self.assertEqual(qmp.status(where, timeout=0.5), "running")
+        xonly.chmod(0o000)                      # no search: still refused
+        self.assertIn("Permission denied", model.reach_problem(server.path))
+
+
+class OtherSpellingFdR6Tests(WalkR5Tests):
+    """NB-R5-4 (QM-R5's Z11, Y1's twin): another spelling of the runtime
+    dir is judged by the descriptor the walk ended in, not by its name."""
+
+    def test_a_swap_after_the_walk_is_judged_as_opened(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir()
+        self.fallback.chmod(0o755)                      # open: unsafe
+        planted = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(planted.close)
+        spelled = str(self.alias() / "alpha.qmp")
+        real_open, name, opens = os.open, self.fallback.name, [0]
+
+        def swapping_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == name and kwargs.get("dir_fd") is not None:
+                opens[0] += 1
+                if opens[0] == 2:               # the alias walk's open
+                    os.rename(self.fallback, self.shared / "opened")
+                    self.fallback.mkdir(mode=0o700)
+            return fd
+
+        with mock.patch.object(model.os, "open", swapping_open):
+            with self.assertRaises(model.RuntimeDirError) as caught:
+                with model.reach(spelled):
+                    pass
+        self.assertIn("it must be 0700", str(caught.exception))
+        self.assertEqual(opens[0], 2)
+        self.assertEqual(planted.seen, [])
+
+
+class StoreR6Tests(Sandbox):
+    """NB-R5-8 (QM-R5's Z14): only regular files load, not any non-FIFO."""
+
+    def test_only_regular_files_load(self):
+        self.define("Alpha")
+        os.mkdir(os.path.join(model.vms_dir(), "dir.json"))
+        os.symlink("/dev/null", os.path.join(model.vms_dir(), "null.json"))
+        os.makedirs(os.path.dirname(model.state_path()), exist_ok=True)
+        os.symlink("/dev/null", model.state_path())
+        machines, problems = store.load_all()
+        self.assertEqual([vm.id for vm in machines], ["alpha"])
+        self.assertEqual(problems, [
+            "dir.json: dir.json is not a regular file",
+            "null.json: null.json is not a regular file"])
+        self.assertEqual(store.load_state(), {"favorites": [], "recents": []})
+        self.assertIsNone(store.get("null"))
 
 
 if __name__ == "__main__":

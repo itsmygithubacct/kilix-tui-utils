@@ -192,7 +192,10 @@ def runtime_dir_alias(path: str) -> bool:
 
 # How many symlinks one walk follows, as the kernel's own limit.
 MAX_SYMLINKS = 40
-_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_PATH: a directory on the way needs search permission only, as it does
+# for the kernel's own lookup; fstat, dir_fd lookups and /proc/self/fd/N
+# all work on such a descriptor. O_NOFOLLOW|O_DIRECTORY refuses a symlink.
+_DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 def _private_group(gid: int) -> bool:
@@ -413,7 +416,27 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 def _checked(path: str) -> Iterator[_Found | None]:
     """The directory descriptor and name `path` may be used through; None
     when there is nothing there. Raises :class:`RuntimeDirError` with the
-    reason when it must not be used. See :func:`reach`."""
+    reason when it must not be used. See :func:`reach`.
+
+    Any other OSError while finding it (EIO, EMFILE, a directory of the
+    user's own changing under the walk) is a reason too: it becomes a
+    RuntimeDirError, so a status read degrades instead of raising. What the
+    caller's ``with`` body raises is left as it is.
+    """
+    with contextlib.ExitStack() as stack:
+        try:
+            found = stack.enter_context(_checked_unwrapped(path))
+        except RuntimeDirError:
+            raise
+        except OSError as error:
+            raise RuntimeDirError(f"cannot read {path}: "
+                                  f"{error.strerror or error}") from error
+        yield found
+
+
+@contextlib.contextmanager
+def _checked_unwrapped(path: str) -> Iterator[_Found | None]:
+    """:func:`_checked` before its OSError is turned into a reason."""
     directory = runtime_dir()
     runtime_fd = -1
     found: _Found | None = None
