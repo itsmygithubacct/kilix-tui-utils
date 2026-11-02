@@ -2909,13 +2909,16 @@ class Group(typing.NamedTuple):
 
 @contextlib.contextmanager
 def group_db(*, name: str | None = None, members=(), other_primary=False,
-             missing=False, second_line=None, sources="files", listing=True):
+             missing=False, second_line=None, sources="files", listing=True,
+             listed=None):
     """The account database as the manager sees it, for this process's
     group: named `name` (default: the user's own name, as a private group
     is), with `members`, and with `other_primary`, another account whose
     primary group it is; with `missing`, the group has no entry at all;
     with `second_line`, a (name, members) group line that shares its gid;
-    `sources` is what nsswitch.conf names for passwd and group. With
+    `sources` is what nsswitch.conf names for passwd and group; `listed`
+    is the (name, members) of the group's own line as the group listing
+    shows it, when that differs from getgrgid's answer. With
     `listing` False the account and group lists come from the C library
     (model._libc), for tests that fake that instead. Other groups are looked
     up for real. (create=True and the pwd.getpwall stand-in let the same
@@ -2946,7 +2949,8 @@ def group_db(*, name: str | None = None, members=(), other_primary=False,
         return entries
 
     def groups():
-        entries = [] if missing else [Group(entry[0], gid, entry[3])]
+        own = listed or (entry[0], entry[3])
+        entries = [] if missing else [Group(own[0], gid, list(own[1]))]
         if second_line:
             entries.append(Group(second_line[0], gid, list(second_line[1])))
         return entries
@@ -3796,6 +3800,21 @@ class AccountListR7Tests(RuntimeDirTests):
                 self.assertFalse(status.pid)
                 self.assertIn("the account list cannot be read",
                               status.detail)
+
+    def test_getgrgid_is_checked_as_well_as_the_listing(self):
+        """nscd caches getgrgid but not getgrent, so the two can disagree:
+        the group's own entry from getgrgid is checked too, not only the
+        lines the listing shows."""
+        me = pwd.getpwuid(os.getuid()).pw_name
+        for label, db, words in (
+                ("another name", {"name": "staff"},
+                 "(it does not have your user name)"),
+                ("another member", {"members": ("qemu-mgr-other",)},
+                 "(it has another member)")):
+            with self.subTest(label), group_db(listed=(me, []), **db):
+                self.assertIn(words, self.problem())
+        with group_db(listed=(me, [])):
+            self.assertEqual(self.problem(), "")
 
     def test_a_second_group_line_with_the_gid_refuses(self):
         me = pwd.getpwuid(os.getuid()).pw_name
