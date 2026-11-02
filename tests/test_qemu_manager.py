@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import typing
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -3296,7 +3297,7 @@ class StoreR6Tests(Sandbox):
         self.assertIsNone(store.get("null"))
 
 
-# ── r7: ACLs, a FIFO pidfile, a real other gid ────────────
+# ── r7: ACLs, a FIFO pidfile, a real other gid, the account list ────────────
 
 ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ = 0x01, 0x02, 0x04
 ACL_GROUP, ACL_MASK, ACL_OTHER = 0x08, 0x10, 0x20
@@ -3629,6 +3630,159 @@ class RealGroupR7Tests(RuntimeDirTests):
             self.assertEqual(server.seen, [])
             vmdir.chmod(0o755)                  # no group write: used
             self.assertEqual(model.reach_problem(server.path), "")
+
+
+class FakeLibc:
+    """setpwent/getpwent/endpwent and the gr* three, as model._libc gives
+    them, from lists; `stop_after` entries in, getpwent (or getgrent)
+    returns NULL with errno `code`, as a source that fails half-way does."""
+
+    def __init__(self, accounts, groups, *, stop="", stop_after=0,
+                 code=errno.EIO):
+        self.lists = {"pw": list(accounts), "gr": list(groups)}
+        self.stop, self.stop_after, self.code = stop, stop_after, code
+        self.errno, self.index, self.started, self.ended = 0, {}, [], []
+
+    def set_errno(self, value):
+        self.errno = value
+
+    def get_errno(self):
+        return self.errno
+
+    def __getattr__(self, name):
+        verb, kind = name[:3], name[3:5]
+        if verb == "set":
+            return lambda: (self.started.append(kind),
+                            self.index.__setitem__(kind, 0))
+        if verb == "end":
+            return lambda: self.ended.append(kind)
+        return lambda: self.step(kind)
+
+    def step(self, kind):
+        index = self.index[kind]
+        if kind == self.stop and index >= self.stop_after:
+            self.errno = self.code
+            return None
+        if index >= len(self.lists[kind]):
+            return None
+        self.index[kind] = index + 1
+        entry = self.lists[kind][index]
+        if kind == "pw":
+            return types.SimpleNamespace(contents=types.SimpleNamespace(
+                pw_name=entry[0].encode(), pw_gid=entry[1]))
+        return types.SimpleNamespace(contents=types.SimpleNamespace(
+            gr_name=entry[0].encode(), gr_gid=entry[1],
+            gr_mem=[member.encode() for member in entry[2]] + [None]))
+
+
+class AccountListR7Tests(RuntimeDirTests):
+    """NB-R6-1 and NB-R6-2: the private-group test fails closed when the
+    account list cannot be complete, and sees every group line with the
+    user's gid."""
+
+    def vm_dir(self) -> Path:
+        vmdir = Path(tempfile.mkdtemp(dir=self.tmp))
+        vmdir.chmod(0o775)
+        return vmdir
+
+    def problem(self) -> str:
+        return model.reach_problem(str(self.vm_dir() / "x.qmp"))
+
+    def test_only_sources_that_list_every_account_are_trusted(self):
+        for sources, used in (("files", True), ("files systemd", True),
+                              ("files [NOTFOUND=return] systemd", True),
+                              ("files sss", False), ("sss files", False),
+                              ("ldap", False), ("compat", False),
+                              ("files winbind", False)):
+            with self.subTest(sources), group_db(sources=sources):
+                problem = self.problem()
+                if used:
+                    self.assertEqual(problem, "")
+                else:
+                    self.assertIn("which is mode 0775 and writable by group",
+                                  problem)
+                    self.assertIn("need not list every account", problem)
+
+    def test_an_nsswitch_conf_without_both_lines_or_unreadable_refuses(self):
+        for label, text, words in (
+                ("no group line", "passwd: files\n", "has no group line"),
+                ("no passwd line", "group: files\n", "has no passwd line"),
+                ("no source", "passwd:\ngroup: files\n",
+                 "names no source for passwd"),
+                ("missing", None, "cannot be read")):
+            with self.subTest(label), group_db():
+                conf = self.tmp / f"nsswitch-{label.replace(' ', '-')}"
+                if text is not None:
+                    conf.write_text(f"# a comment: passwd: ldap\n{text}")
+                with mock.patch.object(model, "NSSWITCH", str(conf)):
+                    problem = self.problem()
+                self.assertIn("which is not your private group", problem)
+                self.assertIn(words, problem)
+
+    def test_a_listing_that_stops_on_an_error_refuses(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        gid = os.getgid()
+        accounts = [("root", 0), (me, gid), ("qemu-mgr-twin", gid)]
+        groups = [("root", 0, []), (me, gid, [])]
+        for label, libc, used in (
+                ("complete, with the twin", FakeLibc(accounts, groups), False),
+                ("complete, without it", FakeLibc(accounts[:2], groups), True),
+                ("passwd stops before the twin (EIO)",
+                 FakeLibc(accounts, groups, stop="pw", stop_after=2), False),
+                ("group stops (EIO)",
+                 FakeLibc(accounts[:2], groups, stop="gr", stop_after=1),
+                 False),
+                ("passwd ends with ENOENT",
+                 FakeLibc(accounts[:2], groups, stop="pw", stop_after=2,
+                          code=errno.ENOENT), True)):
+            with self.subTest(label), group_db(listing=False), \
+                    mock.patch.object(model, "_libc", create=True,
+                                      return_value=(libc, libc.set_errno,
+                                                    libc.get_errno)):
+                problem = self.problem()
+                self.assertTrue(libc.started)    # every listing is ended
+                self.assertEqual(sorted(libc.ended), sorted(libc.started))
+                if used:
+                    self.assertEqual(problem, "")
+                else:
+                    self.assertIn("which is not your private group", problem)
+
+        libc = FakeLibc(accounts, groups, stop="pw", stop_after=2)
+        with mock.patch.object(model, "_libc", create=True,
+                               return_value=(libc, libc.set_errno,
+                                             libc.get_errno)):
+            with self.assertRaises(OSError) as caught:
+                model._accounts()
+        self.assertIn("the account list stopped", str(caught.exception))
+        self.assertEqual(libc.ended, ["pw"])
+
+    def test_the_real_listing_sees_this_user(self):
+        me = pwd.getpwuid(os.getuid())
+        self.assertIn((me.pw_name, me.pw_gid),
+                      [(entry.pw_name, entry.pw_gid)
+                       for entry in model._accounts()])
+        self.assertEqual(sorted(entry.pw_name for entry in model._accounts()),
+                         sorted(entry.pw_name for entry in pwd.getpwall()))
+        self.assertEqual(sorted((g.gr_name, g.gr_gid, tuple(g.gr_mem))
+                                for g in model._groups()),
+                         sorted((g.gr_name, g.gr_gid, tuple(g.gr_mem))
+                                for g in grp.getgrall()))
+
+    def test_a_second_group_line_with_the_gid_refuses(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        for label, line, used in (
+                ("another group, with a member",
+                 ("qemu-mgr-team", ["qemu-mgr-mallory"]), False),
+                ("another group, no member", ("qemu-mgr-team", []), False),
+                ("the user's name again, another member",
+                 (me, ["qemu-mgr-mallory"]), False),
+                ("the user's name again, no member", (me, []), True)):
+            with self.subTest(label), group_db(second_line=line):
+                problem = self.problem()
+                if used:
+                    self.assertEqual(problem, "")
+                else:
+                    self.assertIn("(another group line has its gid)", problem)
 
 
 if __name__ == "__main__":

@@ -142,11 +142,18 @@ swapped between the check and the use.
 - Group write by your own private group is your write. On Debian a user
   whose primary group has their name logs in with umask 002 (pam_umask's
   "usergroups"), so their directories are 0775; those are used. The group
-  must be your process's group, have your user name, have no member but
-  you, and be no other account's primary group. Group write by any other
-  group is refused ("… which is mode 0775 and writable by group staff,
-  which is not your private group"), and so is write by others whatever
-  the group.
+  must be your process's group and your primary group, have your user
+  name, have no member but you in any group line with its gid, and be no
+  other account's primary group. Those last two need the whole account
+  list, so the manager trusts it only when `/etc/nsswitch.conf` takes
+  `passwd` and `group` from `files` and `systemd` alone (sources that list
+  every account), and only when listing them does not stop on an error.
+  With LDAP, sssd, NIS, winbind or `compat` in either line, an unreadable
+  `nsswitch.conf`, or a listing that fails half-way, the group is not
+  taken for private and its write is refused like any other group's.
+  Group write by any other group is refused ("… which is mode 0775 and
+  writable by group staff, which is not your private group (it does not
+  have your user name)"), and so is write by others whatever the group.
 - ACLs. Under a POSIX ACL the group bits of the mode are the ACL mask, so a
   0775 directory of your private group may still let another user or group
   write. The private-group rule above therefore holds only for a directory

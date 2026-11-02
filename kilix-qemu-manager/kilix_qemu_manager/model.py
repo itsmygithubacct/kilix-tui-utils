@@ -43,8 +43,9 @@ import re
 import stat
 import struct
 import tempfile
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, NamedTuple, Sequence
 
 SCHEMA = 1
 ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,47}\Z")
@@ -199,29 +200,174 @@ MAX_SYMLINKS = 40
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def _private_group(gid: int) -> bool:
-    """`gid` is this user's own private group, so its write bit adds no
-    writer but this user (and root).
+# The account database's sources, for the private-group test. Only sources
+# that list every account they know (getpwent/getgrent) are trusted to say
+# "no other account has this group": the files, and systemd's own records.
+NSSWITCH = "/etc/nsswitch.conf"
+LISTING_SOURCES = frozenset({"files", "systemd"})
+
+
+class _Account(NamedTuple):
+    pw_name: str
+    pw_gid: int
+
+
+class _Group(NamedTuple):
+    gr_name: str
+    gr_gid: int
+    gr_mem: list
+
+
+_LISTING = threading.Lock()             # getpwent/getgrent share one cursor
+_LIBC: list = []
+
+
+def _libc():
+    """The C library's set/get/end{pw,gr}ent, as the process sees them
+    (an LD_PRELOAD or NSS module included)."""
+    if not _LIBC:
+        import ctypes
+
+        class CPasswd(ctypes.Structure):
+            _fields_ = [("pw_name", ctypes.c_char_p),
+                        ("pw_passwd", ctypes.c_char_p),
+                        ("pw_uid", ctypes.c_uint), ("pw_gid", ctypes.c_uint),
+                        ("pw_gecos", ctypes.c_char_p),
+                        ("pw_dir", ctypes.c_char_p),
+                        ("pw_shell", ctypes.c_char_p)]
+
+        class CGroup(ctypes.Structure):
+            _fields_ = [("gr_name", ctypes.c_char_p),
+                        ("gr_passwd", ctypes.c_char_p),
+                        ("gr_gid", ctypes.c_uint),
+                        ("gr_mem", ctypes.POINTER(ctypes.c_char_p))]
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.getpwent.restype = ctypes.POINTER(CPasswd)
+        libc.getgrent.restype = ctypes.POINTER(CGroup)
+        _LIBC.append((libc, ctypes.set_errno, ctypes.get_errno))
+    return _LIBC[0]
+
+
+def _listing(kind: str) -> list:
+    """Every passwd (`kind` "pw") or group ("gr") entry the account database
+    lists. Raises OSError when the listing stops on an error: CPython's
+    pwd.getpwall() and grp.getgrall() take that for the end of the list, so
+    a source that fails half-way would look like a short, complete one."""
+    libc, set_errno, get_errno = _libc()
+    start, step, end = (getattr(libc, f"{verb}{kind}ent")
+                        for verb in ("set", "get", "end"))
+    entries: list = []
+    with _LISTING:
+        start()
+        try:
+            while True:
+                set_errno(0)
+                entry = step()
+                if not entry:
+                    code = get_errno()
+                    if code not in (0, errno.ENOENT):
+                        raise OSError(code, "the account list stopped: "
+                                      + os.strerror(code))
+                    return entries
+                c = entry.contents
+                if kind == "pw":
+                    entries.append(_Account(os.fsdecode(c.pw_name or b""),
+                                            c.pw_gid))
+                else:
+                    members, index = [], 0
+                    while c.gr_mem and c.gr_mem[index] is not None:
+                        members.append(os.fsdecode(c.gr_mem[index]))
+                        index += 1
+                    entries.append(_Group(os.fsdecode(c.gr_name or b""),
+                                          c.gr_gid, members))
+        finally:
+            end()
+
+
+def _accounts() -> list:
+    return _listing("pw")
+
+
+def _groups() -> list:
+    return _listing("gr")
+
+
+def _sources_problem() -> str:
+    """'' when the passwd and group databases come only from sources that
+    list every account (:data:`LISTING_SOURCES`); otherwise why not. LDAP,
+    sssd and the like need not list every account, and then no one can say
+    that no other account has a given primary group."""
+    try:
+        with open(NSSWITCH, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(1 << 16)
+    except OSError as error:
+        return f"{NSSWITCH} cannot be read ({error.strerror or error})"
+    seen = set()
+    for line in text.splitlines():
+        database, colon, rest = line.split("#", 1)[0].partition(":")
+        database = database.strip()
+        if not colon or database not in ("passwd", "group"):
+            continue
+        seen.add(database)
+        sources = re.sub(r"\[[^]]*\]", " ", rest).split()
+        if not sources:
+            return f"{NSSWITCH} names no source for {database}"
+        for source in sources:
+            if source not in LISTING_SOURCES:
+                return (f"{NSSWITCH} takes {database} from {source}, which "
+                        "need not list every account")
+    for database in ("passwd", "group"):
+        if database not in seen:
+            return f"{NSSWITCH} has no {database} line"
+    return ""
+
+
+def _private_group_problem(gid: int) -> str:
+    """'' when `gid` is this user's own private group, so its write bit adds
+    no writer but this user (and root); otherwise why it is not.
 
     This is pam_umask's "usergroups" test, made strict: Debian logs a user
     in with umask 002 when their primary group has their name, so their
-    directories are 0775. The group must be this process's group, have the
-    user's name, have no member but the user, and be no other account's
-    primary group. Anything that cannot be looked up is not private.
+    directories are 0775. The group must be this process's group and the
+    user's primary group, have the user's name, have no member but the user
+    in any group line with its gid, and be no other account's primary
+    group. The last two need the whole account list, so the account
+    database must come from sources that list every account
+    (:func:`_sources_problem`) and the listing must not stop on an error.
+    Anything that cannot be looked up is not private.
     """
     if gid != os.getgid():
-        return False
+        return "it is not your process's group"
     try:
-        user = pwd.getpwuid(os.getuid()).pw_name
+        me = pwd.getpwuid(os.getuid())
+        user = me.pw_name
+        if me.pw_gid != gid:
+            return "it is not your primary group"
         group = grp.getgrgid(gid)
         if group.gr_name != user:
-            return False
+            return "it does not have your user name"
         if any(member != user for member in group.gr_mem):
-            return False
-        return not any(entry.pw_gid == gid and entry.pw_name != user
-                       for entry in pwd.getpwall())
-    except (KeyError, OSError):
-        return False
+            return "it has another member"
+        if problem := _sources_problem():
+            return problem
+        if any(entry.gr_gid == gid and (entry.gr_name != user or any(
+                member != user for member in entry.gr_mem))
+               for entry in _groups()):
+            return "another group line has its gid"
+        if any(entry.pw_gid == gid and entry.pw_name != user
+               for entry in _accounts()):
+            return "another account has it as its primary group"
+        return ""
+    except (KeyError, OSError) as error:
+        return f"it cannot be looked up ({error})"
+    except Exception as error:          # ctypes missing or a broken libc
+        return f"the account list cannot be read ({error})"
+
+
+def _private_group(gid: int) -> bool:
+    """See :func:`_private_group_problem`."""
+    return not _private_group_problem(gid)
 
 
 # POSIX ACLs in their xattr form (little-endian): a version word, then
@@ -312,14 +458,15 @@ def _walk_problem(where: str, info: os.stat_result, fd: int) -> str:
 def _group_note(info: os.stat_result, fd: int) -> str:
     if info.st_mode & 0o022 != 0o020:
         return ""                       # others can write: that says it all
-    if _private_group(info.st_gid):
+    why = _private_group_problem(info.st_gid)
+    if not why:
         return f" and {_acl_problem(fd)}"
     try:
         name = grp.getgrgid(info.st_gid).gr_name
     except (KeyError, OSError):
         name = str(info.st_gid)
     return (f" and writable by group {name}, which is not your private "
-            "group")
+            f"group ({why})")
 
 
 @dataclass
