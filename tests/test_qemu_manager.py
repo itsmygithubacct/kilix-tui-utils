@@ -3768,6 +3768,35 @@ class AccountListR7Tests(RuntimeDirTests):
                          sorted((g.gr_name, g.gr_gid, tuple(g.gr_mem))
                                 for g in grp.getgrall()))
 
+    def test_the_group_must_be_the_users_primary_group(self):
+        """getgid() is the user's primary gid unless newgrp or sg changed
+        it; a group the user only switched to is not their private group."""
+        me = pwd.getpwuid(os.getuid())
+        with group_db():
+            self.assertEqual(self.problem(), "")
+            moved = pwd.struct_passwd((me.pw_name, "x", me.pw_uid,
+                                       os.getgid() + 1, "", me.pw_dir,
+                                       "/bin/sh"))
+            with mock.patch.object(pwd, "getpwuid", return_value=moved):
+                self.assertIn("(it is not your primary group)",
+                              self.problem())
+
+    def test_an_account_list_that_cannot_be_read_at_all_refuses(self):
+        """No ctypes, or a C library without getpwent: a refusal with the
+        reason, never an exception out of status."""
+        vm = self.define("Alpha", "-pidfile", str(self.vm_dir() / "q.pid"))
+        for label, error in (("no ctypes", ImportError("No module named "
+                                                       "'ctypes'")),
+                             ("no getpwent", AttributeError("getpwent"))):
+            with self.subTest(label), group_db(listing=False), \
+                    mock.patch.object(model, "_libc", side_effect=error):
+                problem = self.problem()
+                self.assertIn("(the account list cannot be read (", problem)
+                status = self.manager().status(vm)
+                self.assertFalse(status.pid)
+                self.assertIn("the account list cannot be read",
+                              status.detail)
+
     def test_a_second_group_line_with_the_gid_refuses(self):
         me = pwd.getpwuid(os.getuid()).pw_name
         for label, line, used in (
