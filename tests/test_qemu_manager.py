@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import typing
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -2894,37 +2895,81 @@ class StoreR5Tests(Sandbox):
 # ── fix round r6 ─────────────────────────────────────────────────────────────
 
 
+class Account(typing.NamedTuple):
+    pw_name: str
+    pw_gid: int
+
+
+class Group(typing.NamedTuple):
+    gr_name: str
+    gr_gid: int
+    gr_mem: list
+
+
 @contextlib.contextmanager
 def group_db(*, name: str | None = None, members=(), other_primary=False,
-             missing=False):
+             missing=False, second_line=None, sources="files", listing=True):
     """The account database as the manager sees it, for this process's
     group: named `name` (default: the user's own name, as a private group
     is), with `members`, and with `other_primary`, another account whose
-    primary group it is; with `missing`, the group has no entry at all.
-    Other groups are looked up for real."""
+    primary group it is; with `missing`, the group has no entry at all;
+    with `second_line`, a (name, members) group line that shares its gid;
+    `sources` is what nsswitch.conf names for passwd and group. With
+    `listing` False the account and group lists come from the C library
+    (model._libc), for tests that fake that instead. Other groups are looked
+    up for real. (create=True and the pwd.getpwall stand-in let the same
+    helper run against the r6 code, for the before-runs.)"""
     me = pwd.getpwuid(os.getuid())
     gid = os.getgid()
     real_getgrgid = grp.getgrgid
+    real_getpwuid = pwd.getpwuid
+    entry = (name or me.pw_name, "x", gid, list(members))
 
     def getgrgid(number):
         if number == gid and missing:
             raise KeyError(f"getgrgid(): gid not found: {number}")
         if number == gid:
-            return grp.struct_group(
-                (name or me.pw_name, "x", gid, list(members)))
+            return grp.struct_group(entry)
         return real_getgrgid(number)
 
-    def getpwall():
-        entries = [me]
+    def getpwuid(number):
+        if number == os.getuid():
+            return pwd.struct_passwd((me.pw_name, "x", me.pw_uid, gid, "",
+                                      me.pw_dir, "/bin/sh"))
+        return real_getpwuid(number)
+
+    def accounts():
+        entries = [Account(me.pw_name, gid)]
         if other_primary:
-            entries.append(pwd.struct_passwd((
-                "qemu-mgr-other", "x", os.getuid() + 1, gid, "",
-                "/nonexistent", "/usr/sbin/nologin")))
+            entries.append(Account("qemu-mgr-other", gid))
         return entries
 
-    with mock.patch.object(grp, "getgrgid", getgrgid), \
-            mock.patch.object(pwd, "getpwall", getpwall):
-        yield
+    def groups():
+        entries = [] if missing else [Group(entry[0], gid, entry[3])]
+        if second_line:
+            entries.append(Group(second_line[0], gid, list(second_line[1])))
+        return entries
+
+    with tempfile.TemporaryDirectory(prefix="qemu-mgr-nss-") as nss:
+        conf = os.path.join(nss, "nsswitch.conf")
+        with open(conf, "w") as handle:
+            handle.write(f"passwd: {sources}\ngroup: {sources}\n")
+        with contextlib.ExitStack() as stack:
+            for target, attribute, value in (
+                    (grp, "getgrgid", getgrgid), (pwd, "getpwuid", getpwuid),
+                    (pwd, "getpwall", lambda: [
+                        pwd.struct_passwd((entry.pw_name, "x", 0,
+                                           entry.pw_gid, "", "/", "/bin/sh"))
+                        for entry in accounts()]),
+                    (model, "NSSWITCH", conf)):
+                stack.enter_context(mock.patch.object(target, attribute,
+                                                      value, create=True))
+            if listing:
+                stack.enter_context(mock.patch.object(
+                    model, "_accounts", accounts, create=True))
+                stack.enter_context(mock.patch.object(
+                    model, "_groups", groups, create=True))
+            yield
 
 
 def open_fds() -> int:
@@ -3251,7 +3296,256 @@ class StoreR6Tests(Sandbox):
         self.assertIsNone(store.get("null"))
 
 
-# ── r7: a FIFO pidfile ────────────
+# ── r7: ACLs, a FIFO pidfile, a real other gid ────────────
+
+ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ = 0x01, 0x02, 0x04
+ACL_GROUP, ACL_MASK, ACL_OTHER = 0x08, 0x10, 0x20
+ACL_UNDEFINED_ID = 0xFFFFFFFF
+
+
+def acl_blob(named=(), *, mask: int | None = 7, version: int = 2) -> bytes:
+    """A POSIX ACL in the kernel's xattr form, entries in setfacl's order:
+    owner rwx, `named` (tag, perm, id), group r-x, mask, others r-x."""
+    entries = ([(ACL_USER_OBJ, 7, ACL_UNDEFINED_ID)]
+               + sorted(e for e in named if e[0] == ACL_USER)
+               + [(ACL_GROUP_OBJ, 5, ACL_UNDEFINED_ID)]
+               + sorted(e for e in named if e[0] == ACL_GROUP)
+               + ([] if mask is None else [(ACL_MASK, mask, ACL_UNDEFINED_ID)])
+               + [(ACL_OTHER, 5, ACL_UNDEFINED_ID)])
+    return struct.pack("<I", version) + b"".join(
+        struct.pack("<HHI", *entry) for entry in entries)
+
+
+ACCESS_ACL = "system.posix_acl_access"
+DEFAULT_ACL = "system.posix_acl_default"
+
+
+class AclR7Tests(RuntimeDirTests):
+    """R6-B1: under a POSIX ACL the group bits of the mode are the ACL mask,
+    so a 0775 directory of the user's private group may be writable by
+    another user or group. The private-group exemption is given only when
+    the directory has no ACL entry for a named user or group. The ACLs are
+    real (set as setfacl does); the account database is group_db's, so the
+    process's group is private here whatever the host's is."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        probe = Path(tempfile.mkdtemp(dir=self.tmp))
+        try:
+            os.setxattr(probe, ACCESS_ACL,
+                        acl_blob([(ACL_USER, 5, 65534)], mask=5))
+        except OSError as error:
+            self.skipTest(f"no POSIX ACLs where the tests run: {error}")
+
+    def vm_dir(self, mode: int) -> Path:
+        vmdir = Path(tempfile.mkdtemp(dir=self.tmp))
+        vmdir.chmod(mode)
+        return vmdir
+
+    def shared_dirs(self):
+        """(label, directory, expected words) for three ways another user
+        or group gets write through an ACL: u:X:rwx, g:Y:rwx and a default
+        ACL inherited from the parent."""
+        by_user = self.vm_dir(0o755)
+        os.setxattr(by_user, ACCESS_ACL, acl_blob([(ACL_USER, 7, 65534)]))
+        by_group = self.vm_dir(0o755)
+        os.setxattr(by_group, ACCESS_ACL, acl_blob([(ACL_GROUP, 7, 65534)]))
+        parent = self.vm_dir(0o700)
+        os.setxattr(parent, DEFAULT_ACL, acl_blob([(ACL_USER, 7, 65534)]))
+        inherited = parent / "vm"
+        inherited.mkdir()
+        rows = [("u:65534:rwx", by_user, "an entry for user 65534"),
+                ("g:65534:rwx", by_group, "an entry for group 65534"),
+                ("inherited default", inherited, "an entry for user 65534")]
+        for label, path, _words in rows:
+            info = path.stat()
+            # It looks exactly like a private 0775 directory.
+            self.assertEqual(info.st_mode & 0o7777, 0o775, label)
+            self.assertEqual(info.st_gid, os.getgid(), label)
+            self.assertIn(ACCESS_ACL, os.listxattr(path), label)
+        return rows
+
+    def assert_refused(self, vmdir: Path, words: str, label: str) -> None:
+        server = FakeQmpServer(str(vmdir / "own.qmp"), RUNNING_REPLY)
+        self.addCleanup(server.close)
+        vm = self.define(f"Alpha {label}", "-pidfile", str(vmdir / "qemu.pid"))
+        launched = len(self.rc.launched)
+        problem = model.reach_problem(server.path)
+        result = self.manager().launch(vm)
+        status = self.manager().status(vm)
+        self.assertIn(f"{vmdir}, which is mode 0775 and ", problem)
+        self.assertIn(words, problem)
+        self.assertIn("another user can change that", problem)
+        self.assertFalse(result.ok, result.message)
+        self.assertIn(words, result.message)
+        self.assertEqual(len(self.rc.launched), launched)
+        self.assertFalse(status.pid)
+        self.assertEqual(server.seen, [])
+        with self.assertRaises(model.RuntimeDirError):
+            with model.reach(server.path):
+                pass
+
+    def test_a_dir_others_may_write_through_an_acl_is_refused(self):
+        with group_db():
+            for label, vmdir, words in self.shared_dirs():
+                with self.subTest(label):
+                    self.assert_refused(vmdir, words, label)
+
+    def test_a_planted_link_in_an_acl_shared_dir_reaches_nothing(self):
+        """What the named user could do there: replace the recorded QMP
+        socket with a link to another VM's, or the pidfile with a link to a
+        file of the user's. Neither is followed, and no launch goes ahead."""
+        with group_db():
+            (_label, vmdir, _words), = [row for row in self.shared_dirs()
+                                        if row[0] == "g:65534:rwx"]
+            private = self.vm_dir(0o700)
+            bravo = FakeQmpServer(str(private / "bravo.qmp"), RUNNING_REPLY)
+            self.addCleanup(bravo.close)
+            victim = private / "precious"
+            victim.write_text("the user's own data\n")
+            os.symlink(bravo.path, vmdir / "alpha.qmp")
+            os.symlink(victim, vmdir / "qemu.pid")
+            vm = self.define("Alpha", "-pidfile", str(vmdir / "qemu.pid"))
+            self.assertFalse(self.manager().launch(vm).ok)
+            with self.assertRaises(model.RuntimeDirError):
+                with model.reach(str(vmdir / "alpha.qmp")) as where:
+                    qmp.execute(where, "quit", timeout=0.5)
+        self.assertEqual(bravo.seen, [])
+        self.assertEqual(victim.read_text(), "the user's own data\n")
+
+    def test_a_plain_0775_private_group_dir_is_still_used(self):
+        with group_db():
+            for label, extra in (("no ACL", None),
+                                 ("an ACL with a mask and no named entry",
+                                  acl_blob())):
+                with self.subTest(label):
+                    vmdir = self.vm_dir(0o775)
+                    if extra is not None:
+                        os.setxattr(vmdir, ACCESS_ACL, extra)
+                        self.assertIn(ACCESS_ACL, os.listxattr(vmdir))
+                    self.assertEqual(vmdir.stat().st_mode & 0o777, 0o775)
+                    vm = self.define(f"Alpha {label}", "-pidfile",
+                                     str(vmdir / "qemu.pid"))
+                    self.assertEqual(vm.pidfile, str(vmdir / "qemu.pid"))
+                    self.assertEqual(model.reach_problem(vm.pidfile), "")
+                    result = self.manager().launch(vm)
+                    self.assertTrue(result.ok, result.message)
+                    self.wait_for(lambda: self.manager().status(vm).pid)
+                    self.assertTrue(self.manager().control(vm,
+                                                           "poweroff").ok)
+                    self.wait_for(lambda: not self.manager().status(vm).pid)
+
+    def test_a_named_entry_in_the_dirs_own_default_acl_is_refused(self):
+        """It adds no writer to the directory itself, but QEMU's pidfile
+        and socket would inherit it; any named entry ends the exemption."""
+        with group_db():
+            vmdir = self.vm_dir(0o775)
+            os.setxattr(vmdir, DEFAULT_ACL, acl_blob([(ACL_USER, 7, 65534)]))
+            self.assertNotIn(ACCESS_ACL, os.listxattr(vmdir))
+            self.assert_refused(vmdir, f"({DEFAULT_ACL}) with an entry for "
+                                "user 65534", "default")
+
+    def test_a_read_only_acl_on_a_0755_dir_keeps_it_usable(self):
+        """No group write bit (mask r-x): the exemption is not asked."""
+        vmdir = self.vm_dir(0o755)
+        os.setxattr(vmdir, ACCESS_ACL, acl_blob([(ACL_USER, 5, 65534)],
+                                                mask=5))
+        self.assertEqual(vmdir.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(model.reach_problem(str(vmdir / "x.qmp")), "")
+
+    def test_an_acl_that_cannot_be_read_or_parsed_is_refused(self):
+        real_get, real_list = os.getxattr, os.listxattr
+
+        def raising(code):
+            def call(*_args, **_kwargs):
+                raise OSError(code, os.strerror(code))
+            return call
+
+        def returning(value):
+            return lambda *_args, **_kwargs: value
+
+        bad_tag = acl_blob() + struct.pack("<HHI", 0x40, 7, 0)
+        cases = (
+            ("getxattr EIO", raising(errno.EIO), real_list,
+             "its ACL cannot be read (Input/output error)"),
+            ("getxattr EACCES", raising(errno.EACCES), real_list,
+             "its ACL cannot be read (Permission denied)"),
+            ("listxattr EIO", real_get, raising(errno.EIO),
+             "its ACL cannot be read (Input/output error)"),
+            ("version 3", returning(acl_blob(version=3)), real_list,
+             "the manager cannot parse"),
+            ("a torn entry", returning(acl_blob()[:-3]), real_list,
+             "the manager cannot parse"),
+            ("no header", returning(b"\x02"), real_list,
+             "the manager cannot parse"),
+            ("an unknown tag", returning(bad_tag), real_list,
+             "the manager cannot parse"),
+            ("an NFSv4 ACL", real_get, returning(["system.nfs4_acl"]),
+             "(system.nfs4_acl) the manager does not read"),
+            ("a rich ACL", real_get, returning(["system.richacl"]),
+             "(system.richacl) the manager does not read"),
+        )
+        with group_db():
+            for label, get, listing, words in cases:
+                with self.subTest(label):
+                    vmdir = self.vm_dir(0o775)
+                    with mock.patch.object(model.os, "getxattr", get), \
+                            mock.patch.object(model.os, "listxattr", listing):
+                        self.assert_refused(vmdir, words, label)
+
+    def test_no_acl_and_no_acl_support_are_fine(self):
+        def raising(code):
+            def call(*_args, **_kwargs):
+                raise OSError(code, os.strerror(code))
+            return call
+
+        with group_db():
+            for label, code in (("ENODATA", errno.ENODATA),
+                                ("ENOTSUP", errno.ENOTSUP),
+                                ("EOPNOTSUPP", errno.EOPNOTSUPP)):
+                with self.subTest(label):
+                    vmdir = self.vm_dir(0o775)
+                    listing = (raising(code) if code != errno.ENODATA
+                               else (lambda *_a, **_k: []))
+                    with mock.patch.object(model.os, "getxattr",
+                                           raising(code)), \
+                            mock.patch.object(model.os, "listxattr",
+                                              listing):
+                        self.assertEqual(
+                            model.reach_problem(str(vmdir / "x.qmp")), "")
+
+    def test_without_proc_the_exemption_is_not_given(self):
+        """The ACL is read through /proc/self/fd/N; without it, a 0775
+        directory is refused, as before r6 (and the README says so)."""
+        with group_db():
+            vmdir = self.vm_dir(0o775)
+            with mock.patch.object(model, "proc_fd_dir",
+                                   lambda fd: f"{self.tmp}/no-proc/{fd}"):
+                problem = model.reach_problem(str(vmdir / "x.qmp"))
+            self.assertIn(f"{vmdir}, which is mode 0775 and its ACL cannot "
+                          "be read (No such file or directory)", problem)
+            self.assertEqual(model.reach_problem(str(vmdir / "x.qmp")), "")
+
+    def test_the_acl_is_read_from_the_held_descriptor(self):
+        """The xattr calls get /proc/self/fd/N of the walk's own fd, never
+        the directory's name, so a rename after the walk opened it cannot
+        change what is judged."""
+        with group_db():
+            vmdir = self.vm_dir(0o775)
+            seen = []
+            real_get = os.getxattr
+
+            def recording(path, *args, **kwargs):
+                seen.append(os.fspath(path))
+                return real_get(path, *args, **kwargs)
+
+            with mock.patch.object(model.os, "getxattr", recording):
+                self.assertEqual(model.reach_problem(str(vmdir / "x.qmp")),
+                                 "")
+            self.assertTrue(seen)
+            self.assertTrue(all(path.startswith("/proc/self/fd/")
+                                for path in seen), seen)
+
 
 class PidfileFifoR7Tests(Sandbox):
     """NB-R6-4: reading a pidfile never blocks on a FIFO or follows a
@@ -3298,6 +3592,43 @@ class PidfileFifoR7Tests(Sandbox):
         regular.write_text("1" * 4096)
         self.assertEqual(len(backend.read_pidfile(str(regular))),
                          backend.PIDFILE_MAX_BYTES)
+
+
+class RealGroupR7Tests(RuntimeDirTests):
+    """NB-R6-3 (QM-R6's W4): the exemption is asked about the directory's
+    own gid, from the descriptor the walk holds. Here the kernel's gid is
+    one of the user's real supplementary groups, set with chown, while
+    group_db makes the process's own group private, so a rule that asked
+    about the process's gid would trust this directory."""
+
+    def test_a_dir_of_a_real_other_group_is_refused(self):
+        others = [gid for gid in os.getgroups() if gid != os.getgid()]
+        if not others:
+            self.skipTest("this user has no supplementary group, so no "
+                          "directory of theirs can carry another real gid "
+                          "without root")
+        gid = others[0]
+        with group_db():
+            vmdir = Path(tempfile.mkdtemp(dir=self.tmp))
+            os.chown(vmdir, -1, gid)
+            vmdir.chmod(0o775)
+            info = vmdir.stat()
+            self.assertEqual((info.st_gid, info.st_mode & 0o777),
+                             (gid, 0o775))
+            self.assertTrue(model._private_group(os.getgid()))
+            server = FakeQmpServer(str(vmdir / "own.qmp"), RUNNING_REPLY)
+            self.addCleanup(server.close)
+            vm = self.define("Alpha", "-pidfile", str(vmdir / "qemu.pid"))
+            problem = model.reach_problem(server.path)
+            result = self.manager().launch(vm)
+            self.assertIn(f"{vmdir}, which is mode 0775 and writable by "
+                          "group ", problem)
+            self.assertIn("which is not your private group", problem)
+            self.assertFalse(result.ok)
+            self.assertEqual(self.rc.launched, [])
+            self.assertEqual(server.seen, [])
+            vmdir.chmod(0o755)                  # no group write: used
+            self.assertEqual(model.reach_problem(server.path), "")
 
 
 if __name__ == "__main__":

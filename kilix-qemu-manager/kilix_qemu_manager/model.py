@@ -41,6 +41,7 @@ import os
 import pwd
 import re
 import stat
+import struct
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Sequence
@@ -223,27 +224,96 @@ def _private_group(gid: int) -> bool:
         return False
 
 
-def _shared(info: os.stat_result) -> bool:
-    """Someone but this user and root may create names here: others can
-    write, or a group that is not this user's private group can."""
-    if info.st_mode & 0o022 == 0o020 and _private_group(info.st_gid):
-        return False                    # group write by this user alone
-    return bool(info.st_mode & 0o022)
+# POSIX ACLs in their xattr form (little-endian): a version word, then
+# (tag u16, perm u16, id u32) entries.
+_POSIX_ACLS = ("system.posix_acl_access", "system.posix_acl_default")
+_ACL_VERSION = 2
+_ACL_TAGS = {0x01: "user_obj", 0x02: "user", 0x04: "group_obj",
+             0x08: "group", 0x10: "mask", 0x20: "other"}
+_ACL_NAMED = {0x02: "user", 0x08: "group"}
+# getxattr's "this file has no such attribute" and "this filesystem has no
+# xattrs/ACLs"; every other error is a reason.
+_NO_ACL = frozenset({errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 
-def _walk_problem(where: str, info: os.stat_result) -> str:
-    """Why a directory the walk looks names up in may not be trusted."""
-    if info.st_uid not in (0, os.getuid()):
-        return f"{where}, which belongs to uid {info.st_uid}"
-    if _shared(info) and not info.st_mode & stat.S_ISVTX:
-        return (f"{where}, which is mode {stat.S_IMODE(info.st_mode):04o}"
-                + _group_note(info))
+def _posix_acl_problem(name: str, blob: bytes) -> str:
+    if len(blob) < 4 or (len(blob) - 4) % 8:
+        return f"has an ACL ({name}) the manager cannot parse"
+    if struct.unpack_from("<I", blob)[0] != _ACL_VERSION:
+        return f"has an ACL ({name}) the manager cannot parse"
+    for offset in range(4, len(blob), 8):
+        tag, _perm, ident = struct.unpack_from("<HHI", blob, offset)
+        if tag not in _ACL_TAGS:
+            return f"has an ACL ({name}) the manager cannot parse"
+        if tag in _ACL_NAMED:
+            return (f"has an ACL ({name}) with an entry for "
+                    f"{_ACL_NAMED[tag]} {ident}")
     return ""
 
 
-def _group_note(info: os.stat_result) -> str:
+def _acl_problem(fd: int) -> str:
+    """'' when the directory `fd` holds has no ACL that lets anyone but its
+    owner, its owning group and others in; otherwise why not.
+
+    Under a POSIX ACL the group bits of the mode are the ACL mask, which
+    covers every named user and group, so a 0775 directory of the user's
+    own group may still be writable by another user. Read through
+    ``/proc/self/fd/N`` (the walk holds an O_PATH descriptor, which the
+    xattr calls do not take). No ACL, or an ACL of the owner, owning group,
+    mask and others only, is fine. A named user or group entry (in the
+    access or the default ACL), an ACL that cannot be parsed, another kind
+    of ACL (``system.nfs4_acl``, say), no ``/proc``, and any read error but
+    "no ACL" or "not supported" are reasons.
+    """
+    where = proc_fd_dir(fd)
+    try:
+        for name in _POSIX_ACLS:
+            try:
+                blob = os.getxattr(where, name)
+            except OSError as error:
+                if error.errno in _NO_ACL:
+                    continue
+                raise
+            if problem := _posix_acl_problem(name, blob):
+                return problem
+        try:
+            names = os.listxattr(where)
+        except OSError as error:
+            if error.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                return ""
+            raise
+    except OSError as error:
+        return f"its ACL cannot be read ({error.strerror or error})"
+    for name in names:
+        if "acl" in name.lower() and name not in _POSIX_ACLS:
+            return f"has an ACL ({name}) the manager does not read"
+    return ""
+
+
+def _shared(info: os.stat_result, fd: int) -> bool:
+    """Someone but this user and root may create names here: others can
+    write, or a group that is not this user's private group can, or an ACL
+    lets another user or group in. `fd` holds the directory `info` is of."""
+    if info.st_mode & 0o022 == 0o020 and _private_group(info.st_gid):
+        return bool(_acl_problem(fd))   # group write by this user alone
+    return bool(info.st_mode & 0o022)
+
+
+def _walk_problem(where: str, info: os.stat_result, fd: int) -> str:
+    """Why a directory the walk looks names up in may not be trusted."""
+    if info.st_uid not in (0, os.getuid()):
+        return f"{where}, which belongs to uid {info.st_uid}"
+    if _shared(info, fd) and not info.st_mode & stat.S_ISVTX:
+        return (f"{where}, which is mode {stat.S_IMODE(info.st_mode):04o}"
+                + _group_note(info, fd))
+    return ""
+
+
+def _group_note(info: os.stat_result, fd: int) -> str:
     if info.st_mode & 0o022 != 0o020:
         return ""                       # others can write: that says it all
+    if _private_group(info.st_gid):
+        return f" and {_acl_problem(fd)}"
     try:
         name = grp.getgrgid(info.st_gid).gr_name
     except (KeyError, OSError):
@@ -297,7 +367,7 @@ def _walk(path: str, *, follow_last: bool, avoid: tuple | None = None,
                                           "not a file")
                 continue
             info_dir = os.fstat(fd)
-            if problem := _walk_problem(where, info_dir):
+            if problem := _walk_problem(where, info_dir, fd):
                 raise RuntimeDirError(
                     f"{path} is reached through {problem}; another user "
                     "can change that, so it is not used")
@@ -317,8 +387,8 @@ def _walk(path: str, *, follow_last: bool, avoid: tuple | None = None,
                 raise RuntimeDirError(f"cannot read {path}: "
                                       f"{error.strerror or error}") from error
             here = os.path.join(where, part)
-            if (info is not None and _shared(info_dir)
-                    and info.st_uid not in (0, os.getuid())):
+            if (info is not None and info.st_uid not in (0, os.getuid())
+                    and _shared(info_dir, fd)):
                 raise RuntimeDirError(
                     f"{here} was made by uid {info.st_uid} in the shared "
                     f"directory {where}, so it is not used")

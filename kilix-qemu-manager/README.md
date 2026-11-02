@@ -147,6 +147,19 @@ swapped between the check and the use.
   group is refused ("… which is mode 0775 and writable by group staff,
   which is not your private group"), and so is write by others whatever
   the group.
+- ACLs. Under a POSIX ACL the group bits of the mode are the ACL mask, so a
+  0775 directory of your private group may still let another user or group
+  write. The private-group rule above therefore holds only for a directory
+  whose ACL names no user and no group: no ACL at all, or one of the owner,
+  the owning group, the mask and others only. The ACL is read from the
+  directory the walk holds, through `/proc/self/fd/N`. A named user or
+  group entry in its access or its default ACL ("… which is mode 0775 and
+  has an ACL (system.posix_acl_access) with an entry for user 1234"), an
+  ACL the manager cannot parse, another kind of ACL (`system.nfs4_acl`,
+  say), or any error reading it but "no ACL" and "not supported" refuses
+  the directory, as any group write did before. A directory without the
+  group write bit is not affected: a read-only ACL entry on a 0755
+  directory changes nothing.
 - A directory on the way needs search permission only, as it does for the
   kernel: one you may enter but not list (a root-owned 0711 directory, say)
   is walked. Any other error on the way (an I/O error, too many open files)
@@ -163,11 +176,15 @@ then does not fall back to the name: status reads nothing there ("…
 /proc/self/fd is not available, so it is not used"), and no command is sent.
 In full, on such a system:
 
+- a directory with the group write bit (0775) is refused even when its
+  group is your private group, because its ACL cannot be read through
+  `/proc/self/fd/N`, and an unread ACL is not taken for "no ACL";
 - the pidfile, the QMP socket and the launch marker are never read, so a VM
   is seen as live only through its disk lock or its Kilix tab, and every
   control is refused with the reason;
-- the checks before a launch need no `/proc` and still apply, so a launch
-  goes ahead: Kilix opens the tab and QEMU starts, and then the manager
+- the checks before a launch need no `/proc` and still apply (so a launch
+  whose pidfile is in a 0775 directory is refused, as above); otherwise a
+  launch goes ahead: Kilix opens the tab and QEMU starts, and then the manager
   reports that the QMP socket did not answer within the wait, although
   QEMU is running in that tab;
 - a launch in progress is not seen through its marker, because the marker
