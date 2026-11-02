@@ -382,7 +382,12 @@ class QemuManager:
         """Create the launch marker exclusively; False if another holds it."""
         marker = self._marker(vm)
         model.ensure_runtime_dir()
-        if os.path.exists(marker) and not self._launching(vm):
+        try:
+            stale = (not stat.S_ISLNK(os.lstat(marker).st_mode)
+                     and not self._launching(vm))
+        except OSError:
+            stale = False
+        if stale:
             try:
                 os.unlink(marker)       # a stale claim from a crashed launch
             except OSError:
@@ -428,7 +433,7 @@ class QemuManager:
         except model.RuntimeDirError as error:
             return OperationResult(
                 False, f"Not launching {vm.name}: {error}.", command)
-        for path in (vm.pidfile, vm.qmp):
+        for path in (vm.pidfile, vm.qmp, self._marker(vm)):
             if problem := model.reach_problem(path):
                 return OperationResult(
                     False, f"Not launching {vm.name}: {problem}.", command)

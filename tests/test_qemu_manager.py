@@ -2783,5 +2783,48 @@ class LoaderAliasR5Tests(Sandbox):
         self.assertEqual([vm.id for vm in machines], ["alpha"])
         self.assertIn("the manager's QMP socket for VM alpha", problems[0])
 
+
+class LaunchLinksR5Tests(RuntimeDirTests):
+    """NB-R4-2 and QM-R4's Y2: each runtime file a launch would use is
+    checked for a symlink on its own, and a symlink is never removed."""
+
+    def test_a_symlinked_launch_marker_is_kept_and_refuses_the_launch(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        keep = self.tmp / "users-file.txt"
+        keep.write_text("mine\n")
+        marker = self.fallback / "alpha.launch"
+        os.symlink(keep, marker)
+        result = self.manager(launch_wait_seconds=0.3).launch(vm)
+        self.assertFalse(result.ok, result.message)
+        self.assertIn("alpha.launch is a symlink", result.message)
+        self.assertEqual(self.rc.launched, [])
+        self.assertTrue(os.path.islink(marker))
+        self.assertEqual(keep.read_text(), "mine\n")
+
+    def test_a_launch_claim_never_removes_a_symlinked_marker(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        keep = self.tmp / "old-marker"
+        keep.write_text("1\n")
+        old = time.time() - 3600                    # stale, were it a file
+        os.utime(keep, (old, old))
+        marker = self.fallback / "alpha.launch"
+        os.symlink(keep, marker)
+        self.assertFalse(self.manager()._claim_launch(vm))
+        self.assertTrue(os.path.islink(marker))
+
+    def test_a_symlinked_pidfile_alone_refuses_the_launch(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        elsewhere = self.tmp / "elsewhere.pid"
+        os.symlink(elsewhere, vm.pidfile)               # dangling: QEMU
+        result = self.manager(launch_wait_seconds=0.3).launch(vm)  # would
+        self.assertFalse(result.ok, result.message)     # write through it
+        self.assertIn("alpha.pid is a symlink", result.message)
+        self.assertEqual(self.rc.launched, [])
+        self.assertTrue(os.path.islink(vm.pidfile))
+        self.assertFalse(elsewhere.exists())
+
 if __name__ == "__main__":
     unittest.main()
