@@ -2332,8 +2332,9 @@ class StateFileR4Tests(Sandbox):
         before = open_fds()
         with mock.patch.object(store, "LOCK_WAIT_SECONDS", 0.3):
             started = time.monotonic()
-            with self.assertRaisesRegex(OSError, "has held"):
+            with self.assertRaisesRegex(OSError, "has held") as caught:
                 store.set_favorite("alpha", True)
+            self.assertIn(f"{model.state_path()}.lock", str(caught.exception))
             self.assertLess(time.monotonic() - started, 3)
             self.assertFalse(store.save_state({"favorites": ["alpha"]}))
             store.remember_launch("alpha")              # degrades, no raise
