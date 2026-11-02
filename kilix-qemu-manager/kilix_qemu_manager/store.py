@@ -133,7 +133,7 @@ def control_conflicts(machines: list[VmDefinition]) -> list[str]:
                model.canonical(model.qmp_path(vm.id))}
         found: list[str] = []
         for path in sorted(paths):
-            if model.in_runtime_dir(path):
+            if model.runtime_dir_alias(path):
                 if path in own:
                     continue
                 stem, kind = os.path.splitext(os.path.basename(path))

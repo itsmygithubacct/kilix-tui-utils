@@ -2347,5 +2347,441 @@ class StateFileR4Tests(Sandbox):
         self.assertTrue(store.set_favorite("alpha", True))
 
 
+
+# ── fix round r5 ─────────────────────────────────────────────────────────────
+
+
+RUNNING_REPLY = {"query-status": {"return": {"status": "running",
+                                             "running": True}}}
+
+
+class ClassifyRaceR5Tests(RuntimeDirTests):
+    """R4-B1: whether a path is in the runtime directory is decided by its
+    name as written, never by resolving it, and the path is then reached
+    only through the directory descriptor that was checked. The fallback
+    runtime dir here is a symlink, flipped between two open directories of
+    "another user" (stood in for by mode 0755), each holding alpha.qmp -> a
+    live socket of the user's: the victim."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        victim_dir = self.tmp / "victim"
+        victim_dir.mkdir(mode=0o700)
+        self.victim = FakeQmpServer(str(victim_dir / "v.qmp"), RUNNING_REPLY)
+        self.addCleanup(self.victim.close)
+        self.a, self.b = self.shared / "attacker-a", self.shared / "attacker-b"
+        for directory in (self.a, self.b):
+            directory.mkdir()
+            directory.chmod(0o755)              # whatever the umask
+            os.symlink(self.victim.path, directory / "alpha.qmp")
+
+    def plant(self) -> None:
+        os.symlink(self.a, self.fallback)
+
+    def flip(self) -> None:
+        current = os.readlink(self.fallback)
+        swap = self.shared / "flip.tmp"
+        os.symlink(self.b if current == str(self.a) else self.a, swap)
+        os.replace(swap, self.fallback)
+
+    def flipping_realpath(self):
+        """realpath, with the attacker's rename right after each lookup
+        of the runtime directory's name."""
+        real, fallback = os.path.realpath, str(self.fallback)
+
+        def racing(path, *args, **kwargs):
+            result = real(path, *args, **kwargs)
+            if os.fspath(path) == fallback:
+                self.flip()
+            return result
+        return mock.patch.object(model.os.path, "realpath", racing)
+
+    def test_the_place_of_a_name_is_never_resolved(self):
+        vm = self.define("Alpha")
+        self.plant()
+        seen = []
+        real = os.path.realpath
+
+        def recording(path, *args, **kwargs):
+            seen.append(os.fspath(path))
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(model.os.path, "realpath", recording):
+            self.assertTrue(model.in_runtime_dir(vm.qmp))
+            for path in (vm.qmp, vm.pidfile, str(self.fallback / "x.launch")):
+                with self.assertRaises(model.RuntimeDirError):
+                    with model.reach(path):
+                        pass
+            self.manager().status(vm)
+            self.manager().control(vm, "pause")
+        self.assertEqual(seen, [])
+        self.assertEqual(self.victim.seen, [])
+
+    def test_a_flip_between_lookups_never_reaches_the_victim(self):
+        vm = self.define("Alpha")
+        self.plant()
+        with self.flipping_realpath():
+            status = self.manager().status(vm)
+            result = self.manager().control(vm, "poweroff")
+        self.assertEqual((status.state, status.qmp_ok), ("stopped", False))
+        self.assertIn("or is a symlink", status.detail)
+        self.assertFalse(result.ok, result.message)
+        self.assertIn("Not sent to Alpha", result.message)
+        self.assertEqual(self.victim.seen, [])
+
+    def test_power_off_in_the_picker_never_reaches_the_victim(self):
+        """End to end through the keys: the modal is shown for the real,
+        running Alpha; then the attacker takes the fallback's name and
+        races it while y is pressed."""
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        alpha = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(alpha.close)
+        state = tui.State(self.manager(), refresh_seconds=0)
+        state.select_id(vm.id)
+        tui.handle(ord("a"), state)
+        TuiTests.choose(self, state, "poweroff")
+        tui.handle(ENTER, state)
+        frame = app.render_to_text(tui.render, state, height=24, width=120)
+        self.assertIn("Confirm: Power off — Alpha", frame)
+        os.rename(self.fallback, self.shared / "alpha-moved")
+        self.plant()
+        with self.flipping_realpath():
+            tui.handle(ord("y"), state)
+            TuiTests.wait(state)
+        self.assertIn("Not sent to Alpha", state.message)
+        self.assertEqual(self.victim.seen, [])
+        self.assertNotIn("quit", alpha.seen)
+
+    ATTACKER = (
+        "import os, sys, time\n"
+        "mode, fallback, a, real, seconds = sys.argv[1:6]\n"
+        "end = time.monotonic() + float(seconds)\n"
+        "swap = fallback + '.flip'\n"
+        "while time.monotonic() < end:\n"
+        "    try:\n"
+        "        if mode == 'links':\n"
+        "            os.symlink(a, swap); os.replace(swap, fallback)\n"
+        "            os.unlink(fallback)\n"
+        "        else:                    # a real open dir, then a link\n"
+        "            os.rename(real, fallback); os.rename(fallback, real)\n"
+        "            os.symlink(a, fallback); os.unlink(fallback)\n"
+        "    except OSError:\n"
+        "        pass\n")
+
+    def test_a_racing_process_never_reaches_the_victim(self):
+        vm = self.define("Alpha")
+        real = self.shared / "attacker-real"
+        real.mkdir()
+        real.chmod(0o755)
+        os.symlink(self.victim.path, real / "alpha.qmp")
+        manager = self.manager(qmp_timeout=0.3)
+        for mode in ("links", "dir"):
+            with self.subTest(mode=mode):
+                attacker = subprocess.Popen(
+                    [sys.executable, "-c", self.ATTACKER, mode,
+                     str(self.fallback), str(self.a), str(real), "1.5"])
+                self.started.append(attacker)
+                rounds = 0
+                deadline = time.monotonic() + 1.2
+                while time.monotonic() < deadline:
+                    rounds += 1
+                    manager.status(vm)
+                    manager.control(vm, "pause")
+                attacker.wait(10)
+                self.assertGreater(rounds, 10)
+                self.assertEqual(self.victim.seen, [], f"{rounds} rounds")
+
+
+class RuntimeDirFdR5Tests(RuntimeDirTests):
+    """The runtime directory is checked through the descriptor that is
+    then used (QM-R4's Y1): never through a second lookup of its name."""
+
+    def test_a_dir_swapped_between_the_open_and_the_check_is_judged_as_opened(
+            self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir()
+        self.fallback.chmod(0o755)                      # open: unsafe
+        planted = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(planted.close)
+        real_open = os.open
+        name = self.fallback.name
+
+        def swapping_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == name and kwargs.get("dir_fd") is not None:
+                # Right after the open: a safe 0700 dir takes the name.
+                os.rename(self.fallback, self.shared / "opened")
+                self.fallback.mkdir(mode=0o700)
+            return fd
+
+        with mock.patch.object(model.os, "open", swapping_open):
+            result = self.manager().control(vm, "poweroff")
+        self.assertFalse(result.ok, result.message)
+        self.assertIn("it must be 0700", result.message)
+        self.assertEqual(planted.seen, [])
+
+
+class OutsideDirR5Tests(RuntimeDirTests):
+    """A path outside the runtime directory is reached through a checked
+    walk too (NB-R4-1, NB-R4-3), and only through its descriptor."""
+
+    def test_a_path_under_an_old_fallback_another_user_made_is_not_used(self):
+        vm = self.define("Alpha")                       # in the fallback
+        self.fallback.mkdir()
+        self.fallback.chmod(0o755)
+        victim_dir = self.tmp / "victim"
+        victim_dir.mkdir(mode=0o700)
+        victim = FakeQmpServer(str(victim_dir / "v.qmp"), RUNNING_REPLY)
+        self.addCleanup(victim.close)
+        os.symlink(victim.path, vm.qmp)
+        now = self.tmp / "run-now"
+        now.mkdir(mode=0o700)
+        os.environ["XDG_RUNTIME_DIR"] = str(now)        # a session that has one
+        self.assertFalse(model.in_runtime_dir(vm.qmp))
+        with pretend_foreign(self.fallback):
+            status = self.manager().status(vm)
+            result = self.manager().control(vm, "poweroff")
+        self.assertEqual((status.state, status.qmp_ok), ("stopped", False))
+        self.assertIn("which belongs to uid", status.detail)
+        self.assertFalse(result.ok)
+        self.assertEqual(victim.seen, [])
+        # Ours again, it is followed as the user's own symlink.
+        self.assertEqual(self.manager().status(vm).state, "running")
+
+    def test_a_writable_directory_on_the_way_is_not_used(self):
+        for mode, used in ((0o777, False), (0o775, False), (0o1777, True),
+                           (0o755, True)):
+            with self.subTest(mode=oct(mode)):
+                open_dir = Path(tempfile.mkdtemp(dir=self.tmp))
+                open_dir.chmod(mode)
+                mine = open_dir / "mine"
+                mine.mkdir(mode=0o700)
+                server = FakeQmpServer(str(mine / "x.qmp"), RUNNING_REPLY)
+                self.addCleanup(server.close)
+                problem = model.reach_problem(server.path)
+                if used:
+                    self.assertEqual(problem, "")
+                    with model.reach(server.path) as where:
+                        self.assertEqual(qmp.status(where, timeout=0.5),
+                                         "running")
+                else:
+                    self.assertIn(f"which is mode {mode:04o}", problem)
+                    with self.assertRaises(model.RuntimeDirError):
+                        with model.reach(server.path):
+                            pass
+                    self.assertEqual(server.seen, [])
+
+    def test_a_name_another_user_made_in_a_sticky_dir_is_not_used(self):
+        sticky = self.tmp / "sticky"
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        theirs = sticky / "theirs"
+        theirs.mkdir(mode=0o700)
+        server = FakeQmpServer(str(theirs / "x.qmp"), RUNNING_REPLY)
+        self.addCleanup(server.close)
+        real_stat = os.stat
+
+        def foreign_entry(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if os.fspath(path) == "theirs" and kwargs.get("dir_fd") is not None:
+                fields = list(info)
+                fields[4] = info.st_uid + 1
+                return os.stat_result(fields)
+            return info
+
+        with mock.patch.object(model.os, "stat", foreign_entry):
+            self.assertIn("was made by uid", model.reach_problem(server.path))
+        self.assertEqual(model.reach_problem(server.path), "")
+
+    def test_an_outside_path_is_used_through_its_checked_directory(self):
+        mine_dir = self.tmp / "mine"
+        mine_dir.mkdir(mode=0o700)
+        path = str(mine_dir / "x.qmp")
+        mine = FakeQmpServer(path, RUNNING_REPLY)
+        self.addCleanup(mine.close)
+        with model.reach(path) as where:
+            os.rename(mine_dir, self.tmp / "moved")
+            mine_dir.mkdir(mode=0o700)
+            planted = FakeQmpServer(path, {"query-status": {
+                "return": {"status": "paused", "running": False}}})
+            self.addCleanup(planted.close)
+            self.assertEqual(qmp.status(where, timeout=0.5), "running")
+        self.assertEqual(planted.seen, [])
+
+    def test_a_path_below_a_subdir_of_the_runtime_dir_is_not_used(self):
+        """NB-R4-3: <run>/sub/alpha.qmp, hand-made, in a safe runtime dir
+        and in an open one; sub is a real dir or a symlink out."""
+        vm = self.define("Alpha")
+        victim_dir = self.tmp / "victim"
+        victim_dir.mkdir(mode=0o700)
+        victim = FakeQmpServer(str(victim_dir / "alpha.qmp"), RUNNING_REPLY)
+        self.addCleanup(victim.close)
+        self.fallback.mkdir(mode=0o700)
+        real_sub = self.fallback / "real"
+        real_sub.mkdir(mode=0o700)
+        inner = FakeQmpServer(str(real_sub / "alpha.qmp"), RUNNING_REPLY)
+        self.addCleanup(inner.close)
+        os.symlink(victim_dir, self.fallback / "sub")
+        for sub in ("sub", "real"):
+            for mode in (0o700, 0o755):
+                with self.subTest(sub=sub, mode=oct(mode)):
+                    self.fallback.chmod(mode)
+                    data = vm.as_json()
+                    hand = str(self.fallback / sub / "alpha.qmp")
+                    data["argv"] = [model.qmp_spec(hand)
+                                    if word == model.qmp_spec(vm.qmp)
+                                    else word for word in data["argv"]]
+                    data["qmp"] = hand
+                    hand_vm = model.VmDefinition.from_json(data)
+                    status = self.manager().status(hand_vm)
+                    result = self.manager().control(hand_vm, "poweroff")
+                    self.assertEqual(status.state, "stopped")
+                    self.assertIn("below the runtime directory", status.detail)
+                    self.assertFalse(result.ok)
+        self.assertEqual((victim.seen, inner.seen), ([], []))
+
+    def test_a_users_own_symlink_outside_is_still_followed(self):
+        mine = self.tmp / "mine"
+        mine.mkdir(mode=0o700)
+        server = FakeQmpServer(str(mine / "real.qmp"), RUNNING_REPLY)
+        self.addCleanup(server.close)
+        link = self.tmp / "link.qmp"
+        os.symlink("mine/real.qmp", link)               # relative, in ours
+        with model.reach(str(link)) as where:
+            self.assertEqual(qmp.status(where, timeout=0.5), "running")
+        chain = self.tmp / "chain.qmp"
+        os.symlink(link, chain)
+        with model.reach(str(chain)) as where:
+            self.assertEqual(qmp.status(where, timeout=0.5), "running")
+
+    def test_without_proc_nothing_is_reached_by_name(self):
+        """NB-R4-6: with no /proc/self/fd, refuse; never fall back."""
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        server = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(server.close)
+        real_isdir = os.path.isdir
+
+        def no_proc(path):
+            return (False if os.fspath(path).startswith("/proc/self/fd")
+                    else real_isdir(path))
+
+        with mock.patch.object(model.os.path, "isdir", no_proc):
+            status = self.manager().status(vm)
+            result = self.manager().control(vm, "poweroff")
+            self.assertEqual(model.reach_problem(vm.qmp), "")
+        self.assertEqual(status.state, "stopped")
+        self.assertIn("/proc/self/fd is not available", status.detail)
+        self.assertFalse(result.ok)
+        self.assertEqual(server.seen, [])
+
+
+class WalkR5Tests(RuntimeDirTests):
+    """The walk itself: links, loops, other spellings and what is above."""
+
+    def test_a_symlink_loop_is_refused_not_followed_forever(self):
+        loop = self.tmp / "loop"
+        os.symlink("loop2", loop)
+        os.symlink("loop", self.tmp / "loop2")
+        self.assertIn("too many symlinks",
+                      model.reach_problem(str(loop / "x.qmp")))
+        self.assertIn("too many symlinks", model.reach_problem(str(loop)))
+
+    def test_a_name_swapped_for_a_link_after_its_check_is_not_followed(self):
+        """Between the lstat that saw a directory and the open, the
+        runtime dir's name becomes a symlink to a safe 0700 dir of ours
+        with a live socket: the open must not follow it."""
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        linked = self.tmp / "linked"
+        linked.mkdir(mode=0o700)
+        server = FakeQmpServer(str(linked / "alpha.qmp"), RUNNING_REPLY)
+        self.addCleanup(server.close)
+        real_stat, name = os.stat, self.fallback.name
+
+        def swapping_stat(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if os.fspath(path) == name and kwargs.get("dir_fd") is not None \
+                    and self.fallback.is_dir() and not self.fallback.is_symlink():
+                self.fallback.rmdir()
+                self.fallback.symlink_to(linked, target_is_directory=True)
+            return info
+
+        with mock.patch.object(model.os, "stat", swapping_stat):
+            result = self.manager().control(vm, "poweroff")
+        self.assertFalse(result.ok, result.message)
+        self.assertIn("or is a symlink", result.message)
+        self.assertEqual(server.seen, [])
+
+    def alias(self) -> Path:
+        """The runtime dir, spelled through a symlink to its parent."""
+        alias = self.tmp / "alias"
+        if not alias.is_symlink():
+            alias.symlink_to(self.shared, target_is_directory=True)
+        return alias / self.fallback.name
+
+    def test_another_spelling_of_the_runtime_dir_gets_its_rules(self):
+        vm = self.define("Alpha")
+        self.fallback.mkdir(mode=0o700)
+        server = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(server.close)
+        spelled = str(self.alias() / "alpha.qmp")
+        self.assertFalse(model.in_runtime_dir(spelled))
+        with model.reach(spelled) as where:
+            self.assertEqual(qmp.status(where, timeout=0.5), "running")
+        self.fallback.chmod(0o755)
+        self.assertIn("it must be 0700", model.reach_problem(spelled))
+        self.fallback.chmod(0o700)
+        victim_dir = self.tmp / "victim"
+        victim_dir.mkdir(mode=0o700)
+        victim = FakeQmpServer(str(victim_dir / "v.qmp"), RUNNING_REPLY)
+        self.addCleanup(victim.close)
+        os.symlink(victim.path, self.fallback / "linked.qmp")
+        problem = model.reach_problem(str(self.alias() / "linked.qmp"))
+        self.assertIn("is a symlink in the runtime directory", problem)
+        self.assertEqual(victim.seen, [])
+
+    def test_an_open_directory_above_the_runtime_dir_refuses_it(self):
+        above = self.tmp / "above"
+        above.mkdir()
+        above.chmod(0o777)
+        run = above / "run"
+        run.mkdir(mode=0o700)
+        os.environ["XDG_RUNTIME_DIR"] = str(run)
+        vm = self.define("Alpha")
+        os.mkdir(model.runtime_dir(), 0o700)
+        server = FakeQmpServer(vm.qmp, RUNNING_REPLY)
+        self.addCleanup(server.close)
+        status = self.manager().status(vm)
+        self.assertEqual(status.state, "stopped")
+        self.assertIn("which is mode 0777", status.detail)
+        self.assertFalse(self.manager().control(vm, "poweroff").ok)
+        self.assertEqual(server.seen, [])
+        above.chmod(0o755)
+        self.assertEqual(self.manager().status(vm).state, "running")
+
+
+class LoaderAliasR5Tests(Sandbox):
+    """The loader still compares the runtime dir canonically, so a hand
+    clone that opens Alpha's socket by its real path is refused even when
+    XDG_RUNTIME_DIR itself is spelled through a symlink."""
+
+    def test_a_symlinked_xdg_runtime_dir_is_still_the_runtime_dir(self):
+        real = os.environ["XDG_RUNTIME_DIR"]
+        alias = self.tmp / "run-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        os.environ["XDG_RUNTIME_DIR"] = str(alias)
+        alpha = self.define("Alpha")
+        self.assertTrue(alpha.qmp.startswith(str(alias)))
+        path = hand_clone(alpha, "bravo", "Bravo", share=())
+        data = json.loads(path.read_text())
+        real_qmp = os.path.join(real, "kilix-qemu", "alpha.qmp")
+        data["argv"] += ["-monitor", f"unix:{real_qmp},server=on,wait=off"]
+        path.write_text(json.dumps(data))
+        machines, problems = store.load_all()
+        self.assertEqual([vm.id for vm in machines], ["alpha"])
+        self.assertIn("the manager's QMP socket for VM alpha", problems[0])
+
 if __name__ == "__main__":
     unittest.main()

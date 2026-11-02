@@ -102,18 +102,47 @@ same rule without creating anything: in a runtime directory that exists but
 is not safely yours, no pidfile, QMP socket or launch marker is read, the VM
 shows as stopped with the reason, and no QMP command is sent through it.
 
-Whether a path is in the runtime directory is decided by the directory that
-holds the name as written, never by where a symlink in its last component
-points, because the owner of that directory is who could have put it there.
-For every read and control the directory is opened without following
-symlinks, checked through that open descriptor (yours, mode 0700), and the
-file is reached through it (`/proc/self/fd/N/<name>`), so the directory
-cannot be swapped between the check and the use. The manager creates only
-sockets, pidfiles and launch markers there, never symlinks, so a symlink it
-finds there is not followed even in a safe directory: the VM reads as stopped
-with "… is a symlink", no command is sent through it, and a launch is refused
-until you remove it. A path outside the runtime directory that is a symlink
-into it is refused the same way.
+Whether a path is in the runtime directory is decided by its name as
+written: its directory part, normalised (`.`, `..` and doubled slashes, with
+no symlink lookup), is the runtime directory's name. Nothing is resolved to
+decide it, so a shared `/tmp` gives nobody a moment to swap the answer. A
+symlink in the runtime directory is therefore "in" it wherever it points,
+because the owner of that directory is who could have put it there.
+
+No pidfile, QMP socket or launch marker is ever reached by handing its name
+to the kernel. For every read and control the manager walks the path from
+`/`, one directory at a time, through open descriptors, checks each
+directory through its descriptor, and reaches the file through the last one
+(`/proc/self/fd/N/<name>`). No directory is looked up twice, so none can be
+swapped between the check and the use.
+
+- In the runtime directory, the directory must be a real directory (opened
+  without following a symlink), yours, mode 0700, and the file must not be a
+  symlink. The manager creates only sockets, pidfiles and launch markers
+  there, never symlinks or subdirectories, so a symlink it finds there is
+  not followed even in a safe directory: the VM reads as stopped with
+  "… is a symlink", no command is sent through it, and a launch is refused
+  (and the link left in place) until you remove it. A path below a
+  subdirectory of the runtime directory is refused the same way, and so is
+  a path elsewhere that is a symlink into it. Another spelling of the
+  runtime directory (through `/var/run`, say) is recognised by the
+  directory the walk ends in and gets the same rules.
+- Anywhere else (a build's `qemu.pid`, or a path recorded under an earlier
+  runtime directory), every directory on the way must be yours or root's
+  and not writable by group or others unless it has the sticky bit (as
+  `/tmp` does). In a sticky shared directory each name on the way must be
+  yours or root's too. A symlink is followed only where those rules held.
+  So a `<tmp>/kilix-qemu-<uid>` that another user re-created after a reboot,
+  or any directory of theirs, is never read or sent through: the VM reads
+  as stopped with the reason. A group-writable directory of your own on the
+  way is refused as well, because the manager cannot tell who the group is.
+
+Without `/proc/self/fd` (a Linux system without `/proc` mounted, where the
+manager's liveness check, which reads `/proc/<pid>/cmdline`, cannot work
+either) a file cannot be reached through its checked directory. The manager
+then does not fall back to the name: status reads nothing there ("…
+/proc/self/fd is not available, so it is not used"), and no command is sent.
+The checks before a launch need no `/proc` and still apply.
 
 ## Keys
 

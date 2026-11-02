@@ -157,15 +157,280 @@ def canonical(path: str) -> str:
 def in_runtime_dir(path: str) -> bool:
     """True when `path`, as written, names a file directly in the runtime dir.
 
-    The directory that contains the path is resolved; the final component
-    is not. A symlink in the runtime directory is therefore still "in" it,
-    wherever it points: what decides is where the name lives, because that
-    is who could have put it there.
+    Decided by the name alone: the directory part of `path`, normalised
+    (``.``, ``..`` and doubled slashes, no symlink lookup), is the runtime
+    directory's name, normalised the same way. Nothing is resolved, so there
+    is nothing for whoever can rename things in ``<tmp>`` to race. A symlink
+    in the runtime directory is therefore still "in" it, wherever it points.
+
+    A spelling of the runtime directory through a symlink (``/var/run`` for
+    ``/run``) is not "in" it by name; :func:`reach` still recognises it by
+    the directory it opens. The loader, which only decides who may be listed,
+    also compares canonically (:func:`runtime_dir_alias`).
     """
     head, tail = os.path.split(path)
     if tail in ("", ".", ".."):         # names a directory, not a file in one
-        return os.path.dirname(canonical(path)) == canonical(runtime_dir())
+        return False
+    return os.path.normpath(head or ".") == os.path.normpath(runtime_dir())
+
+
+def runtime_dir_alias(path: str) -> bool:
+    """`path` is in the runtime directory by name, or canonically.
+
+    For the loader and import, which compare canonical paths and only ever
+    refuse more when this says yes. Status and controls never use it.
+    """
+    if in_runtime_dir(path):
+        return True
+    head, tail = os.path.split(path)
+    if tail in ("", ".", ".."):
+        return False
     return canonical(head or ".") == canonical(runtime_dir())
+
+
+# How many symlinks one walk follows, as the kernel's own limit.
+MAX_SYMLINKS = 40
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _shared(info: os.stat_result) -> bool:
+    """Group or others may create names here (with the sticky bit)."""
+    return bool(info.st_mode & 0o022)
+
+
+def _walk_problem(where: str, info: os.stat_result) -> str:
+    """Why a directory the walk looks names up in may not be trusted."""
+    if info.st_uid not in (0, os.getuid()):
+        return f"{where}, which belongs to uid {info.st_uid}"
+    if _shared(info) and not info.st_mode & stat.S_ISVTX:
+        return f"{where}, which is mode {stat.S_IMODE(info.st_mode):04o}"
+    return ""
+
+
+@dataclass
+class _Found:
+    """Where a walk ended: the directory that holds the final name."""
+    fd: int
+    name: str
+    info: os.stat_result | None         # lstat of the name; None if missing
+    via_link: bool                      # the final name came from a symlink
+
+
+def _walk(path: str, *, follow_last: bool, avoid: tuple | None = None,
+          ) -> _Found | None:
+    """Walk absolute `path` from ``/``, one component at a time, through
+    directory descriptors; None when a directory on the way is missing.
+
+    Every directory a name is looked up in is checked through its own
+    descriptor: it must be this user's or root's, and not writable by group
+    or others unless it is sticky (``/tmp``). In a sticky shared directory
+    the next name must be this user's or root's too, because anyone could
+    have made it. Directories are opened ``O_NOFOLLOW``, so a name checked as
+    a directory cannot become a symlink before it is opened; a symlink is
+    followed only where it was found under those rules, by reading it
+    through the descriptor and walking its target the same way. `avoid` is
+    the runtime directory's (st_dev, st_ino): a walk that would look up a
+    name below a directory inside it is refused, because the manager keeps
+    nothing in subdirectories there.
+
+    Raises :class:`RuntimeDirError` with the reason when the walk may not
+    go on. The caller closes the returned descriptor.
+    """
+    if not os.path.isabs(path):
+        raise RuntimeDirError(f"{path} is not an absolute path")
+    pending = [part for part in reversed(path.split("/")) if part]
+    fd = os.open("/", _DIR_FLAGS)
+    where, links, via_link = "/", 0, False
+    try:
+        if not pending:
+            raise RuntimeDirError(f"{path} names a directory, not a file")
+        while True:
+            part = pending.pop()
+            if part == ".":
+                if not pending:
+                    raise RuntimeDirError(f"{path} names a directory, "
+                                          "not a file")
+                continue
+            info_dir = os.fstat(fd)
+            if problem := _walk_problem(where, info_dir):
+                raise RuntimeDirError(
+                    f"{path} is reached through {problem}; another user "
+                    "can change that, so it is not used")
+            if part == "..":
+                if not pending:
+                    raise RuntimeDirError(f"{path} names a directory, "
+                                          "not a file")
+                parent = os.open("..", _DIR_FLAGS, dir_fd=fd)
+                os.close(fd)
+                fd, where = parent, os.path.dirname(where.rstrip("/")) or "/"
+                continue
+            try:
+                info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            except OSError as error:
+                raise RuntimeDirError(f"cannot read {path}: "
+                                      f"{error.strerror or error}") from error
+            here = os.path.join(where, part)
+            if (info is not None and _shared(info_dir)
+                    and info.st_uid not in (0, os.getuid())):
+                raise RuntimeDirError(
+                    f"{here} was made by uid {info.st_uid} in the shared "
+                    f"directory {where}, so it is not used")
+            last = not pending
+            if avoid is not None and _identity(info_dir) == avoid:
+                if not last:
+                    raise RuntimeDirError(
+                        f"{path} is below the runtime directory "
+                        f"{runtime_dir()}; the manager keeps nothing in "
+                        "subdirectories there")
+                if info is not None and stat.S_ISLNK(info.st_mode):
+                    raise RuntimeDirError(
+                        f"{path} is a symlink in the runtime directory "
+                        f"{runtime_dir()}; the manager makes none there, so "
+                        "it does not follow one")
+            if info is None:
+                if last:
+                    return _Found(fd, part, None, via_link)
+                os.close(fd)
+                fd = -1
+                return None
+            if stat.S_ISLNK(info.st_mode) and (follow_last or not last):
+                links += 1
+                if links > MAX_SYMLINKS:
+                    raise RuntimeDirError(f"{path}: too many symlinks")
+                target = os.readlink(part, dir_fd=fd)
+                if not target:
+                    raise RuntimeDirError(f"{here} is an empty symlink")
+                if last:
+                    via_link = True
+                pending.extend(p for p in reversed(target.split("/")) if p)
+                if target.startswith("/"):
+                    root = os.open("/", _DIR_FLAGS)
+                    os.close(fd)
+                    fd, where = root, "/"
+                if not pending:
+                    raise RuntimeDirError(f"{path} names a directory, "
+                                          "not a file")
+                continue
+            if last:
+                return _Found(fd, part, info, via_link)
+            if not stat.S_ISDIR(info.st_mode):
+                raise RuntimeDirError(f"{here} is not a directory")
+            try:
+                child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                os.close(fd)
+                fd = -1
+                return None
+            except OSError as error:
+                raise RuntimeDirError(f"cannot open {here}: "
+                                      f"{error.strerror or error}") from error
+            os.close(fd)
+            fd, where = child, here
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        raise
+
+
+def _open_runtime_dir() -> int:
+    """The runtime directory, opened through :func:`_walk` and never through
+    a symlink in its own name; -1 when it (or a directory above it) is
+    missing. Not yet checked: :func:`_dir_info_problem` does that."""
+    directory = runtime_dir()
+    found = _walk(directory, follow_last=False)
+    if found is None:
+        return -1
+    try:
+        if found.info is None:
+            return -1
+        if stat.S_ISLNK(found.info.st_mode) or not stat.S_ISDIR(
+                found.info.st_mode):
+            raise RuntimeDirError(f"runtime directory {directory} is not a "
+                                  "directory (or is a symlink)")
+        try:
+            return os.open(found.name, _DIR_FLAGS, dir_fd=found.fd)
+        except FileNotFoundError:
+            return -1
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise RuntimeDirError(f"runtime directory {directory} is not "
+                                      "a directory (or is a symlink)") from error
+            raise RuntimeDirError(f"cannot use runtime directory {directory}: "
+                                  f"{error.strerror or error}") from error
+    finally:
+        os.close(found.fd)
+
+
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+@contextlib.contextmanager
+def _checked(path: str) -> Iterator[_Found | None]:
+    """The directory descriptor and name `path` may be used through; None
+    when there is nothing there. Raises :class:`RuntimeDirError` with the
+    reason when it must not be used. See :func:`reach`."""
+    directory = runtime_dir()
+    runtime_fd = -1
+    found: _Found | None = None
+    try:
+        try:
+            runtime_fd = _open_runtime_dir()
+        except RuntimeDirError:
+            if in_runtime_dir(path):
+                raise
+            runtime_fd = -1             # not ours to judge from here
+        if in_runtime_dir(path):
+            # Decided by the name as written: the runtime directory itself,
+            # opened once, checked and used through that descriptor.
+            if runtime_fd < 0:
+                yield None
+                return
+            if problem := _dir_info_problem(directory, os.fstat(runtime_fd)):
+                raise RuntimeDirError(problem)
+            name = os.path.basename(path)
+            try:
+                info = os.stat(name, dir_fd=runtime_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            except OSError as error:
+                raise RuntimeDirError(f"cannot read {path}: "
+                                      f"{error.strerror or error}") from error
+            found = _Found(runtime_fd, name, info, False)
+            runtime_fd = -1             # closed through `found` now
+        else:
+            avoid = (_identity(os.fstat(runtime_fd)) if runtime_fd >= 0
+                     else None)
+            found = _walk(path, follow_last=True, avoid=avoid)
+            if found is None:
+                yield None
+                return
+            if avoid is not None and _identity(os.fstat(found.fd)) == avoid:
+                # Another spelling of the runtime directory: its rules.
+                if found.via_link:
+                    raise RuntimeDirError(
+                        f"{path} is a symlink into the runtime directory "
+                        f"{directory}; the manager does not follow it")
+                if problem := _dir_info_problem(directory,
+                                                os.fstat(found.fd)):
+                    raise RuntimeDirError(problem)
+        if found.info is not None and stat.S_ISLNK(found.info.st_mode):
+            raise RuntimeDirError(
+                f"{path} is a symlink; the manager makes none in its runtime "
+                "directory, so it does not follow one")
+        yield found if found.info is not None else None
+    finally:
+        if found is not None:
+            os.close(found.fd)
+        if runtime_fd >= 0:
+            os.close(runtime_fd)
+
+
+def proc_fd_dir(fd: int) -> str:
+    """``/proc/self/fd/N``: a path that reaches what `fd` holds."""
+    return f"/proc/self/fd/{fd}"
 
 
 @contextlib.contextmanager
@@ -174,72 +439,50 @@ def reach(path: str) -> Iterator[str | None]:
 
     Yields the path to use, or None when there is nothing there to read.
     Raises :class:`RuntimeDirError` with the reason when it must not be
-    used at all.
+    used at all. The yielded path is good only inside the ``with`` block.
 
-    A path outside the runtime directory is the user's (or a build's) and is
-    yielded as written. A path in it (judged by :func:`in_runtime_dir`, so
-    by the directory that contains the name) is used only when:
+    Every path is reached the same way: never by handing the name to the
+    kernel, but through a descriptor of the directory that holds it,
+    opened by a walk from ``/`` that checks each directory on the way
+    (:func:`_walk`), and then as ``/proc/self/fd/N/<name>``. So no directory
+    is looked up twice, and none can be swapped between the check and the
+    use.
 
-    * the directory, opened ``O_DIRECTORY|O_NOFOLLOW`` and checked by
-      ``fstat``, is a real directory of this user's, mode 0700 — the rule
-      :func:`ensure_runtime_dir` applies to writes. The file is then reached
-      through that open directory (``/proc/self/fd/N/<name>``), so the
-      directory cannot be swapped between the check and the use;
-    * the name is not a symlink. The manager makes none there (only
-      sockets, pidfiles and launch markers), so one it finds is not its own
-      and is never followed, even in a safe directory.
+    * In the runtime directory (decided by the name as written, by
+      :func:`in_runtime_dir`; or, for another spelling, by the directory the
+      walk ends in), the directory must be a real directory of this user's,
+      mode 0700 (the rule :func:`ensure_runtime_dir` applies to writes),
+      and the name must not be a symlink: the manager makes none there, so
+      one it finds is not its own and is never followed. A path elsewhere
+      that is a symlink into the runtime directory is refused the same way,
+      and so is a path below a subdirectory of it.
+    * Anywhere else, every directory on the way must be this user's or
+      root's and not writable by another user unless sticky, and in a sticky
+      shared directory (``/tmp``) each name must be this user's or root's.
+      So an earlier runtime directory that another user re-created, or a
+      directory of theirs, is refused. A symlink is followed only where the
+      same rules held.
 
-    A path outside the runtime directory whose final component is a symlink
-    into it is refused for the same reason.
+    Without ``/proc/self/fd`` the directory cannot be reached through its
+    descriptor, and the path is refused rather than reached by name.
     """
-    if not in_runtime_dir(path):
-        if in_runtime_dir(canonical(path)):
+    with _checked(path) as found:
+        if found is None:
+            yield None
+            return
+        through = proc_fd_dir(found.fd)
+        if not os.path.isdir(through):
             raise RuntimeDirError(
-                f"{path} is a symlink into the runtime directory "
-                f"{runtime_dir()}; the manager does not follow it")
-        yield path
-        return
-    directory = runtime_dir()
-    try:
-        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                     | os.O_CLOEXEC)
-    except FileNotFoundError:
-        fd = -1                         # no directory: nothing to read
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise RuntimeDirError(f"runtime directory {directory} is not a "
-                                  "directory (or is a symlink)") from error
-        raise RuntimeDirError(f"cannot use runtime directory {directory}: "
-                              f"{error.strerror or error}") from error
-    if fd < 0:
-        yield None
-        return
-    try:
-        if problem := _dir_info_problem(directory, os.fstat(fd)):
-            raise RuntimeDirError(problem)
-        name = os.path.basename(path)
-        try:
-            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        except FileNotFoundError:
-            info = None
-        except OSError as error:
-            raise RuntimeDirError(f"cannot read {path}: "
-                                  f"{error.strerror or error}") from error
-        if info is not None and stat.S_ISLNK(info.st_mode):
-            raise RuntimeDirError(
-                f"{path} is a symlink; the manager makes none in its runtime "
-                "directory, so it does not follow one")
-        through = f"/proc/self/fd/{fd}"
-        yield (None if info is None
-               else f"{through}/{name}" if os.path.isdir(through) else path)
-    finally:
-        os.close(fd)
+                f"cannot reach {path} through its checked directory: "
+                "/proc/self/fd is not available, so it is not used")
+        yield f"{through}/{found.name}"
 
 
 def reach_problem(path: str) -> str:
-    """Why `path` may not be read or connected to; '' when it may."""
+    """Why `path` may not be read, connected to or launched with; '' when
+    it may. Only checks, so it needs no ``/proc``."""
     try:
-        with reach(path):
+        with _checked(path):
             return ""
     except RuntimeDirError as error:
         return str(error)
