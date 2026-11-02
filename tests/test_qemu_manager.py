@@ -3679,6 +3679,87 @@ class FakeLibc:
             gr_mem=[member.encode() for member in entry[2]] + [None]))
 
 
+class SupplementaryMembershipR8Tests(RuntimeDirTests):
+    """An account's initgroups answer can grant a gid absent from getgrent."""
+
+    def problem(self):
+        vmdir = Path(tempfile.mkdtemp(dir=self.tmp))
+        vmdir.chmod(0o775)
+        return model.reach_problem(str(vmdir / "x.qmp"))
+
+    def test_supplementary_member_missing_from_the_group_listing_refuses(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        gid = os.getgid()
+        peer_gid = gid + 51000
+        with group_db(), mock.patch.object(model, "_accounts", return_value=[
+                Account(me, gid), Account("qemu-mgr-peer", peer_gid)]), \
+                mock.patch.object(os, "getgrouplist", return_value=[
+                    peer_gid, gid]) as memberships:
+            problem = self.problem()
+        self.assertIn("which is not your private group", problem)
+        self.assertIn("supplementary group", problem)
+        memberships.assert_called_with("qemu-mgr-peer", peer_gid)
+
+    def test_a_private_group_with_no_other_members_is_still_used(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        gid = os.getgid()
+        peer_gid = gid + 51000
+        with group_db(sources="files systemd"), \
+                mock.patch.object(model, "_accounts", return_value=[
+                    Account(me, gid), Account("qemu-mgr-peer", peer_gid)]), \
+                mock.patch.object(os, "getgrouplist", return_value=[
+                    peer_gid]) as memberships:
+            self.assertEqual(self.problem(), "")
+        memberships.assert_called_with("qemu-mgr-peer", peer_gid)
+
+    def test_membership_lookup_failure_refuses(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        gid = os.getgid()
+        for error in [OSError(errno.EIO, "membership lookup failed"),
+                      KeyError("missing account")]:
+            with self.subTest(error=type(error).__name__), group_db(), \
+                    mock.patch.object(model, "_accounts", return_value=[
+                        Account(me, gid), Account("qemu-mgr-peer", gid + 1)]), \
+                    mock.patch.object(os, "getgrouplist", side_effect=error):
+                self.assertIn("which is not your private group", self.problem())
+
+    def test_each_other_accounts_supplementary_groups_are_checked(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        gid = os.getgid()
+
+        def memberships(user, primary):
+            return [primary, gid] if user == "qemu-mgr-peer2" else [primary]
+
+        with group_db(), mock.patch.object(model, "_accounts", return_value=[
+                Account(me, gid), Account("qemu-mgr-peer1", gid + 1),
+                Account("qemu-mgr-peer2", gid + 2)]), \
+                mock.patch.object(os, "getgrouplist", side_effect=memberships):
+            self.assertIn("supplementary group", self.problem())
+
+    def test_an_explicit_non_listing_initgroups_source_refuses(self):
+        for source in ["sss", "ldap", "qemu-mgr-directory"]:
+            with self.subTest(source=source), group_db():
+                with open(model.NSSWITCH, "a") as handle:
+                    handle.write(f"initgroups: files {source}\n")
+                problem = self.problem()
+                self.assertIn("which is not your private group", problem)
+                self.assertIn("initgroups", problem)
+
+    def test_supported_or_implicit_initgroups_sources_keep_private_groups(self):
+        for line in ["", "initgroups: files\n",
+                     "initgroups: files systemd\n"]:
+            with self.subTest(line=line), group_db():
+                with open(model.NSSWITCH, "a") as handle:
+                    handle.write(line)
+                self.assertEqual(self.problem(), "")
+
+    def test_an_explicit_empty_initgroups_database_refuses(self):
+        with group_db():
+            with open(model.NSSWITCH, "a") as handle:
+                handle.write("initgroups:\n")
+            self.assertIn("names no source for initgroups", self.problem())
+
+
 class AccountListR7Tests(RuntimeDirTests):
     """NB-R6-1 and NB-R6-2: the private-group test fails closed when the
     account list cannot be complete, and sees every group line with the

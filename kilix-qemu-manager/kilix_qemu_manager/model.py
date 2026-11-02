@@ -294,10 +294,12 @@ def _groups() -> list:
 
 
 def _sources_problem() -> str:
-    """'' when the passwd and group databases come only from sources that
-    list every account (:data:`LISTING_SOURCES`); otherwise why not. LDAP,
-    sssd and the like need not list every account, and then no one can say
-    that no other account has a given primary group."""
+    """'' when account and membership lookups use supported sources.
+
+    LDAP, sssd and the like need not list every account. An explicit
+    initgroups database can also supply memberships independently of the
+    group listing. Without that line, glibc uses the group sources.
+    """
     try:
         with open(NSSWITCH, encoding="utf-8", errors="replace") as handle:
             text = handle.read(1 << 16)
@@ -307,7 +309,7 @@ def _sources_problem() -> str:
     for line in text.splitlines():
         database, colon, rest = line.split("#", 1)[0].partition(":")
         database = database.strip()
-        if not colon or database not in ("passwd", "group"):
+        if not colon or database not in ("passwd", "group", "initgroups"):
             continue
         seen.add(database)
         sources = re.sub(r"\[[^]]*\]", " ", rest).split()
@@ -331,8 +333,10 @@ def _private_group_problem(gid: int) -> str:
     in with umask 002 when their primary group has their name, so their
     directories are 0775. The group must be this process's group and the
     user's primary group, have the user's name, have no member but the user
-    in any group line with its gid, and be no other account's primary
-    group. The last two need the whole account list, so the account
+    in any group line with its gid, and be no other account's primary or
+    supplementary group. The latter checks need the whole account list,
+    and supplementary memberships come from initgroups rather than just
+    the group listing. Thus the account
     database must come from sources that list every account
     (:func:`_sources_problem`) and the listing must not stop on an error.
     Anything that cannot be looked up is not private.
@@ -355,9 +359,14 @@ def _private_group_problem(gid: int) -> str:
                 member != user for member in entry.gr_mem))
                for entry in _groups()):
             return "another group line has its gid"
+        accounts = _accounts()
         if any(entry.pw_gid == gid and entry.pw_name != user
-               for entry in _accounts()):
+               for entry in accounts):
             return "another account has it as its primary group"
+        for entry in accounts:
+            if entry.pw_name != user and gid in os.getgrouplist(
+                    entry.pw_name, entry.pw_gid):
+                return "another account has it as a supplementary group"
         return ""
     except (KeyError, OSError) as error:
         return f"it cannot be looked up ({error})"

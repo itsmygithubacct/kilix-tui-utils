@@ -144,10 +144,14 @@ swapped between the check and the use.
   "usergroups"), so their directories are 0775; those are used. The group
   must be your process's group and your primary group, have your user
   name, have no member but you in any group line with its gid, and be no
-  other account's primary group. Those last two need the whole account
+  other account's primary or supplementary group. These checks need the whole account
   list, so the manager trusts it only when `/etc/nsswitch.conf` takes
-  `passwd` and `group` from `files` and `systemd` alone (sources that list
-  every account), and only when listing them does not stop on an error.
+  `passwd`, `group` and an explicit `initgroups` database from `files` and
+  `systemd` alone, and only when account and group listing does not stop on
+  an error. With no `initgroups` line, the group sources apply. Each other
+  listed account's supplementary gids are also checked through
+  `getgrouplist`: systemd userdb memberships need not appear in the group
+  listing. A failed membership lookup refuses the exemption.
   With LDAP, sssd, NIS, winbind or `compat` in either line, an unreadable
   `nsswitch.conf`, or a listing that fails half-way, the group is not
   taken for private and its write is refused like any other group's.
