@@ -722,7 +722,8 @@ class BackendTests(Sandbox):
 
     def test_a_recycled_pid_in_a_stale_pidfile_is_not_a_witness(self):
         vm = self.define("Alpha")
-        Path(vm.pidfile).parent.mkdir(parents=True, exist_ok=True)
+        # 0700, as the manager makes it, whatever the umask.
+        Path(vm.pidfile).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         Path(vm.pidfile).write_text(f"{os.getpid()}\n")     # not a QEMU
         self.assertEqual(self.manager().pid_of(vm), 0)
         # A live QEMU of this user, but another VM's: its argv opens none of
@@ -2825,6 +2826,62 @@ class LaunchLinksR5Tests(RuntimeDirTests):
         self.assertEqual(self.rc.launched, [])
         self.assertTrue(os.path.islink(vm.pidfile))
         self.assertFalse(elsewhere.exists())
+
+
+class StoreR5Tests(Sandbox):
+    def test_an_interrupt_during_the_lock_wait_leaks_no_fd(self):
+        """NB-R4-5."""
+        child = subprocess.Popen(
+            [sys.executable, "-c", (
+                "import sys; sys.path.insert(0, sys.argv[1])\n"
+                "from kilix_qemu_manager import store\n"
+                "with store.state_lock():\n"
+                "    print('held', flush=True)\n"
+                "    sys.stdin.readline()\n"), str(MANAGER)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait, 5)
+        self.addCleanup(child.stdin.close)
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        open_fds = lambda: len(os.listdir("/proc/self/fd"))  # noqa: E731
+        before = open_fds()
+
+        def interrupted(_seconds):
+            raise KeyboardInterrupt
+
+        with mock.patch.object(store.time, "sleep", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                store.set_favorite("alpha", True)
+        self.assertEqual(store._flock, {"depth": 0, "fd": -1})
+        self.assertLessEqual(open_fds(), before, "the lock fd leaked")
+        child.stdin.write("\n")
+        child.stdin.flush()
+        self.assertEqual(child.wait(5), 0)
+
+    def test_a_fifo_in_the_catalog_never_hangs_a_reader(self):
+        """NB-R4-7: in a child with a timeout, since a hang is the defect."""
+        self.define("Alpha")
+        os.mkfifo(os.path.join(model.vms_dir(), "fifo.json"))
+        os.makedirs(os.path.dirname(model.state_path()), exist_ok=True)
+        os.mkfifo(model.state_path())
+        code = (
+            "import json, sys; sys.path.insert(0, sys.argv[1])\n"
+            "from kilix_qemu_manager import store\n"
+            "machines, problems = store.load_all()\n"
+            "print(json.dumps([[m.id for m in machines], problems,\n"
+            "                  store.load_state(), store.get('fifo')]))\n")
+        try:
+            done = subprocess.run([sys.executable, "-c", code, str(MANAGER)],
+                                  capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("a FIFO in the catalog hung load_all")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        ids, problems, record, got = json.loads(done.stdout)
+        self.assertEqual(ids, ["alpha"])
+        self.assertEqual(problems, ["fifo.json: fifo.json is not a regular file"])
+        self.assertEqual(record, {"favorites": [], "recents": []})
+        self.assertIsNone(got)
+
 
 if __name__ == "__main__":
     unittest.main()

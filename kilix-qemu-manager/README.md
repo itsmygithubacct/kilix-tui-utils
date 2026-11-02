@@ -83,7 +83,9 @@ Import never produces any of them:
 
 A definition file is also refused, as damage to that file alone, when a path
 or argv word holds a NUL byte or text that is not UTF-8 (the OS cannot take
-the first; the second cannot be shown). Any other error reading one file
+the first; the second cannot be shown), or when it is not a regular file (a
+FIFO named `x.json` is refused without being read, so it cannot hang the
+catalog). Any other error reading one file
 becomes that file's problem line; the other VMs still load.
 
 Each problem line names the file and the path, and says to edit or delete
@@ -182,8 +184,8 @@ Favorites and the last five launches live in one small state file,
 changes; a damaged file reads as empty. A favorite that cannot be saved is
 reported, not shown as set. Each update holds a lock, across processes too
 (an empty `state.json.lock` beside the state file), so the CLI and a running
-picker never lose each other's change. If another manager process holds
-that lock for more than five seconds (it was stopped with Ctrl-Z, say), the
+picker never lose each other's change. If another process (normally another
+manager) holds that lock for more than five seconds (it was stopped with Ctrl-Z, say), the
 update is not made: a favorite says it could not be saved, and a recent is
 simply not recorded. A write that crashed between its swap file and the
 replace leaves a swap file behind; the next write in that directory removes

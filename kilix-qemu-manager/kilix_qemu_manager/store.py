@@ -50,6 +50,24 @@ def _definition_path(vm_id: str) -> str:
     return os.path.join(model.vms_dir(), f"{vm_id}.json")
 
 
+def _open_regular(path: str):
+    """Open `path` for reading as UTF-8 text, only if it is a regular file.
+
+    O_NONBLOCK keeps a FIFO (or a device) planted under a definition's or
+    the state file's name from blocking the open; it is then refused as not
+    a regular file, like any other damage, instead of hanging every reader.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{os.path.basename(path)} is not a regular file")
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def load_all() -> tuple[list[VmDefinition], list[str]]:
     """Every valid definition, plus one line per file that did not load."""
     directory = model.vms_dir()
@@ -64,7 +82,7 @@ def load_all() -> tuple[list[VmDefinition], list[str]]:
             continue
         path = os.path.join(directory, name)
         try:
-            with open(path, encoding="utf-8") as handle:
+            with _open_regular(path) as handle:
                 vm = VmDefinition.from_json(json.load(handle))
         except RecursionError:
             problems.append(f"{name}: nested too deeply to read")
@@ -168,7 +186,7 @@ def claimed_paths(machines: list[VmDefinition]) -> dict[str, str]:
 
 def get(vm_id: str) -> VmDefinition | None:
     try:
-        with open(_definition_path(vm_id), encoding="utf-8") as handle:
+        with _open_regular(_definition_path(vm_id)) as handle:
             return VmDefinition.from_json(json.load(handle))
     except DAMAGE:
         return None
@@ -202,7 +220,8 @@ def _take_flock(fd: int, path: str) -> bool:
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 raise StateBusy(
-                    f"another kilix-qemu-manager has held {path} for over "
+                    f"another process (normally another kilix-qemu-"
+                    f"manager) has held {path} for over "
                     f"{LOCK_WAIT_SECONDS:g}s") from None
             time.sleep(0.02)
         except OSError:
@@ -228,7 +247,7 @@ def state_lock():
             if fd >= 0:
                 try:
                     taken = _take_flock(fd, path)
-                except StateBusy:
+                except BaseException:   # StateBusy, or an interrupt
                     os.close(fd)
                     raise
                 if not taken:
@@ -373,7 +392,7 @@ def _recents(value: object) -> list[dict]:
 def load_state() -> dict:
     """The record, whole and valid; a missing or damaged file is empty."""
     try:
-        with open(model.state_path(), encoding="utf-8") as handle:
+        with _open_regular(model.state_path()) as handle:
             record = json.load(handle)
     except DAMAGE:
         record = {}
