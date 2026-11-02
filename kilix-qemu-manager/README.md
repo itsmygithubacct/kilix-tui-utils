@@ -152,6 +152,9 @@ swapped between the check and the use.
   is walked. Any other error on the way (an I/O error, too many open files)
   is a refusal with its reason, like the rules above; status never fails on
   one.
+- A pidfile is read only when it is a regular file. It is opened without
+  blocking and without following a symlink, so a FIFO or a device under its
+  name never stalls a status read; the VM's pid is then simply not known.
 
 Without `/proc/self/fd` (a Linux system without `/proc` mounted, where the
 manager's liveness check, which reads `/proc/<pid>/cmdline`, cannot work

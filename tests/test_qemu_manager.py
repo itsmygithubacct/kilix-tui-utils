@@ -1967,7 +1967,7 @@ class RuntimeSymlinkR4Tests(RuntimeDirTests):
         self.plant_links(vm, other_qmp)
         # The links are live: anything that followed them would see a VM.
         self.assertTrue(self.answers(vm.qmp))
-        self.assertEqual(self.manager().pid_of(vm), process.pid)
+        self.assertEqual(int(Path(vm.pidfile).read_text()), process.pid)
         for mode, reason in ((0o755, "it must be 0700"),
                              (0o700, "is a symlink")):
             with self.subTest(mode=oct(mode)):
@@ -3249,6 +3249,55 @@ class StoreR6Tests(Sandbox):
             "null.json: null.json is not a regular file"])
         self.assertEqual(store.load_state(), {"favorites": [], "recents": []})
         self.assertIsNone(store.get("null"))
+
+
+# ── r7: a FIFO pidfile ────────────
+
+class PidfileFifoR7Tests(Sandbox):
+    """NB-R6-4: reading a pidfile never blocks on a FIFO or follows a
+    symlink: it is opened O_NONBLOCK|O_NOFOLLOW and read only when fstat
+    says it is a regular file."""
+
+    def status_in_thread(self, call):
+        done: list = []
+        worker = threading.Thread(target=lambda: done.append(call()),
+                                  daemon=True)
+        worker.start()
+        worker.join(5)
+        return worker, done
+
+    def test_a_fifo_pidfile_never_blocks_status(self):
+        vmdir = Path(tempfile.mkdtemp(dir=self.tmp))
+        vmdir.chmod(0o700)
+        fifo = vmdir / "qemu.pid"
+        vm = self.define("Alpha", "-pidfile", str(fifo))
+        os.mkfifo(fifo)
+        for label, call in (("status", lambda: self.manager().status(vm)),
+                            ("pid_of", lambda: self.manager().pid_of(vm))):
+            with self.subTest(label):
+                worker, done = self.status_in_thread(call)
+                hung = worker.is_alive()
+                if hung:                        # release the blocked reader
+                    os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+                    worker.join(5)
+                self.assertFalse(hung, f"{label} blocked on a FIFO pidfile")
+                result = done[0]
+                self.assertFalse(result if label == "pid_of" else result.pid)
+
+    def test_only_a_regular_file_is_read(self):
+        vmdir = Path(tempfile.mkdtemp(dir=self.tmp))
+        regular = vmdir / "regular.pid"
+        regular.write_text("4242\n")
+        self.assertEqual(backend.read_pidfile(str(regular)), "4242\n")
+        os.mkfifo(vmdir / "fifo.pid")
+        os.symlink(regular, vmdir / "link.pid")
+        (vmdir / "dir.pid").mkdir()
+        for name in ("fifo.pid", "link.pid", "dir.pid"):
+            with self.subTest(name), self.assertRaises(OSError):
+                backend.read_pidfile(str(vmdir / name))
+        regular.write_text("1" * 4096)
+        self.assertEqual(len(backend.read_pidfile(str(regular))),
+                         backend.PIDFILE_MAX_BYTES)
 
 
 if __name__ == "__main__":

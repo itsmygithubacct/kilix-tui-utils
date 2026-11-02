@@ -111,6 +111,27 @@ def disk_locked(path: str) -> bool:
         os.close(fd)
 
 
+# A pidfile holds one decimal number; read no more than this of it.
+PIDFILE_MAX_BYTES = 64
+
+
+def read_pidfile(path: str) -> str:
+    """The text of the pidfile at `path`, read only if it is a regular file.
+
+    Opened O_NONBLOCK|O_NOFOLLOW, so a FIFO or a device planted under its
+    name never blocks a status read, and a symlink is not followed; either
+    raises OSError, which a caller takes for "no pid".
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                 | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        return os.read(fd, PIDFILE_MAX_BYTES).decode("ascii")
+    finally:
+        os.close(fd)
+
+
 def _image_mode(mode: int) -> bool:
     return stat.S_ISREG(mode) or stat.S_ISBLK(mode)
 
@@ -205,8 +226,7 @@ class QemuManager:
 
         `where` is the checked path to read it through (model.reach)."""
         try:
-            with open(where or vm.pidfile, encoding="ascii") as handle:
-                pid = int(handle.read().strip() or 0)
+            pid = int(read_pidfile(where or vm.pidfile).strip() or 0)
         except (OSError, ValueError):
             return 0
         if pid <= 0 or not self._owned(pid):
