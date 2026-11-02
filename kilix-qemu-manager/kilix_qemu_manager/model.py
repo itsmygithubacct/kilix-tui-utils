@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import grp
 import json
 import os
+import pwd
 import re
 import stat
 import tempfile
@@ -193,8 +195,36 @@ MAX_SYMLINKS = 40
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
+def _private_group(gid: int) -> bool:
+    """`gid` is this user's own private group, so its write bit adds no
+    writer but this user (and root).
+
+    This is pam_umask's "usergroups" test, made strict: Debian logs a user
+    in with umask 002 when their primary group has their name, so their
+    directories are 0775. The group must be this process's group, have the
+    user's name, have no member but the user, and be no other account's
+    primary group. Anything that cannot be looked up is not private.
+    """
+    if gid != os.getgid():
+        return False
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+        group = grp.getgrgid(gid)
+        if group.gr_name != user:
+            return False
+        if any(member != user for member in group.gr_mem):
+            return False
+        return not any(entry.pw_gid == gid and entry.pw_name != user
+                       for entry in pwd.getpwall())
+    except (KeyError, OSError):
+        return False
+
+
 def _shared(info: os.stat_result) -> bool:
-    """Group or others may create names here (with the sticky bit)."""
+    """Someone but this user and root may create names here: others can
+    write, or a group that is not this user's private group can."""
+    if info.st_mode & 0o022 == 0o020 and _private_group(info.st_gid):
+        return False                    # group write by this user alone
     return bool(info.st_mode & 0o022)
 
 
@@ -203,8 +233,20 @@ def _walk_problem(where: str, info: os.stat_result) -> str:
     if info.st_uid not in (0, os.getuid()):
         return f"{where}, which belongs to uid {info.st_uid}"
     if _shared(info) and not info.st_mode & stat.S_ISVTX:
-        return f"{where}, which is mode {stat.S_IMODE(info.st_mode):04o}"
+        return (f"{where}, which is mode {stat.S_IMODE(info.st_mode):04o}"
+                + _group_note(info))
     return ""
+
+
+def _group_note(info: os.stat_result) -> str:
+    if info.st_mode & 0o022 != 0o020:
+        return ""                       # others can write: that says it all
+    try:
+        name = grp.getgrgid(info.st_gid).gr_name
+    except (KeyError, OSError):
+        name = str(info.st_gid)
+    return (f" and writable by group {name}, which is not your private "
+            "group")
 
 
 @dataclass

@@ -136,8 +136,17 @@ swapped between the check and the use.
   yours or root's too. A symlink is followed only where those rules held.
   So a `<tmp>/kilix-qemu-<uid>` that another user re-created after a reboot,
   or any directory of theirs, is never read or sent through: the VM reads
-  as stopped with the reason. A group-writable directory of your own on the
-  way is refused as well, because the manager cannot tell who the group is.
+  as stopped with the reason. A sticky directory must be yours or root's
+  too, because its owner may rename anything in it; and the setgid bit is
+  not the sticky bit, so a 2775 or 2777 shared directory is refused.
+- Group write by your own private group is your write. On Debian a user
+  whose primary group has their name logs in with umask 002 (pam_umask's
+  "usergroups"), so their directories are 0775; those are used. The group
+  must be your process's group, have your user name, have no member but
+  you, and be no other account's primary group. Group write by any other
+  group is refused ("… which is mode 0775 and writable by group staff,
+  which is not your private group"), and so is write by others whatever
+  the group.
 
 Without `/proc/self/fd` (a Linux system without `/proc` mounted, where the
 manager's liveness check, which reads `/proc/<pid>/cmdline`, cannot work

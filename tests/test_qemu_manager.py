@@ -8,11 +8,14 @@ Kilix credentials are removed from the environment before anything imports.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import grp
 import io
 import itertools
 import json
 import os
+import pwd
 import shlex
 import shutil
 import socket
@@ -1250,6 +1253,7 @@ class RuntimeDirTests(Sandbox):
         os.environ.pop("XDG_RUNTIME_DIR")          # restored by patch.dict
         self.shared = self.tmp / "shared-tmp"
         self.shared.mkdir()
+        self.shared.chmod(0o1777)                   # as /tmp is, any umask
         patcher = mock.patch.object(model.tempfile, "gettempdir",
                                     return_value=str(self.shared))
         patcher.start()
@@ -2552,9 +2556,11 @@ class OutsideDirR5Tests(RuntimeDirTests):
         self.assertEqual(self.manager().status(vm).state, "running")
 
     def test_a_writable_directory_on_the_way_is_not_used(self):
-        for mode, used in ((0o777, False), (0o775, False), (0o1777, True),
-                           (0o755, True)):
-            with self.subTest(mode=oct(mode)):
+        another = {"members": ("qemu-mgr-other",)}
+        for mode, used, db in ((0o777, False, {}), (0o775, False, another),
+                               (0o775, True, {}), (0o1777, True, {}),
+                               (0o755, True, {})):
+            with self.subTest(mode=oct(mode), **db), group_db(**db):
                 open_dir = Path(tempfile.mkdtemp(dir=self.tmp))
                 open_dir.chmod(mode)
                 mine = open_dir / "mine"
@@ -2882,6 +2888,146 @@ class StoreR5Tests(Sandbox):
         self.assertEqual(problems, ["fifo.json: fifo.json is not a regular file"])
         self.assertEqual(record, {"favorites": [], "recents": []})
         self.assertIsNone(got)
+
+
+# ── fix round r6 ─────────────────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def group_db(*, name: str | None = None, members=(), other_primary=False):
+    """The account database as the manager sees it, for this process's
+    group: named `name` (default: the user's own name, as a private group
+    is), with `members`, and with `other_primary`, another account whose
+    primary group it is. Other groups are looked up for real."""
+    me = pwd.getpwuid(os.getuid())
+    gid = os.getgid()
+    real_getgrgid = grp.getgrgid
+
+    def getgrgid(number):
+        if number == gid:
+            return grp.struct_group(
+                (name or me.pw_name, "x", gid, list(members)))
+        return real_getgrgid(number)
+
+    def getpwall():
+        entries = [me]
+        if other_primary:
+            entries.append(pwd.struct_passwd((
+                "qemu-mgr-other", "x", os.getuid() + 1, gid, "",
+                "/nonexistent", "/usr/sbin/nologin")))
+        return entries
+
+    with mock.patch.object(grp, "getgrgid", getgrgid), \
+            mock.patch.object(pwd, "getpwall", getpwall):
+        yield
+
+
+class PrivateGroupR6Tests(RuntimeDirTests):
+    """R5-B1: group write by the user's own private group (Debian's
+    pam_umask usergroups: umask 002, 0775 directories) is the user's write;
+    group write by any real group is still refused."""
+
+    def vm_dir(self, mode: int) -> Path:
+        vmdir = Path(tempfile.mkdtemp(dir=self.tmp))
+        vmdir.chmod(mode)
+        return vmdir
+
+    def test_a_pidfile_in_a_0775_dir_of_the_users_private_group_is_used(self):
+        vmdir = self.vm_dir(0o775)
+        pidfile = str(vmdir / "qemu.pid")
+        with group_db():
+            vm = self.define("Alpha", "-pidfile", pidfile)
+            self.assertEqual(vm.pidfile, pidfile)       # kept: the user's
+            self.assertEqual(model.reach_problem(pidfile), "")
+            result = self.manager().launch(vm)
+            self.assertTrue(result.ok, result.message)
+            self.wait_for(lambda: self.manager().status(vm).pid)
+            sub = vmdir / "sub"                         # 0775 below 0775
+            sub.mkdir()
+            sub.chmod(0o775)
+            server = FakeQmpServer(str(sub / "own.qmp"), RUNNING_REPLY)
+            self.addCleanup(server.close)
+            with model.reach(server.path) as where:
+                self.assertEqual(qmp.status(where, timeout=0.5), "running")
+        self.assertEqual(server.seen, ["qmp_capabilities", "query-status"])
+
+    def test_a_0775_dir_whose_group_is_not_the_users_alone_is_refused(self):
+        cases = (
+            ("another member", {"members": ("qemu-mgr-other",)}, False),
+            ("another name", {"name": "staff"}, False),
+            ("another account's primary group", {"other_primary": True},
+             False),
+            ("not this process's group", {}, True),
+        )
+        for index, (label, db, other_gid) in enumerate(cases):
+            with self.subTest(label), group_db(**db):
+                vmdir = self.vm_dir(0o775)
+                vm = self.define(f"Alpha {index}", "-pidfile",
+                                 str(vmdir / "qemu.pid"))
+                server = FakeQmpServer(str(vmdir / "own.qmp"), RUNNING_REPLY)
+                self.addCleanup(server.close)
+                with contextlib.ExitStack() as stack:
+                    if other_gid:
+                        stack.enter_context(mock.patch.object(
+                            model.os, "getgid", lambda: os.getegid() + 1))
+                    problem = model.reach_problem(server.path)
+                    result = self.manager().launch(vm)
+                    status = self.manager().status(vm)
+                self.assertIn("which is mode 0775 and writable by group",
+                              problem)
+                self.assertFalse(result.ok)
+                self.assertIn("which is mode 0775", result.message)
+                self.assertFalse(status.pid)
+                self.assertEqual(self.rc.launched, [])
+                self.assertEqual(server.seen, [])
+
+    def test_others_write_is_refused_even_with_a_private_group(self):
+        with group_db():
+            for mode in (0o777, 0o767, 0o757):
+                with self.subTest(mode=oct(mode)):
+                    vmdir = self.vm_dir(mode)
+                    problem = model.reach_problem(str(vmdir / "x.qmp"))
+                    self.assertIn(f"which is mode {mode:04o}", problem)
+                    self.assertNotIn("writable by group", problem)
+
+    def test_setgid_is_not_the_sticky_bit(self):
+        """QM-R5's Z3: a 2777 or 2775 (shared project) dir is not trusted."""
+        another = {"members": ("qemu-mgr-other",)}
+        for mode, used, db in ((0o2777, False, {}), (0o2775, False, another),
+                               (0o2775, True, {}), (0o3777, True, {})):
+            with self.subTest(mode=oct(mode), **db), group_db(**db):
+                vmdir = self.vm_dir(0o700)
+                server = FakeQmpServer(str(vmdir / "x.qmp"), RUNNING_REPLY)
+                self.addCleanup(server.close)
+                vmdir.chmod(mode)
+                problem = model.reach_problem(server.path)
+                if used:
+                    self.assertEqual(problem, "")
+                else:
+                    self.assertIn(f"which is mode {mode:04o}", problem)
+
+    def test_a_sticky_dir_another_user_owns_is_not_trusted(self):
+        """QM-R5's Z6: its owner may rename any entry in it."""
+        sticky = self.vm_dir(0o1777)
+        mine = sticky / "mine"
+        mine.mkdir(mode=0o700)
+        server = FakeQmpServer(str(mine / "x.qmp"), RUNNING_REPLY)
+        self.addCleanup(server.close)
+        with pretend_foreign(sticky):
+            self.assertIn(f"{sticky}, which belongs to uid",
+                          model.reach_problem(server.path))
+            with self.assertRaises(model.RuntimeDirError):
+                with model.reach(server.path):
+                    pass
+        self.assertEqual(server.seen, [])
+        self.assertEqual(model.reach_problem(server.path), "")
+
+    def test_the_sandbox_tmp_is_sticky_like_tmp(self):
+        self.assertEqual(stat_mode(self.shared), 0o1777)
+
+
+def stat_mode(path: Path) -> int:
+    return path.stat().st_mode & 0o7777
 
 
 if __name__ == "__main__":
