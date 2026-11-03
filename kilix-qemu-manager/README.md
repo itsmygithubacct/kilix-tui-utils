@@ -22,6 +22,13 @@ foreground command opens that VM's QMP socket. A VM whose pidfile, QMP socket
 or disk lock says it is live, but which no Kilix tab owns, is reported as
 "live, no Kilix tab", and a second copy is never started.
 
+Startup waits for a fresh private content receipt from `kilix run` and a live
+QMP status response. A timeout, interrupted wait or failed launch closes the
+window bearing that attempt's random environment marker. Cleanup does not
+signal a PID from a file or match a tab by title. A denied cleanup is reported
+with the marker so the remaining tab can be identified. The remote client is
+explicitly told to use the scoped `KILIX_RC_PASSWORD` environment credential.
+
 ## Adding VMs
 
 ```sh

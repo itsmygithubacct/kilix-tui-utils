@@ -181,6 +181,8 @@ class CredentialDelivery(unittest.TestCase):
         self.assertNotIn("--password-file", seen["command"])
         self.assertEqual(seen["env"].get("KILIX_RC_PASSWORD"), "probe-secret")
         self.assertIn("ls", seen["command"])
+        index = seen["command"].index("--password-env")
+        self.assertEqual(seen["command"][index + 1], "KILIX_RC_PASSWORD")
 
     def test_password_is_never_an_argument(self):
         # The value must not appear in argv at all — argv is world-readable
@@ -208,6 +210,36 @@ class CredentialDelivery(unittest.TestCase):
             sp.run = original_run
             kitty_rc.available = original_available
         self.assertNotIn("probe-secret", " ".join(seen["command"]))
+
+
+class OwnedLaunchTransport(unittest.TestCase):
+    def test_raw_bytes_are_restored_and_ascii_marker_remains_matchable(self):
+        import json
+        from unittest.mock import patch
+        marker = "a" * 32
+        argv = ["program", "", "raw-\udcff", "quote'\";$()"]
+        with patch.object(kitty_rc, "_run", return_value="7") as run:
+            self.assertEqual(kitty_rc.launch_tab(argv, title="VM", cwd="/tmp/raw-\udcfe",
+                environment={"KILIX_QEMU_LAUNCH": marker, "KILIX_RUN_READY_FILE": "/tmp/ready-\udcfd"}), 7)
+        command = run.call_args.args[0]
+        self.assertIn("KILIX_QEMU_LAUNCH=" + marker, command)
+        self.assertIn("KILIX_RUN_READY_FILE=", command)
+        self.assertFalse(any(x.startswith("--cwd=") for x in command))
+        target = command[command.index("--") + 1:]
+        decoded, environment, cwd = json.loads(target[3])
+        self.assertEqual(decoded, argv)
+        self.assertEqual(cwd, "/tmp/raw-\udcfe")
+        self.assertEqual(environment["KILIX_RUN_READY_FILE"], "/tmp/ready-\udcfd")
+
+    def test_cleanup_accepts_only_explicit_random_marker(self):
+        from unittest.mock import patch
+        marker = "KILIX_QEMU_LAUNCH=" + "b" * 32
+        with patch.object(kitty_rc, "_run") as run:
+            kitty_rc.close_marked_pane(marker)
+            run.assert_called_once_with(["close-window", "--match", "env:" + marker])
+            for bad in ("", "KILIX_QEMU_LAUNCH=.*", "title:VM", "KILIX_QEMU_LAUNCH=" + "b" * 31):
+                with self.assertRaises(ValueError):
+                    kitty_rc.close_marked_pane(bad)
 
 
 if __name__ == "__main__":

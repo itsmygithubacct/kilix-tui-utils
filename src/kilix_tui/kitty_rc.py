@@ -240,7 +240,7 @@ def _run(args: list[str], *, input_text: str | None = None) -> str:
                 environment["KILIX_RC_PASSWORD"] = handle.read().strip()
         except OSError as exc:
             raise Unavailable(f"cannot read {password_file}: {exc}") from exc
-    command = [_kitten(), "@", *args]
+    command = [_kitten(), "@", "--password-env", "KILIX_RC_PASSWORD", *args]
     try:
         done = subprocess.run(
             command, check=False, timeout=TIMEOUT,
@@ -499,23 +499,30 @@ def launch_tab(
     title: str,
     cwd: str | None = None,
     keep_focus: bool = True,
+    environment: dict[str, str] | None = None,
 ) -> int:
-    """Open `argv` in a new page; return its pane id, or 0 if unreported.
-
-    Fixed argv only, never a shell string — the same discipline Kilix 95's
-    Start menu and Kilix Cap's launchers follow. `keep_focus` leaves the
-    caller focused, which is what a desktop launching a background surface
-    wants; pass False to follow the launch. Raises `Unavailable` when the
-    credential's scope does not include `launch` — that refusal is the
-    terminal's decision and is reported, not worked around.
-    """
+    """Open literal argv in one tab, preserving raw POSIX bytes when needed."""
+    from .launch_transport import literal_launch
+    target, environment, cwd = literal_launch(list(argv), environment or {}, cwd)
+    title = title.encode("utf-8", "replace").decode("utf-8")
     args = ["launch", "--type=tab", "--tab-title", title]
     if cwd:
         args.append(f"--cwd={cwd}")
     if keep_focus:
         args.append("--keep-focus")
-    out = _run([*args, "--", *argv]).strip()
-    return int(out) if out.isdigit() else 0
+    for key, value in environment.items():
+        args += ["--env", f"{key}={value}"]
+    out = _run([*args, "--", *target]).strip()
+    return int(out) if out.isascii() and out.isdigit() else 0
+
+
+def close_marked_pane(marker: str) -> None:
+    """Close only an attempt identified by a fixed name and random hex value."""
+    import re
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*=[0-9a-f]{32}", marker):
+        raise ValueError("invalid launch ownership marker")
+    _run(["close-window", "--match", "env:" + marker])
+
 
 def launch_pane(
     argv: list[str] | tuple[str, ...],

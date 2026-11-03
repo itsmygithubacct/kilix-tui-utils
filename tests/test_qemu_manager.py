@@ -197,6 +197,9 @@ class FakeRc:
         self.processes: list[subprocess.Popen] = []
         self.next_id = 300
         self.up = True
+        self.emit_receipt = True
+        self.closed_markers = []
+        self.owned = {}
 
     def available(self) -> bool:
         return self.up
@@ -231,10 +234,10 @@ class FakeRc:
     def focus_pane(self, pane_id: int) -> None:
         self.focused.append(pane_id)
 
-    def launch_tab(self, argv, *, title, cwd=None, keep_focus=True):
+    def launch_tab(self, argv, *, title, cwd=None, keep_focus=True, environment=None):
         argv = list(argv)
         self.launched.append({"argv": argv, "title": title, "cwd": cwd,
-                              "keep_focus": keep_focus})
+                              "keep_focus": keep_focus, "environment": environment or {}})
         if argv[:1] == ["ssh"]:
             return self.add_window(title, [argv])
         assert argv[:2] == ["env", "KILIX_IN_OVERLAY=1"], argv
@@ -246,11 +249,27 @@ class FakeRc:
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
         self.processes.append(process)
-        return self.add_window(title, [
+        pane_id = self.add_window(title, [
             ["/bin/bash", argv[2], "run", *rest],
             ["python3", "/opt/kilix/config/apprun.py", *rest],
             ["Xvfb", "-displayfd", "5", "-auth", "/tmp/x.auth"],
         ])
+        self.windows[-1]["env"] = dict(environment or {})
+        self.owned[pane_id] = process
+        if self.emit_receipt and environment and environment.get("KILIX_RUN_READY_FILE"):
+            Path(environment["KILIX_RUN_READY_FILE"]).write_bytes(b"content-ready\n")
+        return pane_id
+
+    def close_marked_pane(self, marker):
+        self.closed_markers.append(marker)
+        name, value = marker.split("=", 1)
+        for window in list(self.windows):
+            if window["env"].get(name) == value:
+                process = self.owned.get(window["id"])
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    process.wait(5)
+                self.windows.remove(window)
 
     def close(self) -> None:
         for process in self.processes:
@@ -683,6 +702,92 @@ class BackendTests(Sandbox):
                          ("running", True, True))
         self.assertTrue(status.pane_id)
         self.assertEqual(status.label, "running")
+
+    def test_qmp_without_content_times_out_and_closes_only_owned_marker(self):
+        sentinel = self.rc.add_window("QEMU: Alpha", [["sleep", "60"]])
+        self.rc.emit_receipt = False
+        result = self.manager(launch_wait_seconds=0.3).launch(self.define("Alpha"))
+        self.assertFalse(result.ok)
+        self.assertIn("rendered content", result.message)
+        self.assertEqual([w["id"] for w in self.rc.windows], [sentinel])
+        self.assertTrue(all(p.poll() is not None for p in self.rc.processes))
+        environment = self.rc.launched[-1]["environment"]
+        self.assertEqual(self.rc.closed_markers,
+                         ["KILIX_QEMU_LAUNCH=" + environment["KILIX_QEMU_LAUNCH"]])
+        self.assertFalse(Path(environment["KILIX_RUN_READY_FILE"]).parent.exists())
+
+    def test_content_without_qmp_is_not_success(self):
+        self.rc.env["FAKE_QEMU_NO_QMP"] = "1"
+        result = self.manager(launch_wait_seconds=0.3).launch(self.define("Alpha"))
+        self.assertFalse(result.ok)
+        self.assertEqual(len(self.rc.closed_markers), 1)
+
+    def test_interrupt_and_polling_error_clean_the_owned_attempt(self):
+        for error in (KeyboardInterrupt(), RuntimeError("poll failed")):
+            with self.subTest(error=type(error).__name__):
+                vm = self.define("Interrupt" + type(error).__name__)
+                manager = self.manager()
+                before = len(self.rc.closed_markers)
+                with mock.patch.object(manager, "_content_ready", side_effect=error):
+                    if isinstance(error, KeyboardInterrupt):
+                        with self.assertRaises(KeyboardInterrupt):
+                            manager.launch(vm)
+                    else:
+                        self.assertFalse(manager.launch(vm).ok)
+                self.assertEqual(len(self.rc.closed_markers), before + 1)
+                self.assertFalse(Path(manager._marker(vm)).exists())
+
+    def test_lost_or_malformed_launch_reply_still_closes_marker(self):
+        original = self.rc.launch_tab
+        for mode in ("timeout", "malformed"):
+            def launch(*args, **kwargs):
+                original(*args, **kwargs)
+                if mode == "timeout":
+                    raise subprocess.TimeoutExpired("launch", 1)
+                return 0
+            with self.subTest(mode=mode), mock.patch.object(self.rc, "launch_tab", side_effect=launch):
+                result = self.manager().launch(self.define(mode))
+                self.assertFalse(result.ok)
+                self.assertEqual(self.rc.windows, [])
+
+    def test_denied_cleanup_is_reported_with_exact_attempt_marker(self):
+        self.rc.emit_receipt = False
+        with mock.patch.object(self.rc, "close_marked_pane", side_effect=RuntimeError("denied")):
+            result = self.manager(launch_wait_seconds=0).launch(self.define("Alpha"))
+        self.assertFalse(result.ok)
+        self.assertIn("owned tab cleanup failed", result.message)
+        marker = "KILIX_QEMU_LAUNCH=" + self.rc.launched[-1]["environment"]["KILIX_QEMU_LAUNCH"]
+        self.assertIn(marker, result.message)
+        self.rc.close_marked_pane(marker)
+
+    def test_receipt_teardown_error_also_cleans_launched_tab(self):
+        original = tempfile.TemporaryDirectory
+        @contextlib.contextmanager
+        def broken_teardown(*args, **kwargs):
+            with original(*args, **kwargs) as directory:
+                yield directory
+                raise OSError("receipt teardown failed")
+        with mock.patch.object(backend.tempfile, "TemporaryDirectory", broken_teardown):
+            result = self.manager().launch(self.define("Alpha"))
+        self.assertFalse(result.ok)
+        self.assertIn("receipt teardown failed", result.message)
+        self.assertEqual(len(self.rc.closed_markers), 1)
+        self.assertEqual(self.rc.windows, [])
+
+    def test_receipt_reader_refuses_symlink_fifo_and_excess_content(self):
+        receipt = self.tmp / "receipt"
+        for kind in ("symlink", "fifo", "excess", "valid"):
+            with self.subTest(kind=kind):
+                if kind == "symlink":
+                    target = self.tmp / "target"
+                    target.write_bytes(b"content-ready\n")
+                    receipt.symlink_to(target)
+                elif kind == "fifo":
+                    os.mkfifo(receipt)
+                else:
+                    receipt.write_bytes(b"content-ready\n" + (b"extra" if kind == "excess" else b""))
+                self.assertEqual(backend.QemuManager._content_ready(str(receipt)), kind == "valid")
+                receipt.unlink()
 
     def test_launch_outside_kilix_is_refused_before_anything_starts(self):
         vm = self.define("Alpha")

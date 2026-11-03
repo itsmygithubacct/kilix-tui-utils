@@ -18,6 +18,8 @@ import fcntl
 import json
 import os
 import shutil
+import secrets
+import tempfile
 import stat
 import struct
 import subprocess
@@ -359,7 +361,7 @@ class QemuManager:
 
     def preview(self, vm: VmDefinition, action: str,
                 size: str | None = None, pane_id: int = 0) -> tuple[str, ...]:
-        """The exact command an action runs, for the confirmation screen."""
+        """The target command; launch assigns its private receipt/marker at runtime."""
         if action == "launch":
             return ("kitten", "@", "launch", "--type=tab", "--tab-title",
                     f"QEMU: {vm.name}", "--keep-focus", "--",
@@ -460,36 +462,67 @@ class QemuManager:
         if not self._claim_launch(vm):
             return OperationResult(
                 False, f"{vm.name} is already being launched.", command)
+        marker = "KILIX_QEMU_LAUNCH=" + secrets.token_hex(16)
+        attempted = False
         try:
-            try:
+            with tempfile.TemporaryDirectory(prefix="launch-", dir=model.runtime_dir()) as directory:
+                receipt = os.path.join(directory, "content.ready")
+                attempted = True
                 pane_id = self.rc.launch_tab(
                     self.tab_argv(vm, size), title=f"QEMU: {vm.name}",
-                    cwd=vm.cwd or None, keep_focus=True)
-            except Exception as error:
-                return OperationResult(False, f"Kilix refused the tab: {error}",
-                                       command)
-            deadline = time.monotonic() + self.launch_wait_seconds
-            while True:
-                try:
-                    state = self._qmp(vm.qmp, "query-status",
-                                      timeout=self.qmp_timeout)
-                except qmp.QmpError:
+                    cwd=vm.cwd or None, keep_focus=True,
+                    environment={"KILIX_QEMU_LAUNCH": marker.split("=", 1)[1],
+                                 "KILIX_RUN_READY_FILE": receipt})
+                if type(pane_id) is not int or pane_id <= 0:
+                    raise RuntimeError("Kilix did not return a valid pane ID")
+                deadline = time.monotonic() + self.launch_wait_seconds
+                while True:
                     state = ""
-                if state:
-                    store.remember_launch(vm.id)
-                    where = f" (pane {pane_id})" if pane_id else ""
-                    return OperationResult(
-                        True, f"Opened {vm.name} in a new Kilix tab{where}; "
-                              f"QEMU reports {state}.", command)
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.1)
-            return OperationResult(
-                False, f"Kilix opened the tab, but {vm.name}'s QMP socket did "
-                       f"not answer within {self.launch_wait_seconds:g}s.",
-                command)
+                    if self._content_ready(receipt):
+                        try:
+                            state = self._qmp(vm.qmp, "query-status", timeout=self.qmp_timeout)
+                        except qmp.QmpError:
+                            pass
+                    if state:
+                        store.remember_launch(vm.id)
+                        return OperationResult(
+                            True, f"Opened {vm.name} in a new Kilix tab (pane {pane_id}); "
+                                  f"content ready and QEMU reports {state}.", command)
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"{vm.name} did not produce rendered content and a live QMP "
+                            f"response within {self.launch_wait_seconds:g}s")
+                    time.sleep(0.1)
+        except BaseException as error:
+            # The marker works even if launch timed out before returning an ID.
+            # Include receipt-directory teardown failures in owned cleanup.
+            if attempted:
+                try:
+                    self.rc.close_marked_pane(marker)
+                except Exception as cleanup_error:
+                    message = (f"QEMU launch failed ({error}); owned tab cleanup failed "
+                               f"({cleanup_error}); inspect {marker}")
+                    if not isinstance(error, Exception):
+                        raise RuntimeError(message) from error
+                    return OperationResult(False, message, command)
+            if not isinstance(error, Exception):
+                raise
+            return OperationResult(False, f"QEMU launch failed: {error}", command)
         finally:
             self._release_launch(vm)
+
+    @staticmethod
+    def _content_ready(path: str) -> bool:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            try:
+                info = os.fstat(fd)
+                return (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                        and os.read(fd, 15) == b"content-ready\n")
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
 
     def control(self, vm: VmDefinition, action: str) -> OperationResult:
         if action not in QMP_ACTIONS:
