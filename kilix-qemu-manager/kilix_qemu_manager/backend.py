@@ -462,9 +462,9 @@ class QemuManager:
         if not self._claim_launch(vm):
             return OperationResult(
                 False, f"{vm.name} is already being launched.", command)
-        marker = "KILIX_QEMU_LAUNCH=" + secrets.token_hex(16)
         attempted = False
         try:
+            marker = "KILIX_QEMU_LAUNCH=" + secrets.token_hex(16)
             with tempfile.TemporaryDirectory(prefix="launch-", dir=model.runtime_dir()) as directory:
                 receipt = os.path.join(directory, "content.ready")
                 attempted = True

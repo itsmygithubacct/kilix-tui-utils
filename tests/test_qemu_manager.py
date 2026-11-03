@@ -703,6 +703,29 @@ class BackendTests(Sandbox):
         self.assertTrue(status.pane_id)
         self.assertEqual(status.label, "running")
 
+    def test_marker_generation_error_releases_claim_and_allows_retry(self):
+        vm = self.define("TokenError")
+        manager = self.manager()
+        with mock.patch.object(backend.secrets, "token_hex", side_effect=OSError("token unavailable")):
+            result = manager.launch(vm)
+        self.assertFalse(result.ok)
+        self.assertIn("token unavailable", result.message)
+        self.assertFalse(Path(manager._marker(vm)).exists())
+        self.assertEqual(self.rc.launched, [])
+        self.assertEqual(self.rc.closed_markers, [])
+        self.assertTrue(manager.launch(vm).ok)
+
+    def test_marker_generation_interrupt_releases_claim_and_allows_retry(self):
+        vm = self.define("TokenInterrupt")
+        manager = self.manager()
+        with mock.patch.object(backend.secrets, "token_hex", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                manager.launch(vm)
+        self.assertFalse(Path(manager._marker(vm)).exists())
+        self.assertEqual(self.rc.launched, [])
+        self.assertEqual(self.rc.closed_markers, [])
+        self.assertTrue(manager.launch(vm).ok)
+
     def test_qmp_without_content_times_out_and_closes_only_owned_marker(self):
         sentinel = self.rc.add_window("QEMU: Alpha", [["sleep", "60"]])
         self.rc.emit_receipt = False
