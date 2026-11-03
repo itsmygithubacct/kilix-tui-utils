@@ -231,6 +231,25 @@ class OwnedLaunchTransport(unittest.TestCase):
         self.assertEqual(cwd, "/tmp/raw-\udcfe")
         self.assertEqual(environment["KILIX_RUN_READY_FILE"], "/tmp/ready-\udcfd")
 
+    def test_close_error_requires_authenticated_empty_listing_for_absence(self):
+        from unittest.mock import patch
+        import json
+        marker = "KILIX_QEMU_LAUNCH=" + "c" * 32
+        failure = kitty_rc.Unavailable("close refused")
+        for reply, accepted in (("[]", True), ('[{"tabs": []}]', True),
+                                ('[{"tabs": [{"windows": [{}]}]}]', False),
+                                (json.dumps([{'tabs':[{'windows':[{'env':{'KILIX_QEMU_LAUNCH':'c'*32}}]}]}]), False),
+                                (json.dumps([{'tabs':[{'windows':[{'env':{'KILIX_QEMU_LAUNCH':'d'*32}}]}]}]), True),
+                                ("{}", False), ("invalid", False),
+                                (kitty_rc.Unavailable("ls refused"), False)):
+            with self.subTest(reply=reply), patch.object(kitty_rc, "_run", side_effect=[failure, reply]) as run:
+                if accepted:
+                    kitty_rc.close_marked_pane(marker)
+                else:
+                    with self.assertRaisesRegex(kitty_rc.Unavailable, "close refused"):
+                        kitty_rc.close_marked_pane(marker)
+                self.assertEqual(run.call_args.args[0], ["ls", "--all-env-vars"])
+
     def test_cleanup_accepts_only_explicit_random_marker(self):
         from unittest.mock import patch
         marker = "KILIX_QEMU_LAUNCH=" + "b" * 32

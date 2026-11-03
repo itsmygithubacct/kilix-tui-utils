@@ -516,12 +516,43 @@ def launch_tab(
     return int(out) if out.isascii() and out.isdigit() else 0
 
 
+def _marker_absent(payload, marker: str) -> bool:
+    """Require a complete window/environment listing before proving absence."""
+    name, value = marker.split("=", 1)
+    if not isinstance(payload, list):
+        return False
+    for os_window in payload:
+        if not isinstance(os_window, dict) or not isinstance(os_window.get("tabs"), list):
+            return False
+        for tab in os_window["tabs"]:
+            if not isinstance(tab, dict) or not isinstance(tab.get("windows"), list):
+                return False
+            for window in tab["windows"]:
+                if not isinstance(window, dict) or not isinstance(window.get("env"), dict):
+                    return False
+                environment = window["env"]
+                if not all(isinstance(v, str) for v in environment.values()):
+                    return False
+                if environment.get(name) == value:
+                    return False
+    return True
+
+
 def close_marked_pane(marker: str) -> None:
     """Close only an attempt identified by a fixed name and random hex value."""
     import re
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*=[0-9a-f]{32}", marker):
         raise ValueError("invalid launch ownership marker")
-    _run(["close-window", "--match", "env:" + marker])
+    match = "env:" + marker
+    try:
+        _run(["close-window", "--match", match])
+    except Exception:
+        try:
+            if _marker_absent(json.loads(_run(["ls", "--all-env-vars"])), marker):
+                return
+        except Exception:
+            pass
+        raise
 
 
 def launch_pane(
