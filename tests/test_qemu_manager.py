@@ -2899,6 +2899,7 @@ class StoreR5Tests(Sandbox):
 class Account(typing.NamedTuple):
     pw_name: str
     pw_gid: int
+    pw_uid: int = -1
 
 
 class Group(typing.NamedTuple):
@@ -2943,7 +2944,7 @@ def group_db(*, name: str | None = None, members=(), other_primary=False,
         return real_getpwuid(number)
 
     def accounts():
-        entries = [Account(me.pw_name, gid)]
+        entries = [Account(me.pw_name, gid, me.pw_uid)]
         if other_primary:
             entries.append(Account("qemu-mgr-other", gid))
         return entries
@@ -3673,7 +3674,8 @@ class FakeLibc:
         entry = self.lists[kind][index]
         if kind == "pw":
             return types.SimpleNamespace(contents=types.SimpleNamespace(
-                pw_name=entry[0].encode(), pw_gid=entry[1]))
+                pw_name=entry[0].encode(), pw_gid=entry[1],
+                pw_uid=os.getuid() if entry[0] == pwd.getpwuid(os.getuid()).pw_name else entry[1] + 50000))
         return types.SimpleNamespace(contents=types.SimpleNamespace(
             gr_name=entry[0].encode(), gr_gid=entry[1],
             gr_mem=[member.encode() for member in entry[2]] + [None]))
@@ -3692,7 +3694,7 @@ class SupplementaryMembershipR8Tests(RuntimeDirTests):
         gid = os.getgid()
         peer_gid = gid + 51000
         with group_db(), mock.patch.object(model, "_accounts", return_value=[
-                Account(me, gid), Account("qemu-mgr-peer", peer_gid)]), \
+                Account(me, gid, os.getuid()), Account("qemu-mgr-peer", peer_gid)]), \
                 mock.patch.object(os, "getgrouplist", return_value=[
                     peer_gid, gid]) as memberships:
             problem = self.problem()
@@ -3706,7 +3708,7 @@ class SupplementaryMembershipR8Tests(RuntimeDirTests):
         peer_gid = gid + 51000
         with group_db(sources="files systemd"), \
                 mock.patch.object(model, "_accounts", return_value=[
-                    Account(me, gid), Account("qemu-mgr-peer", peer_gid)]), \
+                    Account(me, gid, os.getuid()), Account("qemu-mgr-peer", peer_gid)]), \
                 mock.patch.object(os, "getgrouplist", return_value=[
                     peer_gid]) as memberships:
             self.assertEqual(self.problem(), "")
@@ -3719,7 +3721,7 @@ class SupplementaryMembershipR8Tests(RuntimeDirTests):
                       KeyError("missing account")]:
             with self.subTest(error=type(error).__name__), group_db(), \
                     mock.patch.object(model, "_accounts", return_value=[
-                        Account(me, gid), Account("qemu-mgr-peer", gid + 1)]), \
+                        Account(me, gid, os.getuid()), Account("qemu-mgr-peer", gid + 1)]), \
                     mock.patch.object(os, "getgrouplist", side_effect=error):
                 self.assertIn("which is not your private group", self.problem())
 
@@ -3731,7 +3733,7 @@ class SupplementaryMembershipR8Tests(RuntimeDirTests):
             return [primary, gid] if user == "qemu-mgr-peer2" else [primary]
 
         with group_db(), mock.patch.object(model, "_accounts", return_value=[
-                Account(me, gid), Account("qemu-mgr-peer1", gid + 1),
+                Account(me, gid, os.getuid()), Account("qemu-mgr-peer1", gid + 1),
                 Account("qemu-mgr-peer2", gid + 2)]), \
                 mock.patch.object(os, "getgrouplist", side_effect=memberships):
             self.assertIn("supplementary group", self.problem())
@@ -3758,6 +3760,76 @@ class SupplementaryMembershipR8Tests(RuntimeDirTests):
             with open(model.NSSWITCH, "a") as handle:
                 handle.write("initgroups:\n")
             self.assertIn("names no source for initgroups", self.problem())
+
+
+class LocalMembershipProofTests(RuntimeDirTests):
+    """Whole-file authority and conservative systemd scope, using real files."""
+
+    def test_config_limit_requires_eof_in_bytes(self):
+        conf = self.tmp / "nsswitch"
+        prefix = b"passwd: files\ngroup: files\n#"
+        with mock.patch.object(model, "NSSWITCH", str(conf)):
+            for size, accepted in [(65535, True), (65536, True), (65537, False)]:
+                conf.write_bytes(prefix + b" " * (size - len(prefix)))
+                self.assertEqual(model._sources_problem() == "", accepted)
+            conf.write_bytes(prefix + b" " * 65536 + b"\npasswd: files ldap\n")
+            self.assertTrue(model._sources_problem())
+            conf.write_bytes(prefix + "é".encode() * 32768)
+            self.assertTrue(model._sources_problem())
+            conf.write_bytes(prefix + b"\0")
+            self.assertTrue(model._sources_problem())
+
+    def test_local_files_keep_uid_identity_and_all_group_lines(self):
+        passwd = self.tmp / "passwd"
+        group = self.tmp / "group"
+        own = "owner:x:1000:1000::/:/bin/sh\n"
+        with mock.patch.object(model, "PASSWD_FILE", str(passwd)), \
+                mock.patch.object(model, "GROUP_FILE", str(group)):
+            cases = [
+                (own, "owner:x:1000:\n", True),
+                (own + "owner:x:61002:1000::/:/bin/sh\n", "owner:x:1000:\n", False),
+                (own + "peer:x:61002:1000::/:/bin/sh\n", "owner:x:1000:\n", False),
+                (own + "alias:x:1000:1000::/:/bin/sh\n", "owner:x:1000:\n", True),
+                (own, "owner:x:1000:\nteam:x:1000:peer\n", False),
+                (own, "owner:x:1000:peer\n", False),
+                (own + "broken\n", "owner:x:1000:\n", False),
+                (own, "owner:x:1000:\nbroken\n", False),
+                (own, "", False),
+                ("", "owner:x:1000:\n", False),
+            ]
+            for pw, gr, accepted in cases:
+                with self.subTest(pw=pw, gr=gr):
+                    passwd.write_text(pw); group.write_text(gr)
+                    self.assertEqual(model._files_group_problem("owner", 1000, 1000) == "", accepted)
+
+    def test_systemd_providers_are_not_membership_authorities(self):
+        services = self.tmp / "services"; services.mkdir()
+        records = self.tmp / "records"; records.mkdir()
+        with mock.patch.object(model, "USERDB_SERVICES", str(services)), \
+                mock.patch.object(model, "USERDB_RECORDS", (str(records),)), \
+                mock.patch.object(os, "getuid", return_value=1000), \
+                mock.patch.object(os, "getgid", return_value=1000):
+            self.assertEqual(model._systemd_authority_problem(), "")
+            dynamic = services / "io.systemd.DynamicUser"; dynamic.touch()
+            self.assertEqual(model._systemd_authority_problem(), "")
+            for name in ["io.systemd.Home", "io.systemd.Multiplexer", "custom"]:
+                provider = services / name; provider.touch()
+                self.assertTrue(model._systemd_authority_problem())
+                with group_db(sources="files systemd"):
+                    self.assertTrue(model._sources_problem())
+                provider.unlink()
+            record = records / "peer:owner.membership"; record.touch()
+            self.assertTrue(model._systemd_authority_problem())
+            record.unlink(); records.rmdir(); records.write_text("not a directory")
+            with self.assertRaises(OSError):
+                model._systemd_authority_problem()
+
+    def test_nss_accounts_preserve_uid_even_with_duplicate_names(self):
+        me = pwd.getpwuid(os.getuid()).pw_name
+        gid = os.getgid()
+        with group_db(), mock.patch.object(model, "_accounts", return_value=[
+                Account(me, gid, os.getuid()), Account(me, gid, os.getuid() + 1)]):
+            self.assertIn("another account", model._private_group_problem(gid))
 
 
 class AccountListR7Tests(RuntimeDirTests):

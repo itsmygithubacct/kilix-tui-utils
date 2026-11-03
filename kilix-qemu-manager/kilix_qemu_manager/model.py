@@ -200,16 +200,98 @@ MAX_SYMLINKS = 40
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-# The account database's sources, for the private-group test. Only sources
-# that list every account they know (getpwent/getgrent) are trusted to say
-# "no other account has this group": the files, and systemd's own records.
+# Supported NSS sources are necessary, not a completeness guarantee. The
+# private-group exemption also requires the local-file authority below.
 NSSWITCH = "/etc/nsswitch.conf"
 LISTING_SOURCES = frozenset({"files", "systemd"})
+PASSWD_FILE = "/etc/passwd"
+GROUP_FILE = "/etc/group"
+USERDB_SERVICES = "/run/systemd/userdb"
+USERDB_RECORDS = ("/etc/userdb", "/run/userdb", "/run/host/userdb",
+                  "/usr/local/lib/userdb", "/usr/lib/userdb")
+
+
+def _read_database(path: str, limit: int) -> str:
+    """A bounded *whole* file, never an accepted prefix."""
+    with open(path, "rb") as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"{path} exceeds the {limit}-byte limit")
+    if b"\0" in data:
+        raise ValueError(f"{path} contains NUL")
+    return data.decode("utf-8")
+
+
+def _systemd_authority_problem() -> str:
+    """Only the stock DynamicUser service has a sufficiently narrow contract.
+
+    It supplies uid == gid accounts and no supplementary memberships. Other
+    providers (including the multiplexer) can hide an error behind a partial
+    NSS success. Do not query those providers to prove their own completeness.
+    Static userdb records are also outside this local-files proof.
+    """
+    try:
+        services = os.listdir(USERDB_SERVICES)
+    except FileNotFoundError:
+        services = []
+    if any(name != "io.systemd.DynamicUser" for name in services):
+        return "systemd userdb has providers without a local membership proof"
+    if os.getuid() != os.getgid():
+        return "systemd private-group proof requires matching uid and gid"
+    for directory in USERDB_RECORDS:
+        try:
+            if os.listdir(directory):
+                return f"{directory} contains records outside the local membership proof"
+        except FileNotFoundError:
+            pass
+    return ""
+
+
+def _files_group_problem(user: str, uid: int, gid: int) -> str:
+    """Read the authority independently of NSS action rules and caches.
+
+    This is a present configuration check, not a snapshot of running kernel
+    credentials. The administrator and the installed files/DynamicUser
+    implementations are trusted; account/provider changes are not atomic.
+    """
+    accounts = []
+    for line in _read_database(PASSWD_FILE, 8 << 20).splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        if (len(fields) != 7 or not fields[0] or
+                not fields[2].isascii() or not fields[2].isdigit() or
+                not fields[3].isascii() or not fields[3].isdigit()):
+            return "the local passwd file cannot prove account identity"
+        accounts.append(_Account(fields[0], int(fields[3]), int(fields[2])))
+    if not any(a.pw_name == user and a.pw_uid == uid and a.pw_gid == gid
+               for a in accounts):
+        return "your primary account is not in the local passwd file"
+    names = {}
+    for account in accounts:
+        if names.setdefault(account.pw_name, account.pw_uid) != account.pw_uid:
+            return "the local passwd file has a name shared by distinct uids"
+        if account.pw_uid != uid and account.pw_gid == gid:
+            return "another local account has it as its primary group"
+    found = False
+    for line in _read_database(GROUP_FILE, 8 << 20).splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        if (len(fields) != 4 or not fields[0] or
+                not fields[2].isascii() or not fields[2].isdigit()):
+            return "the local group file cannot prove membership"
+        if int(fields[2]) == gid:
+            found = True
+            if fields[0] != user or any(m != user for m in fields[3].split(",") if m):
+                return "another local group name or member has its gid"
+    return "" if found else "your group is not in the local group file"
 
 
 class _Account(NamedTuple):
     pw_name: str
     pw_gid: int
+    pw_uid: int
 
 
 class _Group(NamedTuple):
@@ -273,7 +355,7 @@ def _listing(kind: str) -> list:
                 c = entry.contents
                 if kind == "pw":
                     entries.append(_Account(os.fsdecode(c.pw_name or b""),
-                                            c.pw_gid))
+                                            c.pw_gid, c.pw_uid))
                 else:
                     members, index = [], 0
                     while c.gr_mem and c.gr_mem[index] is not None:
@@ -301,11 +383,11 @@ def _sources_problem() -> str:
     group listing. Without that line, glibc uses the group sources.
     """
     try:
-        with open(NSSWITCH, encoding="utf-8", errors="replace") as handle:
-            text = handle.read(1 << 16)
-    except OSError as error:
-        return f"{NSSWITCH} cannot be read ({error.strerror or error})"
+        text = _read_database(NSSWITCH, 1 << 16)
+    except (OSError, ValueError) as error:
+        return f"{NSSWITCH} cannot be read ({error})"
     seen = set()
+    systemd = False
     for line in text.splitlines():
         database, colon, rest = line.split("#", 1)[0].partition(":")
         database = database.strip()
@@ -316,13 +398,14 @@ def _sources_problem() -> str:
         if not sources:
             return f"{NSSWITCH} names no source for {database}"
         for source in sources:
+            systemd |= source == "systemd"
             if source not in LISTING_SOURCES:
                 return (f"{NSSWITCH} takes {database} from {source}, which "
                         "need not list every account")
     for database in ("passwd", "group"):
         if database not in seen:
             return f"{NSSWITCH} has no {database} line"
-    return ""
+    return _systemd_authority_problem() if systemd else ""
 
 
 def _private_group_problem(gid: int) -> str:
@@ -334,12 +417,11 @@ def _private_group_problem(gid: int) -> str:
     directories are 0775. The group must be this process's group and the
     user's primary group, have the user's name, have no member but the user
     in any group line with its gid, and be no other account's primary or
-    supplementary group. The latter checks need the whole account list,
-    and supplementary memberships come from initgroups rather than just
-    the group listing. Thus the account
-    database must come from sources that list every account
-    (:func:`_sources_problem`) and the listing must not stop on an error.
-    Anything that cannot be looked up is not private.
+    supplementary group. Whole local files provide the absence proof under
+    the restricted source configuration (:func:`_sources_problem`). NSS
+    listings and getgrouplist are additional rejection checks only: success
+    can hide provider errors and is never the authority for absence.
+    Anything that cannot be read or looked up is not private.
     """
     if gid != os.getgid():
         return "it is not your process's group"
@@ -355,16 +437,18 @@ def _private_group_problem(gid: int) -> str:
             return "it has another member"
         if problem := _sources_problem():
             return problem
+        if problem := _files_group_problem(user, me.pw_uid, gid):
+            return problem
         if any(entry.gr_gid == gid and (entry.gr_name != user or any(
                 member != user for member in entry.gr_mem))
                for entry in _groups()):
             return "another group line has its gid"
         accounts = _accounts()
-        if any(entry.pw_gid == gid and entry.pw_name != user
+        if any(entry.pw_gid == gid and entry.pw_uid != me.pw_uid
                for entry in accounts):
             return "another account has it as its primary group"
         for entry in accounts:
-            if entry.pw_name != user and gid in os.getgrouplist(
+            if entry.pw_uid != me.pw_uid and gid in os.getgrouplist(
                     entry.pw_name, entry.pw_gid):
                 return "another account has it as a supplementary group"
         return ""

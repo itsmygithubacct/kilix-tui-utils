@@ -144,17 +144,33 @@ swapped between the check and the use.
   "usergroups"), so their directories are 0775; those are used. The group
   must be your process's group and your primary group, have your user
   name, have no member but you in any group line with its gid, and be no
-  other account's primary or supplementary group. These checks need the whole account
-  list, so the manager trusts it only when `/etc/nsswitch.conf` takes
-  `passwd`, `group` and an explicit `initgroups` database from `files` and
-  `systemd` alone, and only when account and group listing does not stop on
-  an error. With no `initgroups` line, the group sources apply. Each other
-  listed account's supplementary gids are also checked through
-  `getgrouplist`: systemd userdb memberships need not appear in the group
-  listing. A failed membership lookup refuses the exemption.
-  With LDAP, sssd, NIS, winbind or `compat` in either line, an unreadable
-  `nsswitch.conf`, or a listing that fails half-way, the group is not
-  taken for private and its write is refused like any other group's.
+  other UID's primary or supplementary group. A duplicate account name
+  cannot identify two different UIDs. The absence proof is deliberately
+  limited to complete local `/etc/passwd` and `/etc/group` files, checked
+  independently of NSS lookup results and action rules. Both files must
+  parse, contain your account/group, and show no other member. Reads are
+  bounded (8 MiB per account file, 64 KiB for `/etc/nsswitch.conf`); exceeding
+  a bound refuses the exemption rather than accepting a prefix.
+  NSS `passwd`, `group`, and explicit `initgroups` sources must still be
+  `files` or `systemd`; absent `initgroups`, the group sources apply.
+  For `systemd`, UID and GID must match, the static userdb directories
+  (`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, `/usr/local/lib/userdb`,
+  `/usr/lib/userdb`) must
+  be empty or absent, and `/run/systemd/userdb` must contain no service
+  except stock `io.systemd.DynamicUser`. That service supplies UID=GID
+  accounts and no supplementary memberships. Additional providers,
+  including homed and the multiplexer, refuse this exemption even when
+  their lookups succeed. Use directories without group write in that case.
+  Unreadable configuration or directories also refuse the exemption.
+  NSS account/group enumeration and each other UID's `getgrouplist` remain
+  additional rejection checks. A successful return is **not** evidence of
+  completeness: libc can return partial results after a provider fails.
+  This proof trusts administrator-controlled files and the installed
+  files/DynamicUser implementations. It describes current configuration,
+  not an atomic account snapshot or the kernel credentials of every running
+  process. It cannot exclude concurrent administrative changes, previously
+  granted groups retained by processes, or groups assigned directly by a
+  privileged service. No account files or service configuration are changed.
   Group write by any other group is refused ("… which is mode 0775 and
   writable by group staff, which is not your private group (it does not
   have your user name)"), and so is write by others whatever the group.
