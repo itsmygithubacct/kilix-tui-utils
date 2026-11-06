@@ -20,6 +20,8 @@ class ArithmeticTests(unittest.TestCase):
             ("7x7+95/2", 96.5), ("what is three times five?", 15),
             ("what is 5% of 512.54", 25.627),
             ("five percent of ten", 0.5),
+            ("how many MB in 1.5 GB", 1500),
+            ("12 inches in cm", 30.48),
         ]:
             self.assertEqual(calc.evaluate(expression), expected, expression)
 

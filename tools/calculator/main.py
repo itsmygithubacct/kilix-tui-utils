@@ -113,10 +113,88 @@ def _eval(node: ast.AST) -> float:
     raise CalculatorError("unsupported expression")
 
 
+_INFO = {
+    "b": 1, "byte": 1, "bytes": 1,
+    "kb": 1_000, "kilobyte": 1_000, "kilobytes": 1_000,
+    "mb": 1_000_000, "megabyte": 1_000_000, "megabytes": 1_000_000,
+    "gb": 1_000_000_000, "gigabyte": 1_000_000_000, "gigabytes": 1_000_000_000,
+    "tb": 1_000_000_000_000, "terabyte": 1_000_000_000_000, "terabytes": 1_000_000_000_000,
+    "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
+}
+_LENGTH = {
+    "mm": 0.001, "millimeter": 0.001, "millimeters": 0.001,
+    "cm": 0.01, "centimeter": 0.01, "centimeters": 0.01,
+    "m": 1, "meter": 1, "meters": 1, "metre": 1, "metres": 1,
+    "km": 1000, "kilometer": 1000, "kilometers": 1000, "kilometre": 1000, "kilometres": 1000,
+    "in": 0.0254, "inch": 0.0254, "inches": 0.0254,
+    "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
+    "yd": 0.9144, "yard": 0.9144, "yards": 0.9144,
+}
+_TEMP = {"c": "c", "celsius": "c", "f": "f", "fahrenheit": "f"}
+_UNIT_LABEL = {
+    "b": "B", "byte": "B", "bytes": "B",
+    "kb": "KB", "kilobyte": "KB", "kilobytes": "KB",
+    "mb": "MB", "megabyte": "MB", "megabytes": "MB",
+    "gb": "GB", "gigabyte": "GB", "gigabytes": "GB",
+    "tb": "TB", "terabyte": "TB", "terabytes": "TB",
+    "kib": "KiB", "mib": "MiB", "gib": "GiB", "tib": "TiB",
+    "mm": "mm", "cm": "cm", "m": "m", "km": "km",
+    "in": "in", "inch": "in", "inches": "in",
+    "ft": "ft", "foot": "ft", "feet": "ft",
+    "yd": "yd", "yard": "yd", "yards": "yd",
+    "c": "°C", "celsius": "°C", "f": "°F", "fahrenheit": "°F",
+}
+_CONVERSION = re.compile(
+    r"^(?:how many (?P<to_a>[a-z]+) (?:are )?in )?"
+    r"(?P<num>-?\d+(?:\.\d+)?)\s*(?P<src>[a-z]+)"
+    r"(?:\s+(?:in|to)\s+(?P<to_b>[a-z]+))?$",
+    re.IGNORECASE,
+)
+
+
+def _unit(name: str) -> tuple[str, float | str]:
+    key = name.lower()
+    if key in _INFO:
+        return "info", _INFO[key]
+    if key in _LENGTH:
+        return "length", _LENGTH[key]
+    if key in _TEMP:
+        return "temp", _TEMP[key]
+    raise KeyError(key)
+
+
+def conversion(expression: str) -> tuple[float, str] | None:
+    """Return a converted value and its unit label, or None."""
+    text = lower(expression).strip()
+    match = _CONVERSION.fullmatch(text)
+    if match is None:
+        return None
+    target = match["to_a"] or match["to_b"]
+    if target is None or (match["to_a"] and match["to_b"]):
+        return None
+    try:
+        src_kind, src = _unit(match["src"])
+        dst_kind, dst = _unit(target)
+    except KeyError:
+        return None
+    if src_kind != dst_kind:
+        raise CalculatorError("those units are not the same kind")
+    number = float(match["num"])
+    if src_kind == "temp":
+        celsius = (number - 32) * 5 / 9 if src == "f" else number
+        value = celsius * 9 / 5 + 32 if dst == "f" else celsius
+    else:
+        value = number * float(src) / float(dst)
+    return float(f"{value:.10g}"), _UNIT_LABEL[target.lower()]
+
+
 def evaluate(expression: str) -> float:
     """Evaluate an arithmetic expression, or raise CalculatorError."""
     if len(expression) > _MAX_DIGITS:
         raise CalculatorError("expression too long")
+    converted = conversion(expression)
+    if converted is not None:
+        return converted[0]
     expression = lower(expression)
     if len(expression) > _MAX_DIGITS:
         raise CalculatorError("expression too long")

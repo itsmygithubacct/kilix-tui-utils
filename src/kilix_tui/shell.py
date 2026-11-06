@@ -25,6 +25,7 @@ from kilix_desk import tango
 # from one file, and a tip earns its row only by saying something the screen
 # does not already show.
 TIPS: dict[str, str] = {
+    "Alarm": "this window stays open until the alarm finishes",
     "Calculator": "answers stay in the list — Up recalls what you typed",
     "CPU": "the busiest processes are listed under the per-core bars",
     "Disk": "Enter scans a filesystem; it stays interruptible while it runs",

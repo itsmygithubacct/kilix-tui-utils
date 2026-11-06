@@ -85,6 +85,7 @@ PROGRAMS = (
     Item("Music", command="kilix-music", sibling="music", verb="tab"),
     Item("Weather", command="kilix-weather", sibling="weather"),
     Item("Calculator", command="kilix-calculator", sibling="calculator"),
+    Item("Alarm", command="kilix-alarm", sibling="alarm"),
     Item("Voice Studio", submenu="voice"),
     Item("Read aloud", command="kilix-tts"),
     Item("Dictation", command="kilix-stt"),

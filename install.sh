@@ -15,6 +15,7 @@ RELOCATABLE="${KILIX_TUI_UTILS_RELOCATABLE:-0}"
 # tool directory : installed command name
 TOOLS=(
     "calculator:kilix-calculator"
+    "alarm:kilix-alarm"
     "cpu:kilix-cpu"
     "temps:kilix-temps"
     "memory:kilix-memory"
