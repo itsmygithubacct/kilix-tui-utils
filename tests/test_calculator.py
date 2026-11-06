@@ -17,6 +17,9 @@ class ArithmeticTests(unittest.TestCase):
             ("2+2", 4), ("2 + 3 * 4", 14), ("(2 + 3) * 4", 20),
             ("7 // 2", 3), ("7 % 2", 1), ("2 ** 10", 1024),
             ("-5 + 3", -2), ("10 / 4", 2.5),
+            ("7x7+95/2", 96.5), ("what is three times five?", 15),
+            ("what is 5% of 512.54", 25.627),
+            ("five percent of ten", 0.5),
         ]:
             self.assertEqual(calc.evaluate(expression), expected, expression)
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import operator
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -41,6 +42,57 @@ class CalculatorError(Exception):
     """A rejected or unevaluable expression."""
 
 
+# Same question and word lowering as Kilix Ask's config/kilix_calc.py.
+_PREFIX = re.compile(
+    r"^(?:please\s+)?(?:what(?:\s+is|'s)|whats|how\s+much\s+is|calculate|compute)\s+",
+    re.IGNORECASE,
+)
+_TENS_ONES = re.compile(
+    r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+    r"[-\s]+(one|two|three|four|five|six|seven|eight|nine)\b",
+    re.IGNORECASE,
+)
+_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19", "twenty": "20", "thirty": "30",
+    "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
+    "eighty": "80", "ninety": "90",
+}
+_WORD = re.compile(r"\b(" + "|".join(_WORDS) + r")\b", re.IGNORECASE)
+_PERCENT_OF = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:%|percent)\s+of\s+(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_PHRASES = (
+    (re.compile(r"\bmultiplied\s+by\b", re.IGNORECASE), "*"),
+    (re.compile(r"\bdivided\s+by\b", re.IGNORECASE), "/"),
+    (re.compile(r"\btimes\b", re.IGNORECASE), "*"),
+    (re.compile(r"\bplus\b", re.IGNORECASE), "+"),
+    (re.compile(r"\bminus\b", re.IGNORECASE), "-"),
+)
+_TIMES_X = re.compile(r"(?<=[\d)])\s*[x×]\s*(?=[\d(])", re.IGNORECASE)
+
+
+def lower(expression: str) -> str:
+    """Turn a question or a written sum into an arithmetic expression."""
+    text = expression.strip().replace("’", "'").replace("×", "x")
+    text = re.sub(r"[?!.]+$", "", text).strip()
+    text = _PREFIX.sub("", text).strip()
+
+    def tens_ones(match: re.Match[str]) -> str:
+        return str(int(_WORDS[match.group(1).lower()]) + int(_WORDS[match.group(2).lower()]))
+
+    text = _TENS_ONES.sub(tens_ones, text)
+    text = _WORD.sub(lambda match: _WORDS[match.group(1).lower()], text)
+    text = _PERCENT_OF.sub(r"((\1)/100)*(\2)", text)
+    for pattern, symbol in _PHRASES:
+        text = pattern.sub(symbol, text)
+    return _TIMES_X.sub("*", text)
+
+
 def _eval(node: ast.AST) -> float:
     if isinstance(node, ast.Expression):
         return _eval(node.body)
@@ -63,6 +115,9 @@ def _eval(node: ast.AST) -> float:
 
 def evaluate(expression: str) -> float:
     """Evaluate an arithmetic expression, or raise CalculatorError."""
+    if len(expression) > _MAX_DIGITS:
+        raise CalculatorError("expression too long")
+    expression = lower(expression)
     if len(expression) > _MAX_DIGITS:
         raise CalculatorError("expression too long")
     try:
@@ -148,6 +203,17 @@ def handle(key: int, state: State) -> bool:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     state = State()
+    if argv[:1] == ["--ask"]:
+        try:
+            lowered = lower(" ".join(argv[1:])).strip()
+            if (not lowered or not re.fullmatch(r"[0-9.+\-*/%()\s]+", lowered)
+                    or not re.search(r"[+\-*/%]", lowered)):
+                return 3
+            print(format_result(evaluate(lowered)))
+            return 0
+        except CalculatorError as error:
+            print(f"kilix-calculator: {error}", file=sys.stderr)
+            return 1
     if argv and argv[0] not in ("--screenshot",):
         # Non-interactive use: `kilix-calculator '2+2'` prints and exits, which
         # makes the tool scriptable and keeps the safe evaluator reusable.
