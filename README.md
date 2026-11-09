@@ -9,6 +9,8 @@ catalog carries it as its one package. This README describes `main`; the
 pinned `b6321de9` is 32 commits ahead on `integration/qemu-tabs` and adds
 `kilix-qemu-manager`.
 
+![The Kilix TUI desktop (`kilix tui`) open at Programs](docs/images/kilix-tui-programs.png)
+
 ## What it does
 
 - The commands below on one shared core: monitors, OS control, files,
@@ -62,6 +64,8 @@ Inside Kilix: `kilix tui`, `kilix launcher`, `kilix panes` (or `F12`), and
 | `kilix-temps` | Live temperature, fan, and thermal-headroom [dashboard](tools/temps/README.md) |
 | `kilix-virtualbox-manager` | Discover, launch, focus, and control VirtualBox VPN machines in Kilix tabs |
 | `kilix-tui` | **The text-native desktop** — see below |
+
+![The Pane Center (`F12`) over a pane: every page and pane, with a live preview of the selected one](docs/images/pane-center.png)
 
 ## How it works
 
