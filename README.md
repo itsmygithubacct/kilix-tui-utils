@@ -3,7 +3,8 @@
 Every Kilix terminal utility in one repository: one version, one test suite, one
 installer, one shared core.
 
-Ships in Plebian-OS 0.2.3: Kilix installs it on first use, and the content
+Ships in Plebian-OS 0.2.3: `pleb install` runs Kilix's installer for it at
+first boot, Kilix also installs it on first use if it is missing, and the content
 catalog carries it as its one package. This README describes `main`; the
 pinned `b6321de9` is 32 commits ahead on `integration/qemu-tabs` and adds
 `kilix-qemu-manager`.
