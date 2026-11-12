@@ -9,6 +9,24 @@ Callers attach byte spans, source identities, and record IDs.
 from __future__ import annotations
 
 
+# Transcript rows (first provider below) that carry session bookkeeping, not
+# conversation text.
+_TRANSCRIPT_METADATA = frozenset({
+    "system", "summary", "file-history-snapshot", "file-history-delta", "last-prompt",
+    "attachment", "queue-operation", "ai-title", "custom-title", "agent-name", "mode",
+    "permission-mode", "session-owner", "atis-latch", "tools-used", "cost-state",
+    "continued-in", "frame-link", "artifact-comment-monitor", "artifact-autoreact-ledger"})
+_API_REQUEST_COPIES = frozenset({"api-request", "api-request-blob", "api-request-shape"})
+# Codex rollout rows and items that carry settings, usage, tool schemas or
+# context state. Conversation text stays in response_item messages and calls.
+_CODEX_TOP_METADATA = frozenset({
+    "session_meta", "turn_context", "token_usage_record", "world_state",
+    "inter_agent_communication_metadata"})
+_CODEX_EVENT_METADATA = frozenset({
+    "token_count", "context_compacted", "turn_aborted", "thread_settings_applied",
+    "thread_goal_updated"})
+
+
 def _pointer(*parts: object) -> str:
     return "".join("/" + str(part).replace("~", "~0").replace("/", "~1") for part in parts)
 
@@ -47,8 +65,12 @@ def adapt_record(provider: str, row: dict) -> dict:
         unsupported("type")
         return result
     if provider == "claude":
-        if kind in {"system", "summary", "file-history-snapshot", "file-history-delta", "last-prompt", "attachment", "queue-operation", "ai-title", "custom-title", "agent-name", "mode", "permission-mode", "agent-name"}:
+        if kind in _TRANSCRIPT_METADATA:
             exclude("system_or_metadata")
+        elif kind in _API_REQUEST_COPIES:
+            # Copies of request messages, system prompts and tool schemas that
+            # the user/assistant rows already record. Never a second citation.
+            exclude("api_request_copy")
         elif kind in {"user", "assistant"}:
             if row.get("isMeta") or row.get("isSidechain"):
                 exclude("synthetic_or_sidechain")
@@ -166,9 +188,46 @@ def adapt_record(provider: str, row: dict) -> dict:
                 if isinstance(payload.get("input"), str):
                     emit("assistant", "tool_request", payload["input"], _pointer("payload", "input"), tool_id=payload.get("call_id"))
             elif item_type in {"function_call_output", "custom_tool_call_output"}:
-                emit("tool", "tool_result", payload.get("output"), _pointer("payload", "output"), tool_id=payload.get("call_id"))
+                output = payload.get("output")
+                if isinstance(output, list):
+                    # Current rollouts store tool output as content parts.
+                    for i, part in enumerate(output):
+                        typ = part.get("type") if isinstance(part, dict) else None
+                        if not isinstance(typ, str):
+                            unsupported("output part")
+                        elif typ in {"input_text", "output_text"}:
+                            emit("tool", "tool_result", part.get("text"), _pointer("payload", "output", i, "text"),
+                                 tool_id=payload.get("call_id"))
+                        elif typ in {"input_image", "output_image", "image", "audio", "input_audio"}:
+                            exclude("binary_payload")
+                        else:
+                            unsupported(typ)
+                else:
+                    emit("tool", "tool_result", output, _pointer("payload", "output"), tool_id=payload.get("call_id"))
+            elif item_type == "agent_message":
+                # A message between agents of one Codex run (author/recipient
+                # paths). It is neither this thread's user nor its assistant,
+                # so it stays searchable without being cited as either.
+                content = payload.get("content")
+                if not isinstance(content, list):
+                    unsupported("agent message content")
+                    return result
+                for i, part in enumerate(content):
+                    typ = part.get("type") if isinstance(part, dict) else None
+                    if not isinstance(typ, str):
+                        unsupported("content part")
+                    elif typ in {"input_text", "output_text"}:
+                        emit("unknown", "message", part.get("text"), _pointer("payload", "content", i, "text"))
+                    elif typ == "encrypted_content":
+                        exclude("encrypted_payload")
+                    else:
+                        unsupported(typ)
             elif item_type in {"reasoning", "compaction"}:
                 exclude("reasoning_or_summary")
+            elif item_type == "additional_tools":
+                exclude("system_or_developer")
+            elif item_type == "configuration_update":
+                exclude("metadata")
             else:
                 unsupported(item_type)
         elif kind == "event_msg":
@@ -184,12 +243,31 @@ def adapt_record(provider: str, row: dict) -> dict:
                 # Duplicated by response_item in current rollouts; cannot prove a
                 # standalone event is the authoritative user turn.
                 exclude("event_message_mirror")
-            elif event in {"token_count", "context_compacted", "turn_aborted"}:
+            elif event == "item_completed":
+                # The app-server's per-item view of the same turn: messages
+                # repeat response_item text, and command items repeat (often
+                # untruncated) the output the model was given as a call output.
+                exclude("event_item_mirror")
+            elif event in _CODEX_EVENT_METADATA:
                 exclude("metadata")
             else:
                 unsupported(event)
-        elif kind in {"session_meta", "turn_context"}:
+        elif kind in _CODEX_TOP_METADATA:
             exclude("system_or_metadata")
+        elif kind in {"compacted", "retained_context"}:
+            exclude("reasoning_or_summary")
+        elif kind == "realtime_item":
+            event = payload.get("type")
+            if not isinstance(event, str):
+                unsupported("realtime item type")
+            elif event == "transcript_segment":
+                # Speech transcript. Most segments repeat a response_item
+                # message, so it stays searchable without a second citation.
+                emit("unknown", "message", payload.get("text"), _pointer("payload", "text"))
+            elif event in {"realtime_session_started", "realtime_session_closed", "bem_item_promoted"}:
+                exclude("metadata")
+            else:
+                unsupported(event)
         else:
             unsupported(kind)
     else:
