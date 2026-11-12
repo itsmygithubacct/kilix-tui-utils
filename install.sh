@@ -28,6 +28,7 @@ TOOLS=(
     "rollout_resume:kilix-rollout-resume"
     "help_search:kilix-help-search"
     "session_log:kilix-session-log"
+    "tool_errors:kilix-tool-errors"
     "switcher:kilix-switch"
     "switcher:kilix-panes"
     "weather:kilix-weather"
