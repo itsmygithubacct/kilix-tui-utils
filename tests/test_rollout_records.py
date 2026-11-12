@@ -79,6 +79,57 @@ class RecordsTests(unittest.TestCase):
         voice["payload"]["type"] = "made_up"
         self.assertEqual(adapt_record("codex", voice)["errors"][0]["code"], "unsupported_record")
 
+    def test_grok_session_updates(self):
+        def update(body, method="session/update", stamp=1794300000):
+            return {"timestamp": stamp, "method": method,
+                    "params": {"sessionId": "g-1", "update": body}}
+        cases = [
+            (update({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "fix it"}}),
+             [("user", "message", "fix it", "/params/update/content/text", None)], []),
+            (update({"sessionUpdate": "user_message_chunk",
+                     "content": {"type": "text", "text": "<system-reminder>\nx"}}), [], ["synthetic_user_wrapper"]),
+            (update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "done"}}),
+             [("assistant", "message", "done", "/params/update/content/text", None)], []),
+            (update({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hm"}}),
+             [], ["reasoning_or_summary"]),
+            (update({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "run_terminal_command",
+                     "rawInput": {"command": "make"}, "_meta": {"x.ai/tool": {"name": "run_terminal_command"}}}),
+             [("assistant", "tool_request", "run_terminal_command", "/params/update/_meta/x.ai~1tool/name", "c1"),
+              ("assistant", "tool_request", "make", "/params/update/rawInput/command", "c1")], []),
+            (update({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "title": "Execute",
+                     "content": [{"type": "content", "content": {"type": "text", "text": "Build it"}}]}),
+             [("assistant", "tool_request", "Build it", "/params/update/content/0/content/text", "c1")], []),
+            (update({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed",
+                     "content": [{"type": "content", "content": {"type": "text", "text": "make: *** Error 2"}},
+                                 {"type": "diff", "path": "a", "oldText": "", "newText": "b"}],
+                     "rawOutput": {"type": "Bash", "exit_code": 2}}),
+             [("tool", "tool_result", "make: *** Error 2", "/params/update/content/0/content/text", "c1")],
+             ["nontext_tool_payload"]),
+            (update({"sessionUpdate": "tool_call_update", "toolCallId": "c2", "status": "failed",
+                     "rawOutput": {"type": "MCP", "output": {"Error": "refused"}}}),
+             [("tool", "tool_result", "refused", "/params/update/rawOutput/output/Error", "c2")], []),
+            (update({"sessionUpdate": "tool_call_update", "toolCallId": "c3", "rawInput": {}}), [], ["metadata"]),
+            (update({"sessionUpdate": "turn_completed"}, method="_x.ai/session/update"),
+             [("unknown", "lifecycle", "turn_completed", "/params/update/sessionUpdate", None)], []),
+            (update({"sessionUpdate": "session_recap", "summary": "s"}, method="_x.ai/session/update"),
+             [], ["reasoning_or_summary"]),
+            (update({"sessionUpdate": "background_tasks", "tasks": []}, method="_x.ai/session/update"),
+             [], ["metadata"]),
+        ]
+        for row, records, excluded in cases:
+            with self.subTest(row=row):
+                out = adapt_record("grok", row)
+                self.assertEqual(out["errors"], [])
+                self.assertEqual([(r["role"], r["channel"], r["text"], r["json_pointer"], r["tool_call_id"])
+                                  for r in out["records"]], records)
+                self.assertEqual(out["excluded"], excluded)
+        first = adapt_record("grok", cases[0][0])["records"][0]
+        self.assertEqual((first["timestamp"], first["timestamp_basis"]), ("2026-11-10T08:40:00Z", "source"))
+        for row in (update({"sessionUpdate": "made_up"}), {"method": "other", "params": {}},
+                    update({"sessionUpdate": "tool_call_update", "content": [{"type": "made_up"}]})):
+            with self.subTest(row=row):
+                self.assertEqual(adapt_record("grok", row)["errors"][0]["code"], "unsupported_record")
+
     def test_unhashable_discriminators_are_reported(self):
         cases = [("claude", {"type": []}), ("claude", {"type": {}}),
                  ("claude", {"type": "user", "message": {"role": [], "content": "x"}}),

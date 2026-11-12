@@ -8,6 +8,8 @@ Callers attach byte spans, source identities, and record IDs.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 
 # Transcript rows (first provider below) that carry session bookkeeping, not
 # conversation text.
@@ -25,20 +27,44 @@ _CODEX_TOP_METADATA = frozenset({
 _CODEX_EVENT_METADATA = frozenset({
     "token_count", "context_compacted", "turn_aborted", "thread_settings_applied",
     "thread_goal_updated"})
+# Grok session updates (updates.jsonl): ACP rows under session/update and
+# Grok's own under _x.ai/session/update. Each message is one row.
+_GROK_METHODS = frozenset({"session/update", "_x.ai/session/update"})
+_GROK_METADATA = frozenset({
+    "plan", "current_mode_update", "background_tasks", "task_backgrounded", "task_completed",
+    "goal_updated", "auto_compact_started", "auto_compact_completed", "auto_compact_cancelled",
+    "auto_compact_failed", "compaction_checkpoint", "retry_state", "subagent_spawned",
+    "subagent_finished", "memory_flush_started", "memory_flush_completed", "memory_dream_queued",
+    "memory_dream_started", "memory_dream_completed", "memory_session_saved",
+    "scheduled_task_created", "scheduled_task_deleted"})
+_GROK_SUMMARIES = frozenset({"agent_thought_chunk", "session_recap"})
+_SYNTHETIC_USER = ("<system-reminder>", "<task-notification>", "<local-command-stdout>",
+                   "<monitor-event")
 
 
 def _pointer(*parts: object) -> str:
     return "".join("/" + str(part).replace("~", "~0").replace("/", "~1") for part in parts)
 
 
+def _row_time(row: dict) -> str | None:
+    stamp = row.get("timestamp")
+    if isinstance(stamp, str):
+        return stamp
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and 0 < stamp < 1e11:
+        # Grok writes epoch seconds.
+        return datetime.fromtimestamp(stamp, timezone.utc).isoformat().replace("+00:00", "Z")
+    return None
+
+
 def adapt_record(provider: str, row: dict) -> dict:
-    """Export eligible text from a Claude or Codex JSONL row.
+    """Export eligible text from a Claude, Codex or Grok JSONL row.
 
     Unsupported variants are explicit errors. Exclusions are categorical and
     should be copied into source coverage. Text is kept byte-for-byte after
     JSON decoding; embedded terminal controls remain for the renderer to escape.
     """
     result = {"records": [], "excluded": [], "errors": []}
+    stamp = _row_time(row) if isinstance(row, dict) else None
     def emit(role: str, channel: str, text: object, pointer: str,
              *, tool_id: object = None, turn_id: object = None) -> None:
         if not isinstance(text, str):
@@ -46,8 +72,8 @@ def adapt_record(provider: str, row: dict) -> dict:
             return
         result["records"].append({
             "role": role, "channel": channel, "text": text,
-            "timestamp": row.get("timestamp") if isinstance(row.get("timestamp"), str) else None,
-            "timestamp_basis": "source" if isinstance(row.get("timestamp"), str) else "unknown",
+            "timestamp": stamp,
+            "timestamp_basis": "source" if stamp else "unknown",
             "turn_id": turn_id if isinstance(turn_id, str) else None,
             "tool_call_id": tool_id if isinstance(tool_id, str) else None,
             "json_pointer": pointer,
@@ -59,6 +85,10 @@ def adapt_record(provider: str, row: dict) -> dict:
         result["errors"].append({"code": "unsupported_record", "message": f"unsupported {provider} record: {str(what)[:160]}"})
     if not isinstance(row, dict):
         unsupported("non-object")
+        return result
+    if provider == "grok":
+        # Grok rows are JSON-RPC notifications with no "type" field.
+        _adapt_grok(row, emit, exclude, unsupported)
         return result
     kind = row.get("type")
     if not isinstance(kind, str):
@@ -273,3 +303,84 @@ def adapt_record(provider: str, row: dict) -> dict:
     else:
         unsupported("provider")
     return result
+
+
+def _adapt_grok(row: dict, emit, exclude, unsupported) -> None:
+    if row.get("method") not in _GROK_METHODS:
+        unsupported(row.get("method"))
+        return
+    params = row.get("params")
+    update = params.get("update") if isinstance(params, dict) else None
+    event = update.get("sessionUpdate") if isinstance(update, dict) else None
+    if not isinstance(event, str):
+        unsupported("session update")
+        return
+    base = ("params", "update")
+    call = update.get("toolCallId")
+    if event in {"user_message_chunk", "agent_message_chunk"}:
+        content = update.get("content")
+        kind = content.get("type") if isinstance(content, dict) else None
+        if kind == "image":
+            exclude("binary_payload")
+        elif kind != "text":
+            unsupported(f"{event} content")
+        elif event == "agent_message_chunk":
+            emit("assistant", "message", content.get("text"), _pointer(*base, "content", "text"))
+        elif isinstance(content.get("text"), str) and content["text"].lstrip().startswith(_SYNTHETIC_USER):
+            exclude("synthetic_user_wrapper")
+        else:
+            emit("user", "message", content.get("text"), _pointer(*base, "content", "text"))
+    elif event == "tool_call":
+        meta = update.get("_meta")
+        tool = meta.get("x.ai/tool") if isinstance(meta, dict) else None
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+            emit("assistant", "tool_request", tool["name"], _pointer(*base, "_meta", "x.ai/tool", "name"),
+                 tool_id=call)
+        else:
+            emit("assistant", "tool_request", update.get("title"), _pointer(*base, "title"), tool_id=call)
+        raw = update.get("rawInput")
+        if isinstance(raw, dict) and isinstance(raw.get("command"), str):
+            emit("assistant", "tool_request", raw["command"], _pointer(*base, "rawInput", "command"),
+                 tool_id=call)
+    elif event == "tool_call_update":
+        finished = update.get("status") in {"completed", "failed"}
+        content = update.get("content")
+        if content is None:
+            output = update.get("rawOutput")
+            detail = output.get("output") if isinstance(output, dict) and output.get("type") == "MCP" else None
+            if isinstance(detail, str):
+                emit("tool", "tool_result", detail, _pointer(*base, "rawOutput", "output"), tool_id=call)
+            elif isinstance(detail, dict) and any(isinstance(v, str) for v in detail.values()):
+                for key, value in detail.items():
+                    if isinstance(value, str):
+                        emit("tool", "tool_result", value, _pointer(*base, "rawOutput", "output", key),
+                             tool_id=call)
+            elif output is not None:
+                exclude("nontext_tool_payload")
+            else:
+                # A progress row repeating the call's title and input.
+                exclude("metadata")
+            return
+        if not isinstance(content, list):
+            unsupported("tool update content")
+            return
+        for i, item in enumerate(content):
+            kind = item.get("type") if isinstance(item, dict) else None
+            inner = item.get("content") if kind == "content" else None
+            inner_kind = inner.get("type") if isinstance(inner, dict) else None
+            if kind == "content" and inner_kind == "text":
+                # Before completion the text is the caller's description of the call.
+                emit("tool" if finished else "assistant", "tool_result" if finished else "tool_request",
+                     inner.get("text"), _pointer(*base, "content", i, "content", "text"), tool_id=call)
+            elif kind == "content" and inner_kind == "image" or kind == "diff":
+                exclude("nontext_tool_payload")
+            else:
+                unsupported(f"tool update {kind}")
+    elif event == "turn_completed":
+        emit("unknown", "lifecycle", event, _pointer(*base, "sessionUpdate"))
+    elif event in _GROK_SUMMARIES:
+        exclude("reasoning_or_summary")
+    elif event in _GROK_METADATA:
+        exclude("metadata")
+    else:
+        unsupported(event)
