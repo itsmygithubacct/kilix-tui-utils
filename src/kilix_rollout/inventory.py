@@ -15,6 +15,7 @@ import time
 from urllib.parse import unquote
 
 PROVIDERS = ("claude", "codex", "grok", "omp", "raw")
+VERSION = 1
 METADATA_BYTES = 65536
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
@@ -177,7 +178,7 @@ def describe(path: Path | str, provider: str, *, root: Path | None = None, tier:
     title = title or prompt or " · ".join(part for part in (project, command) if part)
     title = title or (provider + " · " + (session[:13] or name))
     key = hashlib.sha256((provider + "\0" + str(path)).encode()).hexdigest()[:24]
-    return {"inventory_id": "log-" + key, "provider": provider, "session_id": session,
+    return {"inventory_id": "log-" + key, "inventory_version": VERSION, "provider": provider, "session_id": session,
             "title": title, "cwd": cwd, "command": command, "project": project,
             "path": str(path), "root": str(root.absolute()) if root else "", "tier": tier,
             "updated": info.st_mtime, "size": info.st_size, "device": info.st_dev,
@@ -251,7 +252,7 @@ def discover(provider: str | None = None, *, locations: dict | None = None,
                     try:
                         old = (cached or {}).get((key, str(path)))
                         info = path.lstat()
-                        if key != "raw" and old and all(old.get(field) == value for field, value in (
+                        if key != "raw" and old and old.get("inventory_version") == VERSION and all(old.get(field) == value for field, value in (
                                 ("size", info.st_size), ("device", info.st_dev), ("inode", info.st_ino),
                                 ("mtime_ns", info.st_mtime_ns), ("ctime_ns", info.st_ctime_ns))):
                             item = dict(old, root=str(root), tier=tier)
