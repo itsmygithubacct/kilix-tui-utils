@@ -60,6 +60,35 @@ class RecordsTests(unittest.TestCase):
                     {"type": "message", "message": {"role": "assistant", "content": [{"type": []}]}}):
             self.assertEqual(adapt_record("omp", row)["errors"][0]["code"], "unsupported_record")
 
+    def test_omp_subagent_session_init_is_bookkeeping_and_unknown_rows_still_fail(self):
+        stamp = "2026-01-02T03:04:05.006Z"
+        header = [
+            {"type": "title", "v": 1, "title": "", "pad": " " * 16, "updatedAt": stamp},
+            {"type": "session", "version": 3, "id": "child", "parentSession": "/sessions/p/parent.jsonl",
+             "cwd": "/workspace", "timestamp": stamp},
+            {"type": "model_change", "id": "a1", "parentId": None, "model": "m", "timestamp": stamp},
+            {"type": "thinking_level_change", "id": "a2", "parentId": "a1", "thinkingLevel": "high",
+             "timestamp": stamp},
+            {"type": "session_init", "id": "a3", "parentId": "a2", "timestamp": stamp, "agent": "scout",
+             "systemPrompt": "Subagent rules", "task": "Map the parser", "tools": ["read"], "spawns": "",
+             "readOnly": True, "outputSchema": {"type": "object"}},
+            {"type": "message", "id": "a4", "parentId": "a3", "timestamp": stamp, "message": {
+                "role": "user", "content": [{"type": "text", "text": "Assignment: Map the parser"}]}},
+        ]
+        for provider in ("omp", "qwen"):
+            with self.subTest(provider=provider):
+                outs = [adapt_record(provider, row) for row in header]
+                self.assertEqual([out["errors"] for out in outs], [[]] * len(header))
+                self.assertEqual(outs[4], {"records": [], "excluded": ["system_or_metadata"], "errors": []})
+                # The assignment reaches evidence once, through the user message.
+                self.assertEqual([(r["role"], r["text"], r["json_pointer"]) for out in outs for r in out["records"]],
+                                 [("user", "Assignment: Map the parser", "/message/content/0/text")])
+                for kind in ("session_init_v2", "Session_init", "session-init", "subagent_init"):
+                    out = adapt_record(provider, {"type": kind, "task": "t", "systemPrompt": "s"})
+                    self.assertEqual((out["records"], out["excluded"]), ([], []))
+                    self.assertEqual(out["errors"], [{"code": "unsupported_record",
+                                                      "message": f"unsupported {provider} record: {kind}"}])
+
     def test_codex_channels(self):
         def row(channel):
             return {"type": "response_item", "payload": {"type": "message",

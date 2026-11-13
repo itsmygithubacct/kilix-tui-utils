@@ -313,13 +313,15 @@ def _adapt_omp(row: dict, emit, exclude, unsupported) -> None:
 
     Custom notifications are searchable but are not attributed to the user.
     Compaction and branch summaries are not original conversation evidence.
+    A subagent's session_init records its agent definition and system prompt,
+    plus the task its first user message delivers as evidence.
     """
     kind = row.get("type")
     if not isinstance(kind, str):
         unsupported("type")
         return
     if kind in {"session", "title", "title_change", "model_change", "thinking_level_change",
-                "custom", "label", "session_info"}:
+                "custom", "label", "session_info", "session_init"}:
         exclude("system_or_metadata")
         return
     if kind in {"compaction", "branch_summary"}:
