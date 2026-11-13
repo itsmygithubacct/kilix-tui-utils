@@ -73,6 +73,11 @@ class InventoryTests(unittest.TestCase):
         for letter in "parser":
             state.filter.handle(ord(letter))
         self.assertEqual([r["id"] for r in state.view()], ["recent"])
+        state.selected, state.viewing, state.directory = 0, None, str(self.root)
+        state.items[0]["title"] = "Parser repair " + "long title " * 20
+        frame = module.app.render_to_text(module.render, state, width=80, height=24)
+        self.assertIn("[recent]", frame)
+        self.assertIn("Parser repair", frame)
 
     def test_metadata_is_bounded_and_control_characters_do_not_label_rows(self):
         path = self.write("omp/session.jsonl", [{"type": "title", "title": "Title\x1b\nspoof"},

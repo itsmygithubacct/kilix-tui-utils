@@ -143,7 +143,7 @@ def render(surface, state: State) -> None:
         shell.put(
             surface, row, body.left,
             f"{marker} {stamp}  {proc.human_bytes(int(item['size'])):>8}  "
-            f"{item.get('title', item['id'])} {tag} · {str(item['id'])[:13]}",
+            f"{tag:<10} {item.get('title', item['id'])} · {str(item['id'])[:13]}",
             shell.tango.attr("selected") if selected else 0,
         )
 
