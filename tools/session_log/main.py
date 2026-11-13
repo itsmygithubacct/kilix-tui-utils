@@ -1,4 +1,4 @@
-"""kilix-session-log — browse pane transcripts across both storage tiers.
+"""kilix-session-log — browse named pane transcripts across all storage tiers.
 
 Kilix keeps recent transcripts uncompressed and archives older ones with zstd.
 Which tier a session landed in is an implementation detail, so this lists both
@@ -7,6 +7,9 @@ together and opens either without the reader needing to know.
 from __future__ import annotations
 
 import subprocess
+from collections import deque
+import select
+import time
 
 import os
 import sys
@@ -16,55 +19,55 @@ sys.path.insert(0, os.path.join(
     "src"))
 
 from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
+from kilix_rollout.inventory import raw_entries, transcript_root  # noqa: E402
 
 
 def transcript_dir() -> str:
-    if explicit := os.environ.get("KILIX_TRANSCRIPT_DIR"):
-        return explicit
-    state = os.environ.get("KILIX_STATE_DIRECTORY") or os.path.join(
-        os.path.expanduser("~"), ".local/gpu_terminal/kilix/state")
-    return os.path.join(state, "transcripts")
+    return str(transcript_root())
 
 
 def entries(directory: str) -> list[dict[str, object]]:
-    found: list[dict[str, object]] = []
-    for tier, folder, suffix in (("live", directory, ".log"),
-                                 ("archived", os.path.join(directory, "archive"),
-                                  ".log.zst")):
-        try:
-            names = os.listdir(folder)
-        except OSError:
-            continue
-        for name in names:
-            if not name.endswith(suffix):
-                continue
-            path = os.path.join(folder, name)
-            try:
-                info = os.stat(path)
-            except OSError:
-                continue
-            found.append({
-                "id": name[: -len(suffix)], "tier": tier, "path": path,
-                "size": info.st_size, "mtime": info.st_mtime,
-            })
-    found.sort(key=lambda item: item["mtime"], reverse=True)
-    return found
+    return [item | {"id": item["session_id"], "mtime": item["updated"]}
+            for item in raw_entries(directory)]
 
 
 def read_transcript(entry: dict[str, object], limit: int = 200000) -> str:
     """Return a transcript's text, decompressing an archived one."""
     path = str(entry["path"])
-    if entry["tier"] == "archived":
+    if path.endswith(".zst"):
+        process = None
         try:
-            result = subprocess.run(["zstd", "-dcq", "--", path],
-                                    capture_output=True, timeout=60, check=False)
-            data = result.stdout
+            process = subprocess.Popen(["zstd", "-dcq", "--", path], stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            parts, size = deque(), 0
+            deadline = time.monotonic() + 30
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                    return "(archive read timed out)"
+                part = os.read(process.stdout.fileno(), 65536)
+                if not part:
+                    break
+                parts.append(part)
+                size += len(part)
+                while parts and size - len(parts[0]) >= limit:
+                    size -= len(parts.popleft())
+            if process.wait(timeout=max(0.01, deadline - time.monotonic())):
+                return "(archive could not be decoded)"
+            data = b"".join(parts)[-limit:]
         except (OSError, subprocess.SubprocessError):
             return "(zstd is required to read this archived transcript)"
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                process.stdout.close()
     else:
         try:
             with open(path, "rb") as handle:
-                data = handle.read()
+                handle.seek(max(0, os.fstat(handle.fileno()).st_size - limit))
+                data = handle.read(limit)
         except OSError as error:
             return f"({error})"
     return data[-limit:].decode("utf-8", errors="replace")
@@ -82,7 +85,8 @@ class State:
     def view(self) -> list:
         """The transcripts on screen; every reader goes through this so the
         cursor cannot index past a filtered list."""
-        return self.filter.apply(self.items, key=lambda row: row["id"])
+        return self.filter.apply(self.items, key=lambda row: " ".join(str(row.get(key, ""))
+                                 for key in ("id", "title", "cwd", "command", "tier")))
 
 
 def render(surface, state: State) -> None:
@@ -93,7 +97,7 @@ def render(surface, state: State) -> None:
             title="Session Logs",
             sections=("Sessions", "Transcript"),
             active=1,
-            summary=f"{item['id']} · {item['tier']}",
+            summary=f"{item.get('title', item['id'])} · {item['id']} · {item['tier']}",
             footer="↑/↓ scroll · Esc back · q quit",
         )
         for index, line in enumerate(
@@ -104,6 +108,7 @@ def render(surface, state: State) -> None:
     rows = state.view()
     state.selected = max(0, min(state.selected, max(0, len(rows) - 1)))
     live = sum(int(i["size"]) for i in state.items if i["tier"] == "live")
+    recent = sum(int(i["size"]) for i in state.items if i["tier"] == "recent")
     archived = sum(int(i["size"]) for i in state.items if i["tier"] == "archived")
     body = shell.draw(
         surface,
@@ -112,6 +117,7 @@ def render(surface, state: State) -> None:
         active=0,
         summary=state.filter.summary(len(rows)) or (
             f"live {proc.human_bytes(live)} · "
+            f"recent {proc.human_bytes(recent)} · "
             f"archived {proc.human_bytes(archived)} · "
             f"{len(state.items)} panes"
         ),
@@ -133,11 +139,11 @@ def render(surface, state: State) -> None:
         marker = "▶" if selected else " "
         stamp = _time.strftime("%Y-%m-%d %H:%M",
                                _time.localtime(float(item["mtime"])))
-        tag = "[archived]" if item["tier"] == "archived" else ""
+        tag = f"[{item['tier']}]"
         shell.put(
             surface, row, body.left,
             f"{marker} {stamp}  {proc.human_bytes(int(item['size'])):>8}  "
-            f"{item['id']} {tag}",
+            f"{item.get('title', item['id'])} {tag} · {str(item['id'])[:13]}",
             shell.tango.attr("selected") if selected else 0,
         )
 
