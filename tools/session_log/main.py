@@ -1,8 +1,8 @@
 """kilix-session-log — browse named pane transcripts across all storage tiers.
 
-Kilix keeps recent transcripts uncompressed and archives older ones with zstd.
-Which tier a session landed in is an implementation detail, so this lists both
-together and opens either without the reader needing to know.
+Kilix keeps live transcripts and compresses its recent and archived tiers with
+zstd. The list combines all three tiers, uses project and command names, and
+places the most recently modified recordings first.
 """
 from __future__ import annotations
 

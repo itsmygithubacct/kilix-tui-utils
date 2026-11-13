@@ -27,7 +27,7 @@ collapses that into one checkout pinned once by Kilix’s dependency closure.
 | `kilix-launcher` | Launcher catalog: stack programs, discovered XDG apps, your `.desktop` launchers, stack scripts, a run-a-command row, and the laptop session profiles (running ones marked, Enter opens or closes them through `kilix laptop`); `kilix launcher` opens it |
 | `kilix-package` | Installed packages, read-only |
 | `kilix-rollout-resume` | Recover Claude Code, Codex, and Kimi Code sessions; install and update those agents |
-| `kilix-session-log` | Pane transcripts across the live and archived tiers |
+| `kilix-session-log` | Live, recent, and archived pane transcripts, named by project and command, newest first |
 | `kilix-panes` / `kilix-switch` | Pane Center TUI plus pane/session/broker CLI, live text, idle detection, and bounded messaging |
 | `kilix-weather` | Forecast from Open-Meteo |
 | `kilix-cameras` | Camera views and stream profiles for kilix-rtsp — view a camera, mosaic a group, `n` writes a profile to `cameras.conf` |

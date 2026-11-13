@@ -86,7 +86,7 @@ def _text(content: object) -> str:
 
 def _codex_titles(locations: list[Path]) -> dict[str, str]:
     titles = {}
-    for home in {Path(root).parent for root in locations}:
+    for home in {Path(root).expanduser().parent for root in locations}:
         path = home / "session_index.jsonl"
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)

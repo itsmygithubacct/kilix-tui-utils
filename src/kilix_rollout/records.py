@@ -17,7 +17,7 @@ _TRANSCRIPT_METADATA = frozenset({
     "system", "summary", "file-history-snapshot", "file-history-delta", "last-prompt",
     "attachment", "queue-operation", "ai-title", "custom-title", "agent-name", "mode",
     "permission-mode", "session-owner", "atis-latch", "tools-used", "cost-state",
-    "continued-in", "frame-link", "artifact-comment-monitor", "artifact-autoreact-ledger"})
+    "continued-in", "frame-link", "fork-context-ref", "artifact-comment-monitor", "artifact-autoreact-ledger"})
 _API_REQUEST_COPIES = frozenset({"api-request", "api-request-blob", "api-request-shape"})
 # Codex rollout rows and items that carry settings, usage, tool schemas or
 # context state. Conversation text stays in response_item messages and calls.

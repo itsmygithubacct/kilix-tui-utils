@@ -73,7 +73,7 @@ class RecordsTests(unittest.TestCase):
     def test_current_bookkeeping_rows_are_excluded_without_errors(self):
         cases = [("claude", {"type": t, "sessionId": "s"}, "system_or_metadata") for t in (
                     "session-owner", "atis-latch", "tools-used", "cost-state", "continued-in",
-                    "frame-link", "artifact-comment-monitor", "artifact-autoreact-ledger")]
+                    "frame-link", "fork-context-ref", "artifact-comment-monitor", "artifact-autoreact-ledger")]
         cases += [("claude", {"type": t, "sessionId": "s", "message": {"role": "user", "content": "copy"}},
                    "api_request_copy") for t in ("api-request", "api-request-blob", "api-request-shape")]
         cases += [("codex", {"type": t, "payload": {}}, "system_or_metadata") for t in (
