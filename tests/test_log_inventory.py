@@ -91,6 +91,15 @@ class InventoryTests(unittest.TestCase):
         limited = discover(locations={"omp": [self.root / "omp"]}, max_entries=0)
         self.assertFalse(limited["complete"])
 
+    def test_codex_fork_keeps_child_identity_and_name(self):
+        path = self.write("codex/child.jsonl", [
+            {"type": "session_meta", "payload": {"id": "child", "forked_from_id": "parent",
+             "agent_nickname": "Parser worker", "cwd": "/workspace/child"}},
+            {"type": "session_meta", "payload": {"id": "parent", "cwd": "/workspace/parent"}}])
+        item = describe(path, "codex")
+        self.assertEqual((item["session_id"], item["title"], item["cwd"]),
+                         ("child", "Parser worker", "/workspace/child"))
+
     def test_saved_codex_names_override_prompts_without_rereading_unchanged_logs(self):
         session = "12345678-1234-1234-1234-123456789abc"
         path = self.write("codex/sessions/2026/11/13/rollout.jsonl", [

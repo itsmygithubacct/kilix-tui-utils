@@ -123,6 +123,7 @@ def describe(path: Path | str, provider: str, *, root: Path | None = None, tier:
     session = (path.parent.name if provider == "grok" else matches[-1] if matches else
                name if provider == "raw" else "")
     title = cwd = prompt = command = ""
+    codex_meta = False
     if provider == "raw":
         base = root or (path.parent.parent if path.parent.name in ("recent", "archive") else path.parent)
         try:
@@ -139,9 +140,12 @@ def describe(path: Path | str, provider: str, *, root: Path | None = None, tier:
             if provider == "codex":
                 payload = row.get("payload")
                 if isinstance(payload, dict):
-                    if kind == "session_meta":
+                    if kind == "session_meta" and not codex_meta:
                         session = label(payload.get("id"), 256) or session
                         cwd = label(payload.get("cwd"), 1024) or cwd
+                        title = label(payload.get("agent_nickname")) or title
+                        # A fork can copy parent headers later in the file.
+                        codex_meta = bool(payload.get("id"))
                     if kind == "response_item" and payload.get("role") == "user" and not prompt:
                         prompt = label(_text(payload.get("content")))
             elif provider == "claude":
