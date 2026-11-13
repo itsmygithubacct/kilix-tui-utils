@@ -57,7 +57,7 @@ def _row_time(row: dict) -> str | None:
 
 
 def adapt_record(provider: str, row: dict) -> dict:
-    """Export eligible text from a Claude, Codex or Grok JSONL row.
+    """Export eligible text from a Claude, Codex, Grok or OMP JSONL row.
 
     Unsupported variants are explicit errors. Exclusions are categorical and
     should be copied into source coverage. Text is kept byte-for-byte after
@@ -89,6 +89,9 @@ def adapt_record(provider: str, row: dict) -> dict:
     if provider == "grok":
         # Grok rows are JSON-RPC notifications with no "type" field.
         _adapt_grok(row, emit, exclude, unsupported)
+        return result
+    if provider in {"omp", "qwen"}:
+        _adapt_omp(row, emit, exclude, unsupported)
         return result
     kind = row.get("type")
     if not isinstance(kind, str):
@@ -303,6 +306,75 @@ def adapt_record(provider: str, row: dict) -> dict:
     else:
         unsupported("provider")
     return result
+
+
+def _adapt_omp(row: dict, emit, exclude, unsupported) -> None:
+    """OMP's persisted messages, including Qwen Token Plan sessions.
+
+    Custom notifications are searchable but are not attributed to the user.
+    Compaction and branch summaries are not original conversation evidence.
+    """
+    kind = row.get("type")
+    if not isinstance(kind, str):
+        unsupported("type")
+        return
+    if kind in {"session", "title", "title_change", "model_change", "thinking_level_change",
+                "custom", "label", "session_info"}:
+        exclude("system_or_metadata")
+        return
+    if kind in {"compaction", "branch_summary"}:
+        exclude("reasoning_or_summary")
+        return
+    if kind == "custom_message":
+        message, base, role = row, "", "unknown"
+    elif kind == "message" and isinstance(row.get("message"), dict):
+        message, base = row["message"], "/message"
+        role = message.get("role")
+        if not isinstance(role, str):
+            unsupported("message role")
+            return
+        if role in {"system", "developer"}:
+            exclude("system_or_developer")
+            return
+        if role == "bashExecution":
+            emit("unknown", "tool_request", message.get("command"), base + "/command")
+            emit("tool", "tool_result", message.get("output"), base + "/output")
+            return
+        if role not in {"user", "assistant", "toolResult"}:
+            unsupported("message role")
+            return
+        role = "tool" if role == "toolResult" else role
+    else:
+        unsupported(kind)
+        return
+    channel = "tool_result" if role == "tool" else "message"
+    call = message.get("toolCallId") if role == "tool" else None
+    content = message.get("content")
+    if isinstance(content, str):
+        emit(role, channel, content, base + "/content", tool_id=call)
+    elif isinstance(content, list):
+        for i, part in enumerate(content):
+            typ = part.get("type") if isinstance(part, dict) else None
+            pointer = base + _pointer("content", i)
+            if not isinstance(typ, str):
+                unsupported("content part")
+            elif typ == "text":
+                emit(role, channel, part.get("text"), pointer + "/text", tool_id=call)
+            elif typ == "toolCall" and role == "assistant":
+                emit("assistant", "tool_request", part.get("name"), pointer + "/name",
+                     tool_id=part.get("id"))
+                arguments = part.get("arguments")
+                if isinstance(arguments, dict) and isinstance(arguments.get("command"), str):
+                    emit("assistant", "tool_request", arguments["command"], pointer + "/arguments/command",
+                         tool_id=part.get("id"))
+            elif typ in {"thinking", "redacted_thinking", "image", "audio", "document"}:
+                exclude("reasoning_or_binary")
+            else:
+                unsupported(typ)
+    else:
+        unsupported("message content")
+    if isinstance(message.get("errorMessage"), str):
+        emit("unknown", "lifecycle", message["errorMessage"], base + "/errorMessage")
 
 
 def _adapt_grok(row: dict, emit, exclude, unsupported) -> None:

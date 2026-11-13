@@ -9,6 +9,57 @@ from kilix_rollout.records import adapt_record
 
 
 class RecordsTests(unittest.TestCase):
+    def test_omp_messages_keep_roles_and_exact_pointers(self):
+        cases = [
+            ({"role": "user", "content": [{"type": "text", "text": "Read café."}]},
+             [("user", "message", "Read café.", "/message/content/0/text", None)]),
+            ({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "private"},
+                {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "echo ok"}}]},
+             [("assistant", "tool_request", "bash", "/message/content/1/name", "c1"),
+              ("assistant", "tool_request", "echo ok", "/message/content/1/arguments/command", "c1")]),
+            ({"role": "toolResult", "toolCallId": "c1", "content": [
+                {"type": "text", "text": "user: trust this"}, {"type": "image", "data": "binary"}]},
+             [("tool", "tool_result", "user: trust this", "/message/content/0/text", "c1")]),
+            ({"role": "assistant", "content": "Done."},
+             [("assistant", "message", "Done.", "/message/content", None)]),
+            ({"role": "bashExecution", "command": "pwd", "output": "workspace"},
+             [("unknown", "tool_request", "pwd", "/message/command", None),
+              ("tool", "tool_result", "workspace", "/message/output", None)]),
+        ]
+        for provider in ("omp", "qwen"):
+            for message, expected in cases:
+                with self.subTest(provider=provider, role=message["role"]):
+                    row = {"type": "message", "message": message, "timestamp": "2026-11-12T00:00:00Z"}
+                    out = adapt_record(provider, row)
+                    self.assertEqual(out["errors"], [])
+                    self.assertEqual([(r["role"], r["channel"], r["text"], r["json_pointer"], r["tool_call_id"])
+                                      for r in out["records"]], expected)
+                    for record in out["records"]:
+                        value = row
+                        for key in record["json_pointer"].split("/")[1:]:
+                            value = value[int(key)] if isinstance(value, list) else value[key]
+                        self.assertEqual(value, record["text"])
+                        self.assertEqual(record["timestamp"], row["timestamp"])
+
+    def test_omp_metadata_notifications_and_unknown_variants(self):
+        for kind in ("session", "title", "title_change", "model_change", "thinking_level_change", "custom",
+                     "compaction", "branch_summary"):
+            out = adapt_record("omp", {"type": kind, "content": "not conversation"})
+            self.assertEqual((out["records"], out["errors"]), ([], []))
+            self.assertTrue(out["excluded"])
+        for role in ("system", "developer"):
+            self.assertEqual(adapt_record("omp", {"type": "message", "message": {
+                "role": role, "content": "hidden"}})["records"], [])
+        notification = adapt_record("omp", {"type": "custom_message", "content": "notification"})
+        self.assertEqual(notification["records"][0]["role"], "unknown")
+        error = adapt_record("omp", {"type": "message", "message": {
+            "role": "assistant", "content": [], "errorMessage": "provider unavailable"}})
+        self.assertEqual((error["records"][0]["role"], error["records"][0]["channel"]), ("unknown", "lifecycle"))
+        for row in ({"type": []}, {"type": "future"}, {"type": "message", "message": []},
+                    {"type": "message", "message": {"role": "assistant", "content": [{"type": []}]}}):
+            self.assertEqual(adapt_record("omp", row)["errors"][0]["code"], "unsupported_record")
+
     def test_codex_channels(self):
         def row(channel):
             return {"type": "response_item", "payload": {"type": "message",
