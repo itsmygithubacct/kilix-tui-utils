@@ -84,6 +84,34 @@ def _text(content: object) -> str:
     return ""
 
 
+def _codex_titles(locations: list[Path]) -> dict[str, str]:
+    titles = {}
+    for home in {Path(root).parent for root in locations}:
+        path = home / "session_index.jsonl"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                continue
+            while source.tell() < 16 * 1024 * 1024:
+                line = source.readline(METADATA_BYTES + 1)
+                if not line:
+                    break
+                if len(line) > METADATA_BYTES:
+                    break
+                try:
+                    row = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("id"), str):
+                    title = label(row.get("thread_name"))
+                    if title:
+                        titles[row["id"]] = title
+    return titles
+
+
 def describe(path: Path | str, provider: str, *, root: Path | None = None, tier: str = "live") -> dict:
     path = Path(path).expanduser().absolute()
     provider = "omp" if provider == "qwen" else provider
@@ -171,11 +199,12 @@ def raw_entries(directory: str | Path) -> list[dict]:
 
 
 def discover(provider: str | None = None, *, locations: dict | None = None,
-             max_entries: int = 300000, max_seconds: float = 30) -> dict:
+             cached: dict | None = None, max_entries: int = 300000, max_seconds: float = 30) -> dict:
     provider = "omp" if provider == "qwen" else provider
     if provider is not None and provider not in PROVIDERS:
         raise ValueError("unsupported provider")
     selected = locations if locations is not None else roots()
+    titles = _codex_titles(selected.get("codex", [])) if provider in (None, "codex") else {}
     rows, errors, seen = [], [], set()
     visited = 0
     deadline = time.monotonic() + max_seconds
@@ -216,7 +245,17 @@ def discover(provider: str | None = None, *, locations: dict | None = None,
                     tier = ("recent" if key == "raw" and path.parent.name == "recent" else
                             "archived" if path.name.endswith(".zst") or root.name == "archived_sessions" else "live")
                     try:
-                        rows.append(describe(path, key, root=root, tier=tier))
+                        old = (cached or {}).get((key, str(path)))
+                        info = path.lstat()
+                        if key != "raw" and old and all(old.get(field) == value for field, value in (
+                                ("size", info.st_size), ("device", info.st_dev), ("inode", info.st_ino),
+                                ("mtime_ns", info.st_mtime_ns), ("ctime_ns", info.st_ctime_ns))):
+                            item = dict(old, root=str(root), tier=tier)
+                        else:
+                            item = describe(path, key, root=root, tier=tier)
+                        if key == "codex" and item["session_id"] in titles:
+                            item["title"] = titles[item["session_id"]]
+                        rows.append(item)
                     except (OSError, ValueError) as exc:
                         errors.append({"code": "inventory_read_failed", "path": str(path), "message": str(exc)})
             except (OSError, TimeoutError) as exc:

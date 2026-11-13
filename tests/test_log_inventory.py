@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -84,6 +85,21 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(result["session_id"], "s")
         limited = discover(locations={"omp": [self.root / "omp"]}, max_entries=0)
         self.assertFalse(limited["complete"])
+
+    def test_saved_codex_names_override_prompts_without_rereading_unchanged_logs(self):
+        session = "12345678-1234-1234-1234-123456789abc"
+        path = self.write("codex/sessions/2026/11/13/rollout.jsonl", [
+            {"type": "session_meta", "payload": {"id": session, "cwd": "/workspace/parser"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "Generic prompt"}}])
+        titles = self.root / "codex/session_index.jsonl"
+        titles.write_text(json.dumps({"id": session, "thread_name": "Parser repair"}) + "\n")
+        locations = {"codex": [self.root / "codex/sessions"]}
+        result = discover(locations=locations)
+        self.assertEqual(result["sessions"][0]["title"], "Parser repair")
+        cached = {("codex", str(path)): result["sessions"][0]}
+        with mock.patch("kilix_rollout.inventory.describe", side_effect=AssertionError("metadata reread")):
+            result = discover(locations=locations, cached=cached)
+        self.assertEqual(result["sessions"][0]["title"], "Parser repair")
 
     @unittest.skipUnless(shutil.which("zstd"), "zstd required")
     def test_recent_archive_preview_keeps_the_tail(self):
