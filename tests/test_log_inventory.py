@@ -115,6 +115,189 @@ class InventoryTests(unittest.TestCase):
             result = discover(locations=locations, cached=cached)
         self.assertEqual(result["sessions"][0]["title"], "Parser repair")
 
+    def omp_log(self, relative, session_id, *, parent=None, agent=None, prompt="", title="",
+                system="Follow the rules.", stamp=None, tail=()):
+        """An OMP log shaped like OMP's own: a padded title slot, the session
+        header, then for a subagent its session_init and assignment."""
+        header = {"type": "session", "version": 3, "id": session_id, "cwd": "/workspace/corpus"}
+        if parent is not None:
+            header["parentSession"] = str(parent)
+        rows = [{"type": "title", "v": 1, "title": title, "pad": " " * 64}, header]
+        if agent is not None:
+            rows.append({"type": "session_init", "agent": agent, "task": prompt, "systemPrompt": system})
+        if prompt:
+            rows.append({"type": "message", "message": {"role": "user", "content": [
+                {"type": "text", "text": prompt}]}})
+        path = self.write("omp/" + relative, rows + list(tail))
+        if stamp is not None:
+            os.utime(path, (stamp, stamp))
+        return path
+
+    def nested_tree(self, base):
+        """A session, its subagent, a grandchild, and a deeper great-grandchild."""
+        session = "-workspace-corpus/2026-01-02T03-04-05-006Z_0000aaaa-0000-7000-8000-00000000000" + base
+        top = self.omp_log(session + ".jsonl", session[-36:], prompt="Repair the corpus")
+        child = self.omp_log(session + "/MapTrainer.jsonl", "child-" + base, parent=top, agent="scout")
+        grandchild = self.omp_log(session + "/MapTrainer/MapTrainer.Stages.jsonl", "grandchild-" + base,
+                                  parent=child, agent="scout")
+        deeper = self.omp_log(session + "/MapTrainer/MapTrainer.Stages/MapTrainer.Stages.Check.jsonl",
+                              "deeper-" + base, parent=grandchild, agent="reviewer")
+        return top, child, grandchild, deeper
+
+    def test_nested_omp_subagent_logs_are_separate_sessions_in_recency_order(self):
+        parent_id = "0000aaaa-0000-7000-8000-000000000001"
+        session = "-workspace-corpus/2026-01-02T03-04-05-006Z_" + parent_id
+        assignment = "Assignment from the parent agent. Target: "
+        parent = self.omp_log(session + ".jsonl", parent_id, title="Corpus repair",
+                              prompt="Repair the corpus", stamp=100)
+        mapper = self.omp_log(session + "/MapParser.jsonl", "child-parser", parent=parent, agent="scout",
+                              prompt=assignment + "map the parser", stamp=400)
+        trainer = self.omp_log(session + "/MapTrainer.jsonl", "child-trainer", parent=parent, agent="scout",
+                               prompt=assignment + "map the trainer", stamp=200)
+        stages = self.omp_log(session + "/MapTrainer/MapTrainer.Stages.jsonl", "grandchild-stages",
+                              parent=trainer, agent="reviewer", prompt=assignment + "list the stages", stamp=500)
+        other_id = "0000bbbb-0000-7000-8000-000000000001"
+        other = self.omp_log("-workspace-arcade/2026-01-03T04-05-06-007Z_" + other_id + ".jsonl", other_id,
+                             prompt="Review the arcade shell", stamp=300)
+        # Task outputs and tool logs sit beside subagent logs; they are not recordings.
+        for artifact in ("MapParser.md", "MapParser.json", "0.bash.log", "7.bash-original.log",
+                         "MapTrainer/3.bash.log"):
+            (self.root / "omp" / session / artifact).write_text("{}\n")
+        locations = {"omp": [self.root / "omp"]}
+        result = discover("qwen", locations=locations)
+        self.assertTrue(result["complete"], result["errors"])
+        rows = result["sessions"]
+        self.assertEqual([r["path"] for r in rows], [str(p) for p in (stages, mapper, other, trainer, parent)])
+        self.assertEqual([r["session_id"] for r in rows],
+                         ["grandchild-stages", "child-parser", other_id, "child-trainer", parent_id])
+        self.assertEqual([r["title"] for r in rows], ["MapTrainer.Stages · reviewer", "MapParser · scout",
+                                                      "Review the arcade shell", "MapTrainer · scout",
+                                                      "Corpus repair"])
+        self.assertEqual({r["provider"] for r in rows}, {"omp"})
+        self.assertEqual(len({r["inventory_id"] for r in rows}), 5)
+        self.assertEqual(discover("omp", locations=locations)["sessions"], rows)
+        self.assertEqual({k: describe(mapper, "qwen")[k] for k in ("provider", "session_id", "title")},
+                         {"provider": "omp", "session_id": "child-parser", "title": "MapParser · scout"})
+
+    def test_omp_child_names_and_identities_come_from_the_child_itself(self):
+        parent_id = "0000cccc-0000-7000-8000-000000000001"
+        session = "-workspace-corpus/2026-01-02T03-04-05-006Z_" + parent_id
+        # The parent may already be archived; its children still name it.
+        parent = self.root / "omp" / (session + ".jsonl")
+        named = self.omp_log(session + "/AuditShell.jsonl", "child-shell", parent=parent, agent="reviewer",
+                             title="Shell audit", prompt="Assignment from the parent agent. Target: the shell")
+        # An agent definition can outgrow the metadata window; the child's place
+        # in the directory its header names as parent still identifies it.
+        filler = {"type": "message", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "y" * 1000}]}}
+        hidden = self.omp_log(session + "/AuditCore.jsonl", "child-core", parent=parent, agent="reviewer",
+                              system="x" * 70000, prompt="Assignment from the parent agent. Target: the core",
+                              tail=[filler] * 100)
+        orphan = self.write("omp/" + session + "/Truncated.jsonl", [
+            {"type": "message", "message": {"role": "user", "content": "Partial assignment"}}])
+        fork_id = "0000cccc-0000-7000-8000-000000000002"
+        fork = self.omp_log("-workspace-corpus/2026-01-04T05-06-07-008Z_" + fork_id + ".jsonl", fork_id,
+                            parent=parent, prompt="Continue the corpus repair")
+        expected = {named: ("child-shell", "Shell audit"), hidden: ("child-core", "AuditCore"),
+                    orphan: ("", "Partial assignment"), fork: (fork_id, "Continue the corpus repair")}
+        result = discover(locations={"omp": [self.root / "omp"]})
+        self.assertTrue(result["complete"], result["errors"])
+        self.assertEqual({Path(r["path"]): (r["session_id"], r["title"]) for r in result["sessions"]}, expected)
+        # Entries cached by an older parser are described again, not reused.
+        stale = dict(describe(hidden, "omp"), inventory_version=1, title="corpus")
+        current = dict(describe(named, "omp"), title="Kept name")
+        cached = {("omp", str(hidden)): stale, ("omp", str(named)): current}
+        titles = {r["path"]: r["title"] for r in discover(locations={"omp": [self.root / "omp"]},
+                                                         cached=cached)["sessions"]}
+        self.assertEqual((titles[str(hidden)], titles[str(named)]), ("AuditCore", "Kept name"))
+
+    def test_nested_omp_walk_has_no_depth_ceiling_and_reports_an_exhausted_budget(self):
+        session = "-workspace-corpus/2026-01-02T03-04-05-006Z_0000dddd-0000-7000-8000-000000000001"
+        self.omp_log(session + ".jsonl", session[-36:], prompt="Repair the corpus")
+        deepest = self.omp_log(session + "".join("/Stage%02d" % i for i in range(40)) + "/Deepest.jsonl",
+                               "deepest", agent="scout", prompt="Deep task")
+        root = self.root / "omp"
+        entries = sum(len(dirs) + len(files) for _, dirs, files in os.walk(root))
+        result = discover(locations={"omp": [root]}, max_entries=entries)
+        self.assertTrue(result["complete"], result["errors"])
+        self.assertIn(str(deepest), [r["path"] for r in result["sessions"]])
+        # Breadth first, a budget that runs out costs the deepest logs and says so.
+        for limited in (discover(locations={"omp": [root]}, max_entries=entries - 1),
+                        discover("qwen", locations={"omp": [root]}, max_seconds=-1)):
+            self.assertFalse(limited["complete"])
+            self.assertEqual(limited["errors"], [{"code": "inventory_incomplete", "path": str(root),
+                                                  "message": "inventory discovery limit reached"}])
+            self.assertNotIn(str(deepest), [r["path"] for r in limited["sessions"]])
+
+    def test_nested_omp_walk_never_follows_links_cycles_or_special_files(self):
+        top, child, grandchild, deeper = self.nested_tree("1")
+        artifacts = child.parent
+        planted = self.write("outside/MapTrainer/Planted.jsonl", [{"type": "session", "id": "planted"}])
+        (artifacts / "escape").symlink_to(planted.parent.parent, target_is_directory=True)
+        (artifacts / "MapTrainer" / "loop").symlink_to(self.root / "omp", target_is_directory=True)
+        (artifacts / "Linked.jsonl").symlink_to(planted)
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(artifacts / "Pipe.jsonl")
+        expected = sorted(str(p) for p in (top, child, grandchild, deeper))
+        result = discover(locations={"omp": [self.root / "omp"]})
+        self.assertTrue(result["complete"], result["errors"])
+        self.assertEqual(sorted(r["path"] for r in result["sessions"]), expected)
+        # A configured root may itself be a link, as a relocated agent home is.
+        link = self.root / "omp-home"
+        link.symlink_to(self.root / "omp", target_is_directory=True)
+        result = discover(locations={"omp": [link]})
+        self.assertTrue(result["complete"], result["errors"])
+        self.assertEqual(sorted(r["path"] for r in result["sessions"]),
+                         [p.replace(str(self.root / "omp"), str(link), 1) for p in expected])
+
+    @unittest.skipIf(os.geteuid() == 0, "permissions do not bind root")
+    def test_nested_omp_walk_reports_an_unreadable_directory_and_walks_on(self):
+        top, child, grandchild, deeper = self.nested_tree("2")
+        locked = child.parent / "Locked"
+        locked.mkdir()
+        self.omp_log(str(locked.relative_to(self.root / "omp")) + "/Locked.Inner.jsonl", "inner", agent="scout")
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        result = discover(locations={"omp": [self.root / "omp"]})
+        self.assertFalse(result["complete"])
+        self.assertEqual([(e["code"], e["path"]) for e in result["errors"]], [("inventory_incomplete", str(locked))])
+        # Directories walked after the unreadable one are still inventoried.
+        self.assertEqual(sorted(r["path"] for r in result["sessions"]),
+                         sorted(str(p) for p in (top, child, grandchild, deeper)))
+
+    def test_nested_omp_walk_refuses_a_directory_replaced_after_listing(self):
+        real_open = os.open
+        for case, base in (("link", "3"), ("ancestor", "4")):
+            top, child, grandchild, deeper = self.nested_tree(base)
+            target = grandchild.parent
+            outside = self.root / ("outside-" + case)
+            planted = self.write(outside.name + "/MapTrainer/Planted.jsonl", [{"type": "session", "id": "planted"}])
+            raced = []
+
+            def racing_open(path, flags, *args, **kwargs):
+                if os.fspath(path) == str(target) and not raced:
+                    raced.append(case)
+                    # Swap the directory, or one of its ancestors, for a link out of the tree.
+                    moved = target if case == "link" else target.parent
+                    moved.rename(moved.with_name(moved.name + ".moved"))
+                    moved.symlink_to(planted.parent if case == "link" else planted.parent.parent,
+                                     target_is_directory=True)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch("os.open", racing_open):
+                result = discover(locations={"omp": [self.root / "omp"]})
+            self.assertEqual(raced, [case])
+            self.assertFalse(result["complete"])
+            self.assertEqual([(e["code"], e["path"]) for e in result["errors"]],
+                             [("inventory_incomplete", str(target))])
+            if case == "ancestor":
+                self.assertEqual(result["errors"][0]["message"], "directory changed during discovery")
+            paths = {r["path"] for r in result["sessions"]}
+            self.assertNotIn(planted.name, {Path(p).name for p in paths})
+            self.assertTrue({str(top), str(child)} <= paths)
+            shutil.rmtree(self.root / "omp")
+            shutil.rmtree(outside)
+
     @unittest.skipUnless(shutil.which("zstd"), "zstd required")
     def test_recent_archive_preview_keeps_the_tail(self):
         spec = importlib.util.spec_from_file_location("session_logs", ROOT / "tools/session_log/main.py")

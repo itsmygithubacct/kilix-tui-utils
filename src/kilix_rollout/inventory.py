@@ -2,9 +2,13 @@
 
 Discovery reads bounded metadata windows, never whole conversations. Paths
 remain separate entries even when two files claim the same session identity.
+OMP keeps each subagent's log in its parent session's artifact directory, as
+<session>/<task id>.jsonl, and subagents may spawn their own; those child logs
+are entries of their own, named by their task and agent.
 """
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import json
 import os
@@ -15,9 +19,14 @@ import time
 from urllib.parse import unquote
 
 PROVIDERS = ("claude", "codex", "grok", "omp", "raw")
-VERSION = 1
+VERSION = 2
 METADATA_BYTES = 65536
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+# Directory levels below each root that hold a provider's recordings. OMP
+# nests subagent logs as deep as subagents spawn, so it has no fixed depth:
+# only discovery's entry and time budget bounds it, and running out is reported.
+DEPTHS = {"claude": 3, "codex": 3, "grok": 2, "omp": None, "raw": 1}
+_DIRECTORY = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
 def label(value: object, limit: int = 160) -> str:
@@ -123,8 +132,8 @@ def describe(path: Path | str, provider: str, *, root: Path | None = None, tier:
     matches = _UUID.findall(name)
     session = (path.parent.name if provider == "grok" else matches[-1] if matches else
                name if provider == "raw" else "")
-    title = cwd = prompt = command = ""
-    codex_meta = False
+    title = cwd = prompt = command = parent = agent = ""
+    codex_meta = spawned = False
     if provider == "raw":
         base = root or (path.parent.parent if path.parent.name in ("recent", "archive") else path.parent)
         try:
@@ -160,6 +169,11 @@ def describe(path: Path | str, provider: str, *, root: Path | None = None, tier:
                 if kind == "session":
                     session = label(row.get("id"), 256) or session
                     cwd = label(row.get("cwd"), 1024) or cwd
+                    if isinstance(row.get("parentSession"), str):
+                        parent = row["parentSession"]
+                if kind == "session_init" and not spawned:
+                    # Written only when OMP spawns a subagent.
+                    spawned, agent = True, label(row.get("agent"))
                 if kind in ("title", "title_change", "session_info"):
                     title = label(row.get("title") or row.get("name")) or title
                 if isinstance(message, dict) and message.get("role") == "user" and not prompt:
@@ -174,6 +188,12 @@ def describe(path: Path | str, provider: str, *, root: Path | None = None, tier:
                         prompt = label(content.get("text")) if isinstance(content, dict) else ""
         if provider == "grok":
             cwd = unquote(path.parent.parent.name)
+    if provider == "omp" and not title and not matches and (
+            spawned or os.path.basename(parent) == path.parent.name + ".jsonl"):
+        # A subagent's file is named by its task id, which tells siblings apart
+        # better than assignments that open with the same boilerplate. A fork
+        # also names a parent session but keeps a session-id file name.
+        title = " · ".join(part for part in (label(name), agent) if part)
     project = Path(cwd).name if cwd else ""
     title = title or prompt or " · ".join(part for part in (project, command) if part)
     title = title or (provider + " · " + (session[:13] or name))
@@ -183,6 +203,10 @@ def describe(path: Path | str, provider: str, *, root: Path | None = None, tier:
             "path": str(path), "root": str(root.absolute()) if root else "", "tier": tier,
             "updated": info.st_mtime, "size": info.st_size, "device": info.st_dev,
             "inode": info.st_ino, "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}
+
+
+def _incomplete(path: Path, problem: object) -> dict:
+    return {"code": "inventory_incomplete", "path": str(path), "message": str(problem)}
 
 
 def raw_entries(directory: str | Path) -> list[dict]:
@@ -214,20 +238,68 @@ def discover(provider: str | None = None, *, locations: dict | None = None,
     visited = 0
     deadline = time.monotonic() + max_seconds
 
-    def walk(directory: Path, depth: int):
+    def walk(root: Path, depth: int | None):
+        """Regular files below root, breadth first, never through a link.
+
+        A fixed layout stops after ``depth`` directory levels. None descends as
+        deep as directories nest; the shared entry and time budget is then the
+        only bound, and exhausting it raises rather than passing for the end of
+        the tree. Below the root each directory is opened without following a
+        link and must still be the directory its parent listed. One that cannot
+        be read, was replaced or was already walked is reported and skipped,
+        and the rest of the tree is still walked.
+        """
         nonlocal visited
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    visited += 1
-                    if visited > max_entries or time.monotonic() > deadline:
-                        raise TimeoutError("inventory discovery limit reached")
-                    if entry.is_dir(follow_symlinks=False) and depth:
-                        yield from walk(Path(entry.path), depth - 1)
-                    elif entry.is_file(follow_symlinks=False):
-                        yield Path(entry.path)
-        except FileNotFoundError:
-            return
+        pending = deque([(root, depth, None)])
+        walked = set()
+        while pending:
+            directory, remaining, expected = pending.popleft()
+            try:
+                fd = os.open(directory, _DIRECTORY | (0 if expected is None else os.O_NOFOLLOW))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                errors.append(_incomplete(directory, exc))
+                continue
+            try:
+                info = os.fstat(fd)
+                identity = (info.st_dev, info.st_ino)
+                if expected is not None and identity != expected:
+                    errors.append(_incomplete(directory, "directory changed during discovery"))
+                    continue
+                if identity in walked:
+                    # Without links only a bind mount, or a filesystem without
+                    # unique inodes, returns here: never list it twice or as done.
+                    errors.append(_incomplete(directory, "directory reached twice during discovery"))
+                    continue
+                walked.add(identity)
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        visited += 1
+                        if visited > max_entries or time.monotonic() > deadline:
+                            raise TimeoutError("inventory discovery limit reached")
+                        path = directory / entry.name
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if remaining is None or remaining > 0:
+                                    found = entry.stat(follow_symlinks=False)
+                                    pending.append((path, None if remaining is None else remaining - 1,
+                                                    (found.st_dev, found.st_ino)))
+                                continue
+                            regular = entry.is_file(follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        except OSError as exc:
+                            errors.append(_incomplete(path, exc))
+                            continue
+                        if regular:
+                            yield path
+            except TimeoutError:
+                raise
+            except OSError as exc:
+                errors.append(_incomplete(directory, exc))
+            finally:
+                os.close(fd)
 
     for key in PROVIDERS:
         if provider and key != provider:
@@ -235,7 +307,7 @@ def discover(provider: str | None = None, *, locations: dict | None = None,
         for root in selected.get(key, []):
             root = Path(root).expanduser().absolute()
             try:
-                for path in walk(root, 3 if key in ("codex", "claude") else 2 if key == "grok" else 1):
+                for path in walk(root, DEPTHS[key]):
                     if key == "raw":
                         if not (path.name.endswith(".log") or path.name.endswith(".log.zst")):
                             continue
