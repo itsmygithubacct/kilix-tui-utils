@@ -40,6 +40,7 @@ import json
 import os
 import pwd
 import re
+import socket
 import stat
 import struct
 import tempfile
@@ -212,14 +213,99 @@ USERDB_RECORDS = ("/etc/userdb", "/run/userdb", "/run/host/userdb",
 
 
 def _read_database(path: str, limit: int) -> str:
-    """A bounded *whole* file, never an accepted prefix."""
+    """A bounded whole regular file. A short read is never an accepted prefix."""
     with open(path, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        if info.st_size > limit:
+            raise ValueError(f"{path} exceeds the {limit}-byte limit")
+        # Cap the read. A file that grows or returns early does not match
+        # the size seen on open, so the caller refuses instead of parsing
+        # a prefix.
         data = handle.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"{path} exceeds the {limit}-byte limit")
+        if len(data) != info.st_size or handle.read(1):
+            raise ValueError(f"{path} changed while it was read")
     if b"\0" in data:
         raise ValueError(f"{path} contains NUL")
     return data.decode("utf-8")
+
+
+# Peer of the stock DynamicUser socket. A same-user process can bind that
+# name and answer one membership query, then fail the rest; glibc then
+# returns only the primary gid and does not raise. The executable of pid 1
+# is not readable here, so an unresolvable exe is accepted only for root's
+# systemd. A stand-in has a resolvable exe and is refused.
+_STOCK_USERDB_COMM = frozenset({"systemd", "systemd-userdbd"})
+_STOCK_USERDB_BINARIES = (
+    "/usr/lib/systemd/systemd",
+    "/lib/systemd/systemd",
+    "/usr/lib/systemd/systemd-userdbd",
+    "/lib/systemd/systemd-userdbd",
+    "/sbin/init",
+)
+
+
+def _resolved_exe(pid: int) -> str:
+    link = f"/proc/{pid}/exe"
+    try:
+        peer = os.path.realpath(link)
+    except OSError:
+        return ""
+    if not peer or peer == link or peer.startswith("/proc/"):
+        return ""
+    return peer
+
+
+def _same_executable(left: str, right: str) -> bool:
+    try:
+        return os.path.samestat(os.stat(left), os.stat(right))
+    except OSError:
+        return False
+
+
+def _stock_userdb_peer(pid: int, uid: int) -> bool:
+    peer = _resolved_exe(pid)
+    if peer:
+        return any(_same_executable(peer, candidate)
+                   for candidate in _STOCK_USERDB_BINARIES)
+    if uid != 0:
+        return False
+    try:
+        with open(f"/proc/{pid}/comm", encoding="ascii") as handle:
+            comm = handle.read().strip()
+    except (OSError, UnicodeError):
+        return False
+    return comm in _STOCK_USERDB_COMM
+
+
+def _dynamic_user_peer_problem(path: str) -> str:
+    """'' when `path` is not a socket or is the installed systemd service.
+
+    Anything else, including a socket this user is serving, is not a
+    membership authority. A failed inspection is a refusal.
+    """
+    try:
+        info = os.stat(path)
+    except OSError as error:
+        return f"{path} cannot be inspected ({error.strerror or error})"
+    if not stat.S_ISSOCK(info.st_mode):
+        return ""
+    sock = socket.socket(socket.AF_UNIX)
+    try:
+        sock.settimeout(2)
+        try:
+            sock.connect(path)
+            cred = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        except OSError as error:
+            return (f"{path} is not the stock DynamicUser service "
+                    f"({error.strerror or error})")
+    finally:
+        sock.close()
+    pid, uid, _gid = struct.unpack("iii", cred)
+    if _stock_userdb_peer(pid, uid):
+        return ""
+    return f"{path} is not served by the installed systemd userdb"
 
 
 def _systemd_authority_problem() -> str:
@@ -227,8 +313,10 @@ def _systemd_authority_problem() -> str:
 
     It supplies uid == gid accounts and no supplementary memberships. Other
     providers (including the multiplexer) can hide an error behind a partial
-    NSS success. Do not query those providers to prove their own completeness.
-    Static userdb records are also outside this local-files proof.
+    NSS success. A socket that merely uses DynamicUser's name can do the
+    same, so the listener has to be the installed systemd. Do not query
+    those providers to prove their own completeness. Static userdb records
+    are also outside this local-files proof.
     """
     try:
         services = os.listdir(USERDB_SERVICES)
@@ -236,6 +324,10 @@ def _systemd_authority_problem() -> str:
         services = []
     if any(name != "io.systemd.DynamicUser" for name in services):
         return "systemd userdb has providers without a local membership proof"
+    if "io.systemd.DynamicUser" in services:
+        if problem := _dynamic_user_peer_problem(
+                os.path.join(USERDB_SERVICES, "io.systemd.DynamicUser")):
+            return problem
     if os.getuid() != os.getgid():
         return "systemd private-group proof requires matching uid and gid"
     for directory in USERDB_RECORDS:

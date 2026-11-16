@@ -3830,6 +3830,24 @@ class SupplementaryMembershipR8Tests(RuntimeDirTests):
         self.assertIn("supplementary group", problem)
         memberships.assert_called_with("qemu-mgr-peer", peer_gid)
 
+    def test_a_stand_in_provider_cannot_hide_behind_a_partial_group_list(self):
+        """R8-B1: a short getgrouplist is not absence when the listener is ours."""
+        services = self.tmp / "svc"
+        services.mkdir()
+        path = services / "io.systemd.DynamicUser"
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(str(path))
+        server.listen(1)
+        self.addCleanup(server.close)
+        gid = os.getgid()
+        with mock.patch.object(model, "USERDB_SERVICES", str(services)), \
+                mock.patch.object(model, "USERDB_RECORDS", ()), \
+                group_db(sources="files systemd"), \
+                mock.patch.object(os, "getgrouplist", return_value=[gid + 51000]):
+            problem = self.problem()
+        self.assertIn("not served by the installed systemd userdb", problem)
+        self.assertIn("which is not your private group", problem)
+
     def test_a_private_group_with_no_other_members_is_still_used(self):
         me = pwd.getpwuid(os.getuid()).pw_name
         gid = os.getgid()
@@ -3951,6 +3969,25 @@ class LocalMembershipProofTests(RuntimeDirTests):
             record.unlink(); records.rmdir(); records.write_text("not a directory")
             with self.assertRaises(OSError):
                 model._systemd_authority_problem()
+
+    def test_the_installed_dynamicuser_socket_stays_acceptable(self):
+        path = "/run/systemd/userdb/io.systemd.DynamicUser"
+        if not os.path.exists(path):
+            self.skipTest("this host has no DynamicUser socket")
+        self.assertEqual(model._dynamic_user_peer_problem(path), "")
+
+    def test_a_same_user_dynamicuser_socket_is_not_an_authority(self):
+        services = self.tmp / "svc"
+        services.mkdir()
+        path = services / "io.systemd.DynamicUser"
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(str(path))
+        server.listen(1)
+        self.addCleanup(server.close)
+        with mock.patch.object(model, "USERDB_SERVICES", str(services)), \
+                mock.patch.object(model, "USERDB_RECORDS", ()):
+            self.assertIn("not served by the installed systemd userdb",
+                          model._systemd_authority_problem())
 
     def test_nss_accounts_preserve_uid_even_with_duplicate_names(self):
         me = pwd.getpwuid(os.getuid()).pw_name

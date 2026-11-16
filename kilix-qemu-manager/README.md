@@ -164,10 +164,16 @@ swapped between the check and the use.
   (`/etc/userdb`, `/run/userdb`, `/run/host/userdb`, `/usr/local/lib/userdb`,
   `/usr/lib/userdb`) must
   be empty or absent, and `/run/systemd/userdb` must contain no service
-  except stock `io.systemd.DynamicUser`. That service supplies UID=GID
-  accounts and no supplementary memberships. Additional providers,
-  including homed and the multiplexer, refuse this exemption even when
-  their lookups succeed. Use directories without group write in that case.
+  except stock `io.systemd.DynamicUser`. That socket, when it is a socket,
+  must be served by the installed systemd or systemd-userdbd: a root peer
+  whose executable is that binary, or, when the executable cannot be read,
+  root's `systemd` / `systemd-userdbd`. A socket this user serves under
+  the same name is not that service. A partial membership reply, including
+  one that returns the primary gid and then fails, is not absence.
+  That service supplies UID=GID accounts and no supplementary memberships.
+  Additional providers, including homed and the multiplexer, refuse this
+  exemption even when their lookups succeed. Use directories without
+  group write in that case.
   Unreadable configuration or directories also refuse the exemption.
   NSS account/group enumeration and each other UID's `getgrouplist` remain
   additional rejection checks. A successful return is **not** evidence of
