@@ -167,7 +167,10 @@ swapped between the check and the use.
   except stock `io.systemd.DynamicUser`. That socket, when it is a socket,
   must be served by the installed systemd or systemd-userdbd: a root peer
   whose executable is that binary, or, when the executable cannot be read,
-  root's `systemd` / `systemd-userdbd`. A socket this user serves under
+  root's `systemd` / `systemd-userdbd`. The executable is the inode of one
+  `O_PATH` handle on `/proc/<pid>/exe`, and that match is accepted only
+  for uid 0, so a non-root peer is refused even when the inode is stock.
+  A socket this user serves under
   the same name is not that service. A peer whose owner uid is 65534 and
   whose executable cannot be read cannot be verified because of namespace
   mapping; the exemption is refused, and that peer is not described as a
@@ -182,7 +185,9 @@ swapped between the check and the use.
   additional rejection checks. A successful return is **not** evidence of
   completeness: libc can return partial results after a provider fails.
   This proof trusts administrator-controlled files and the installed
-  files/DynamicUser implementations. It describes current configuration,
+  files/DynamicUser implementations. It assumes the manager's mount
+  namespace, `/run/systemd/userdb`, and the stock systemd binaries are
+  controlled by the administrator. It describes current configuration,
   not an atomic account snapshot or the kernel credentials of every running
   process. It cannot exclude concurrent administrative changes, previously
   granted groups retained by processes, or groups assigned directly by a

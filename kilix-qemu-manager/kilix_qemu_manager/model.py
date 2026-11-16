@@ -245,9 +245,13 @@ def _read_database(path: str, limit: int) -> str:
 
 # Peer of the stock DynamicUser socket. A same-user process can bind that
 # name and answer one membership query, then fail the rest; glibc then
-# returns only the primary gid and does not raise. The executable of pid 1
-# is not readable here, so an unresolvable exe is accepted only for root's
-# systemd. A stand-in has a resolvable exe and is refused.
+# returns only the primary gid and does not raise. The executable is opened
+# once, with O_PATH on /proc/<pid>/exe, and compared by device and inode.
+# That match is accepted only for uid 0. A deleted, memfd, or other
+# resolvable exe that is not a stock binary is refused, and comm is not
+# consulted. An exe that cannot be opened is accepted only for uid 0 with
+# comm systemd or systemd-userdbd. Any other uid is refused, including a
+# stand-in whose executable is a stock binary.
 _STOCK_USERDB_COMM = frozenset({"systemd", "systemd-userdbd"})
 _STOCK_USERDB_BINARIES = (
     "/usr/lib/systemd/systemd",
@@ -258,27 +262,39 @@ _STOCK_USERDB_BINARIES = (
 )
 
 
-def _resolved_exe(pid: int) -> str:
-    link = f"/proc/{pid}/exe"
+def _peer_exe(pid: int):
+    """One O_PATH handle for `/proc/<pid>/exe`, or None if it cannot be opened.
+
+    None is an unreadable link (pid 1 here, hidepid, a vanished pid). A
+    deleted file or a memfd still opens; the caller refuses those unless
+    the inode is a stock binary.
+    """
     try:
-        peer = os.path.realpath(link)
+        return os.open(f"/proc/{pid}/exe", os.O_PATH | os.O_CLOEXEC)
     except OSError:
-        return ""
-    if not peer or peer == link or peer.startswith("/proc/"):
-        return ""
-    return peer
+        return None
 
 
-def _same_executable(left: str, right: str) -> bool:
+def _same_executable(peer, candidate: str) -> bool:
+    """True when `peer`, the fstat of the one O_PATH handle, is `candidate`."""
     try:
-        return os.path.samestat(os.stat(left), os.stat(right))
+        stock = os.stat(candidate)
     except OSError:
         return False
+    return peer.st_dev == stock.st_dev and peer.st_ino == stock.st_ino
 
 
-def _stock_userdb_peer(pid: int, uid: int) -> bool:
-    peer = _resolved_exe(pid)
-    if peer:
+def _stock_userdb_peer(pid: int, uid: int, exe_fd) -> bool:
+    """True when this peer is the installed systemd.
+
+    `exe_fd` is the one handle from :func:`_peer_exe`, or None. The caller
+    owns it. A resolved inode counts only for uid 0. Comm is reached only
+    when that open failed, and only for uid 0.
+    """
+    if exe_fd is not None:
+        peer = os.fstat(exe_fd)
+        if uid != 0:
+            return False
         return any(_same_executable(peer, candidate)
                    for candidate in _STOCK_USERDB_BINARIES)
     if uid != 0:
@@ -317,11 +333,17 @@ def _dynamic_user_peer_problem(path: str) -> str:
     finally:
         sock.close()
     pid, uid, _gid = struct.unpack("iii", cred)
-    if uid == 65534 and not _resolved_exe(pid):
-        return (f"{path} cannot be verified because of namespace mapping "
-                "(owner uid 65534, exe unreadable)")
-    if _stock_userdb_peer(pid, uid):
-        return ""
+    # One handle for the whole check. A second lookup would race an exec.
+    exe_fd = _peer_exe(pid)
+    try:
+        if _stock_userdb_peer(pid, uid, exe_fd):
+            return ""
+        if exe_fd is None and uid == 65534:
+            return (f"{path} cannot be verified because of namespace mapping "
+                    "(owner uid 65534, exe unreadable)")
+    finally:
+        if exe_fd is not None:
+            os.close(exe_fd)
     return f"{path} is not served by the installed systemd userdb"
 
 

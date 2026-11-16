@@ -4123,8 +4123,8 @@ class LocalMembershipProofTests(RuntimeDirTests):
         self.assertIn("cannot be inspected", missing)
         self.assertNotEqual(missing, "")
 
-    def _peer(self, uid, *, pid=1, realpath="/proc/1/exe", comm=None,
-              cred_error=None):
+    def _peer(self, uid, *, pid=1, comm=None, cred_error=None,
+              fstat_inode=None):
         directory = Path(tempfile.mkdtemp(dir=self.tmp, prefix="svc"))
         path = directory / "sock"
         server = socket.socket(socket.AF_UNIX)
@@ -4147,8 +4147,7 @@ class LocalMembershipProofTests(RuntimeDirTests):
             def close(self):
                 pass
 
-        patches = [mock.patch.object(socket, "socket", return_value=Sock()),
-                   mock.patch.object(os.path, "realpath", return_value=realpath)]
+        patches = [mock.patch.object(socket, "socket", return_value=Sock())]
         if comm is not None:
             real_open = open
 
@@ -4160,10 +4159,44 @@ class LocalMembershipProofTests(RuntimeDirTests):
                 return real_open(file, *args, **kwargs)
 
             patches.append(mock.patch("builtins.open", opener))
+        if fstat_inode is not None:
+            real_open_fd = os.open
+            real_fstat = os.fstat
+            opened = {}
+
+            def spy_open(file, flags, *args, **kwargs):
+                fd = real_open_fd(file, flags, *args, **kwargs)
+                if os.fspath(file) == f"/proc/{pid}/exe":
+                    opened["fd"] = fd
+                return fd
+
+            def spy_fstat(fd):
+                info = real_fstat(fd)
+                if fd == opened.get("fd"):
+                    return types.SimpleNamespace(
+                        st_mode=info.st_mode, st_dev=fstat_inode.st_dev,
+                        st_ino=fstat_inode.st_ino)
+                return info
+
+            patches.append(mock.patch.object(os, "open", spy_open))
+            patches.append(mock.patch.object(os, "fstat", spy_fstat))
         with contextlib.ExitStack() as stack:
             for patch in patches:
                 stack.enter_context(patch)
             return model._dynamic_user_peer_problem(str(path))
+
+    def _stock_inode(self):
+        for candidate in model._STOCK_USERDB_BINARIES:
+            try:
+                return os.stat(candidate)
+            except OSError:
+                continue
+        self.skipTest("this host has no stock systemd binary")
+
+    def _stop(self, proc):
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
 
     def test_an_unmapped_dynamicuser_peer_names_the_namespace_limit(self):
         path_problem = self._peer(65534)
@@ -4172,8 +4205,8 @@ class LocalMembershipProofTests(RuntimeDirTests):
         self.assertIn("owner uid 65534, exe unreadable", path_problem)
         self.assertNotIn("not served", path_problem)
         self.assertNotIn("not the stock", path_problem)
-        # A resolved executable is a different refusal: the peer can be named.
-        resolved = self._peer(65534, realpath="/usr/bin/python3")
+        # This process's executable can be opened, so the refusal names the peer.
+        resolved = self._peer(65534, pid=os.getpid())
         self.assertIn("not served by the installed systemd userdb", resolved)
         self.assertNotIn("namespace mapping", resolved)
 
@@ -4197,17 +4230,101 @@ class LocalMembershipProofTests(RuntimeDirTests):
                 self.assertIn("not served by the installed systemd userdb",
                               problem)
 
-    def test_an_unreadable_or_unmatched_exe_is_not_stock(self):
-        with mock.patch.object(os.path, "realpath",
-                               side_effect=OSError(errno.EACCES, "denied")):
-            self.assertEqual(model._resolved_exe(1), "")
-        for reported in ("/proc/1/exe", "/proc/1/root/sbin/init", ""):
-            with self.subTest(reported=reported), \
-                    mock.patch.object(os.path, "realpath", return_value=reported):
-                self.assertEqual(model._resolved_exe(1), "")
-        missing = self._peer(0, realpath="/no/such/qemu-mgr-exe")
-        self.assertIn("not served by the installed systemd userdb", missing)
-        self.assertNotIn("namespace mapping", missing)
+    def test_a_non_root_stock_exe_is_refused_and_root_is_accepted(self):
+        """The inode match counts only for uid 0."""
+        stock = self._stock_inode()
+        refused = self._peer(1000, pid=os.getpid(), fstat_inode=stock)
+        self.assertIn("not served by the installed systemd userdb", refused)
+        self.assertNotIn("namespace mapping", refused)
+        self.assertEqual(
+            self._peer(0, pid=os.getpid(), fstat_inode=stock), "")
+
+    def test_the_peer_exe_is_one_path_handle(self):
+        """The comparison is fstat of one O_PATH fd, not a path string."""
+        pid = os.getpid()
+        opened = []
+        fstatted = []
+        real_open = os.open
+        real_fstat = os.fstat
+
+        def spy_open(file, flags, *args, **kwargs):
+            fd = real_open(file, flags, *args, **kwargs)
+            opened.append((os.fspath(file), flags, fd))
+            return fd
+
+        def spy_fstat(fd):
+            fstatted.append(fd)
+            return real_fstat(fd)
+
+        def banned(*_args, **_kwargs):
+            raise AssertionError("the peer exe was resolved by path")
+
+        problem = self._peer(0, pid=pid)
+        # Re-run under the spies. The unspied call above only checks the
+        # outcome; the spied call checks the handle.
+        directory = Path(tempfile.mkdtemp(dir=self.tmp, prefix="svc"))
+        path = directory / "sock"
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(str(path))
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        class Sock:
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _path):
+                pass
+
+            def getsockopt(self, *_args):
+                return struct.pack("iii", pid, 0, 0)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(socket, "socket", return_value=Sock()), \
+                mock.patch.object(os, "open", spy_open), \
+                mock.patch.object(os, "fstat", spy_fstat), \
+                mock.patch.object(os.path, "realpath", banned), \
+                mock.patch.object(os, "readlink", banned):
+            spied = model._dynamic_user_peer_problem(str(path))
+        self.assertIn("not served by the installed systemd userdb", problem)
+        self.assertIn("not served by the installed systemd userdb", spied)
+        exe = [item for item in opened if item[0] == f"/proc/{pid}/exe"]
+        self.assertEqual(len(exe), 1)
+        self.assertTrue(exe[0][1] & os.O_PATH)
+        self.assertIn(exe[0][2], fstatted)
+
+    def test_a_deleted_or_memfd_exe_is_refused_for_root(self):
+        """A resolvable non-stock inode does not fall through to comm."""
+        binary = self.tmp / "sleep"
+        shutil.copy("/bin/sleep", binary)
+        binary.chmod(0o755)
+        deleted = subprocess.Popen([str(binary), "30"])
+        self.addCleanup(self._stop, deleted)
+        os.unlink(binary)
+        hidden = self.tmp / "hidden"
+        hidden.mkdir()
+        buried = hidden / "sleep"
+        shutil.copy("/bin/sleep", buried)
+        buried.chmod(0o755)
+        covered = subprocess.Popen([str(buried), "30"])
+        self.addCleanup(self._stop, covered)
+        hidden.chmod(0)
+        self.addCleanup(hidden.chmod, 0o755)
+        mem = os.memfd_create("qm")
+        os.write(mem, Path("/bin/sleep").read_bytes())
+        memfd = subprocess.Popen(
+            [f"/proc/self/fd/{mem}", "30"], pass_fds=(mem,))
+        os.close(mem)
+        self.addCleanup(self._stop, memfd)
+        for label, proc in (("deleted", deleted), ("hidden", covered),
+                            ("memfd", memfd)):
+            with self.subTest(label):
+                problem = self._peer(0, pid=proc.pid, comm="systemd\n")
+                self.assertIn("not served by the installed systemd userdb",
+                              problem)
+                self.assertNotIn("namespace mapping", problem)
 
     def test_nss_accounts_preserve_uid_even_with_duplicate_names(self):
         me = pwd.getpwuid(os.getuid()).pw_name
