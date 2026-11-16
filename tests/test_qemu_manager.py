@@ -3989,6 +3989,226 @@ class LocalMembershipProofTests(RuntimeDirTests):
             self.assertIn("not served by the installed systemd userdb",
                           model._systemd_authority_problem())
 
+    def _refuse_promptly(self, call):
+        box = {}
+
+        def run():
+            try:
+                box["value"] = call()
+            except Exception as error:
+                box["error"] = error
+
+        worker = threading.Thread(target=run, daemon=True)
+        started = time.monotonic()
+        worker.start()
+        worker.join(2)
+        self.assertFalse(worker.is_alive(), "the check blocked")
+        self.assertLess(time.monotonic() - started, 2)
+        return box
+
+    def test_a_non_regular_account_file_is_refused_before_reading(self):
+        """A FIFO must not hang, and a directory is not a database."""
+        for label, limit in (("nsswitch", 1 << 16),
+                             ("passwd", 8 << 20), ("group", 8 << 20)):
+            fifo = self.tmp / f"{label}.fifo"
+            os.mkfifo(fifo)
+            with self.subTest(label=label, kind="fifo"):
+                box = self._refuse_promptly(
+                    lambda fifo=fifo, limit=limit:
+                    model._read_database(str(fifo), limit))
+                self.assertIsInstance(box.get("error"), ValueError)
+                self.assertIn("not a regular file", str(box["error"]))
+            directory = self.tmp / f"{label}.dir"
+            directory.mkdir()
+            with self.subTest(label=label, kind="directory"):
+                with self.assertRaises(ValueError) as caught:
+                    model._read_database(str(directory), limit)
+                self.assertIn("not a regular file", str(caught.exception))
+        regular = self.tmp / "nsswitch.real"
+        regular.write_text("passwd: files\ngroup: files\n")
+        link = self.tmp / "nsswitch.link"
+        link.symlink_to(regular)
+        self.assertIn("passwd: files", model._read_database(str(link), 1 << 16))
+        fifo = self.tmp / "nsswitch.fifo"
+        followed = self.tmp / "nsswitch.fifo.link"
+        followed.symlink_to(fifo)
+        box = self._refuse_promptly(
+            lambda: model._read_database(str(followed), 1 << 16))
+        self.assertIn("not a regular file", str(box.get("error")))
+        conf = self.tmp / "nsswitch.sources"
+        os.mkfifo(conf)
+        with mock.patch.object(model, "NSSWITCH", str(conf)):
+            box = self._refuse_promptly(model._sources_problem)
+        self.assertIn("not a regular file", box.get("value", ""))
+        self.assertNotIn("error", box)
+
+    def test_a_database_whose_size_at_open_does_not_match_is_refused(self):
+        path = self.tmp / "sized"
+        path.write_bytes(b"passwd: files\ngroup: files\n")
+        real = os.fstat
+        for claimed in (0, 4, path.stat().st_size + 8):
+            with self.subTest(claimed=claimed):
+                def fake(fd, claimed=claimed):
+                    info = real(fd)
+                    return types.SimpleNamespace(st_mode=info.st_mode,
+                                                 st_size=claimed)
+                with mock.patch.object(os, "fstat", fake):
+                    with self.assertRaises(ValueError) as caught:
+                        model._read_database(str(path), 1 << 16)
+                self.assertIn("changed while it was read", str(caught.exception))
+
+    def test_a_database_that_grows_during_the_read_is_refused(self):
+        path = self.tmp / "growing"
+        path.write_bytes(b"passwd: files\ngroup: files\n")
+        real_fdopen = os.fdopen
+
+        def growing(fd, *args, **kwargs):
+            raw = real_fdopen(fd, *args, **kwargs)
+
+            class Reader:
+                calls = 0
+
+                def read(self, n=-1):
+                    Reader.calls += 1
+                    if Reader.calls == 1:
+                        return raw.read(n)
+                    return b"\n"
+
+                def close(self):
+                    raw.close()
+
+            return Reader()
+
+        with mock.patch.object(os, "fdopen", growing):
+            with self.assertRaises(ValueError) as caught:
+                model._read_database(str(path), 1 << 16)
+        self.assertIn("changed while it was read", str(caught.exception))
+
+    def test_a_dynamicuser_connect_or_stat_failure_is_refused(self):
+        bound = self.tmp / "svc-bound"
+        bound.mkdir()
+        path = bound / "io.systemd.DynamicUser"
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(str(path))
+        self.addCleanup(server.close)
+        problem = model._dynamic_user_peer_problem(str(path))
+        self.assertIn("is not the stock DynamicUser service", problem)
+        self.assertNotIn("namespace mapping", problem)
+
+        class Sock:
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _path):
+                pass
+
+            def getsockopt(self, *_args):
+                raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+
+            def close(self):
+                pass
+
+        listening = self.tmp / "svc-listen"
+        listening.mkdir()
+        live = listening / "io.systemd.DynamicUser"
+        accepted = socket.socket(socket.AF_UNIX)
+        accepted.bind(str(live))
+        accepted.listen(1)
+        self.addCleanup(accepted.close)
+        with mock.patch.object(socket, "socket", return_value=Sock()):
+            problem = model._dynamic_user_peer_problem(str(live))
+        self.assertIn("is not the stock DynamicUser service", problem)
+        self.assertIn("not connected", problem)
+        missing = model._dynamic_user_peer_problem(str(self.tmp / "absent-sock"))
+        self.assertIn("cannot be inspected", missing)
+        self.assertNotEqual(missing, "")
+
+    def _peer(self, uid, *, pid=1, realpath="/proc/1/exe", comm=None,
+              cred_error=None):
+        directory = Path(tempfile.mkdtemp(dir=self.tmp, prefix="svc"))
+        path = directory / "sock"
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(str(path))
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        class Sock:
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _path):
+                pass
+
+            def getsockopt(self, *_args):
+                if cred_error is not None:
+                    raise cred_error
+                return struct.pack("iii", pid, uid, uid)
+
+            def close(self):
+                pass
+
+        patches = [mock.patch.object(socket, "socket", return_value=Sock()),
+                   mock.patch.object(os.path, "realpath", return_value=realpath)]
+        if comm is not None:
+            real_open = open
+
+            def opener(file, *args, **kwargs):
+                if os.fspath(file) == f"/proc/{pid}/comm":
+                    if isinstance(comm, BaseException):
+                        raise comm
+                    return io.StringIO(comm)
+                return real_open(file, *args, **kwargs)
+
+            patches.append(mock.patch("builtins.open", opener))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            return model._dynamic_user_peer_problem(str(path))
+
+    def test_an_unmapped_dynamicuser_peer_names_the_namespace_limit(self):
+        path_problem = self._peer(65534)
+        self.assertIn("cannot be verified because of namespace mapping",
+                      path_problem)
+        self.assertIn("owner uid 65534, exe unreadable", path_problem)
+        self.assertNotIn("not served", path_problem)
+        self.assertNotIn("not the stock", path_problem)
+        # A resolved executable is a different refusal: the peer can be named.
+        resolved = self._peer(65534, realpath="/usr/bin/python3")
+        self.assertIn("not served by the installed systemd userdb", resolved)
+        self.assertNotIn("namespace mapping", resolved)
+
+    def test_the_comm_fallback_accepts_only_root_systemd(self):
+        """Unresolved exe: uid 0 and a stock comm, and nothing wider."""
+        self.assertEqual(
+            self._peer(0, comm="systemd\n"), "")
+        self.assertEqual(
+            self._peer(0, comm="systemd-userdbd\n"), "")
+        # A3: dropping the uid check would accept this comm.
+        ignored_uid = self._peer(os.getuid() or 1000, comm="systemd\n")
+        self.assertIn("not served by the installed systemd userdb", ignored_uid)
+        self.assertNotIn("namespace mapping", ignored_uid)
+        # A10: accepting any comm would accept this.
+        other = self._peer(0, comm="qemu-mgr\n")
+        self.assertIn("not served by the installed systemd userdb", other)
+        for error in (OSError(errno.EIO, "comm unreadable"),
+                      UnicodeDecodeError("ascii", b"\xff", 0, 1, "bad")):
+            with self.subTest(error=type(error).__name__):
+                problem = self._peer(0, comm=error)
+                self.assertIn("not served by the installed systemd userdb",
+                              problem)
+
+    def test_an_unreadable_or_unmatched_exe_is_not_stock(self):
+        with mock.patch.object(os.path, "realpath",
+                               side_effect=OSError(errno.EACCES, "denied")):
+            self.assertEqual(model._resolved_exe(1), "")
+        for reported in ("/proc/1/exe", "/proc/1/root/sbin/init", ""):
+            with self.subTest(reported=reported), \
+                    mock.patch.object(os.path, "realpath", return_value=reported):
+                self.assertEqual(model._resolved_exe(1), "")
+        missing = self._peer(0, realpath="/no/such/qemu-mgr-exe")
+        self.assertIn("not served by the installed systemd userdb", missing)
+        self.assertNotIn("namespace mapping", missing)
+
     def test_nss_accounts_preserve_uid_even_with_duplicate_names(self):
         me = pwd.getpwuid(os.getuid()).pw_name
         gid = os.getgid()

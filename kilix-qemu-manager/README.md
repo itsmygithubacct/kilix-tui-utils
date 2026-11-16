@@ -168,8 +168,11 @@ swapped between the check and the use.
   must be served by the installed systemd or systemd-userdbd: a root peer
   whose executable is that binary, or, when the executable cannot be read,
   root's `systemd` / `systemd-userdbd`. A socket this user serves under
-  the same name is not that service. A partial membership reply, including
-  one that returns the primary gid and then fails, is not absence.
+  the same name is not that service. A peer whose owner uid is 65534 and
+  whose executable cannot be read cannot be verified because of namespace
+  mapping; the exemption is refused, and that peer is not described as a
+  different service. A partial membership reply, including one that
+  returns the primary gid and then fails, is not absence.
   That service supplies UID=GID accounts and no supplementary memberships.
   Additional providers, including homed and the multiplexer, refuse this
   exemption even when their lookups succeed. Use directories without

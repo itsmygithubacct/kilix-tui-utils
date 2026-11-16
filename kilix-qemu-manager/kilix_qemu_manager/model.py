@@ -213,19 +213,31 @@ USERDB_RECORDS = ("/etc/userdb", "/run/userdb", "/run/host/userdb",
 
 
 def _read_database(path: str, limit: int) -> str:
-    """A bounded whole regular file. A short read is never an accepted prefix."""
-    with open(path, "rb") as handle:
-        info = os.fstat(handle.fileno())
+    """A bounded whole regular file. A short read is never an accepted prefix.
+
+    Open non-blocking and refuse a non-regular file before reading. A FIFO
+    otherwise waits for a writer, and the check hangs instead of refusing.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    handle = None
+    try:
+        info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"{path} is not a regular file")
         if info.st_size > limit:
             raise ValueError(f"{path} exceeds the {limit}-byte limit")
+        # The descriptor stays owned here. fdopen must not close it too.
+        handle = os.fdopen(fd, "rb", closefd=False)
         # Cap the read. A file that grows or returns early does not match
         # the size seen on open, so the caller refuses instead of parsing
         # a prefix.
         data = handle.read(limit + 1)
         if len(data) != info.st_size or handle.read(1):
             raise ValueError(f"{path} changed while it was read")
+    finally:
+        if handle is not None:
+            handle.close()
+        os.close(fd)
     if b"\0" in data:
         raise ValueError(f"{path} contains NUL")
     return data.decode("utf-8")
@@ -283,7 +295,9 @@ def _dynamic_user_peer_problem(path: str) -> str:
     """'' when `path` is not a socket or is the installed systemd service.
 
     Anything else, including a socket this user is serving, is not a
-    membership authority. A failed inspection is a refusal.
+    membership authority. A failed inspection is a refusal. A peer seen as
+    uid 65534 with an unreadable executable cannot be checked through user
+    namespace mapping; that refuses too, and it is not some other service.
     """
     try:
         info = os.stat(path)
@@ -303,6 +317,9 @@ def _dynamic_user_peer_problem(path: str) -> str:
     finally:
         sock.close()
     pid, uid, _gid = struct.unpack("iii", cred)
+    if uid == 65534 and not _resolved_exe(pid):
+        return (f"{path} cannot be verified because of namespace mapping "
+                "(owner uid 65534, exe unreadable)")
     if _stock_userdb_peer(pid, uid):
         return ""
     return f"{path} is not served by the installed systemd userdb"
