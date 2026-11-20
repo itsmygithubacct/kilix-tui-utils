@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+# Launchers from install.sh point at the checkout. The package copies the
+# tree and rewrites those paths to /usr/share/kilix-tui-utils. Developer
+# installs are unchanged.
+
+SHARE := debian/kilix-tui-utils/usr/share/kilix-tui-utils
+PREFIX := $(CURDIR)/debian/kilix-tui-utils/usr
+
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -d $(SHARE)
+	cp -a src tools kilix-tui kilix-qemu-manager kilix-virtualbox-manager VERSION $(SHARE)/
+	find $(SHARE) -depth -name __pycache__ -type d -exec rm -rf {} +
+	find $(SHARE) -type f -name '*.pyc' -delete
+	KILIX_TUI_UTILS_PREFIX=$(PREFIX) \
+	KILIX_TUI_UTILS_RELOCATABLE=0 \
+	KILIX_TUI_UTILS_SYNC_MENU=0 \
+	./install.sh
+	python3 packaging/rewrite-launchers.py $(CURDIR) $(PREFIX)/bin

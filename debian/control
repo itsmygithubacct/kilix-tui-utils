@@ -1,0 +1,17 @@
+Source: kilix-tui-utils
+Section: utils
+Priority: optional
+Maintainer: itsmygithubacct <itsmygithubacct@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Homepage: https://github.com/itsmygithubacct/kilix-tui-utils
+Vcs-Git: https://github.com/itsmygithubacct/kilix-tui-utils.git
+Vcs-Browser: https://github.com/itsmygithubacct/kilix-tui-utils
+Rules-Requires-Root: no
+
+Package: kilix-tui-utils
+Architecture: all
+Depends: python3, ${misc:Depends}
+Description: Kilix terminal utilities
+ Terminal tools for files, the system, sessions, and the small desktop
+ centers. Each command runs the copy installed under /usr/share/kilix-tui-utils.

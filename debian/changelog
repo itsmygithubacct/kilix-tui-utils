@@ -1,0 +1,6 @@
+kilix-tui-utils (0.3.1+packaging1) UNRELEASED; urgency=medium
+
+  * Install the utilities under /usr/share/kilix-tui-utils and their commands
+    under /usr/bin. The commands call that copy. Developer installs are unchanged.
+
+ -- itsmygithubacct <itsmygithubacct@users.noreply.github.com>  Fri, 20 Nov 2026 06:08:35 +0000
