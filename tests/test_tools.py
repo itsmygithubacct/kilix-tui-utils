@@ -71,13 +71,17 @@ class ToolContractTests(unittest.TestCase):
         for name in TOOLS:
             with self.subTest(tool=name):
                 module = load(name)
+                state = make_state(module)
                 frame = app.render_to_text(
-                    module.render, make_state(module),
-                    height=24, width=100,
+                    module.render, state, height=24, width=100,
                 )
                 lines = frame.splitlines()
                 self.assertIn("KILIX TUI", lines[0])
-                self.assertIn("▶1", lines[1])
+                # Rollout Resume opens Agents on first use to offer installation.
+                tab = 2 if name == "rollout_resume" and not any(
+                    agent["installed"] for agent in state.agents
+                ) else 1
+                self.assertIn(f"▶{tab}", lines[1])
                 self.assertTrue(lines[2].startswith("─"))
                 self.assertNotIn(" // ", frame)
 
