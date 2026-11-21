@@ -1,3 +1,9 @@
+kilix-tui-utils (0.3.1+packaging2) UNRELEASED; urgency=medium
+
+  * Support noninteractive volume and default-output commands from Kilix Ask.
+
+ -- itsmygithubacct <itsmygithubacct@users.noreply.github.com>  Sat, 21 Nov 2026 01:20:43 +0000
+
 kilix-tui-utils (0.3.1+packaging1) UNRELEASED; urgency=medium
 
   * Install the utilities under /usr/share/kilix-tui-utils and their commands

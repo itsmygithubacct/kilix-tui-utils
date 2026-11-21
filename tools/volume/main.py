@@ -4,81 +4,71 @@ Replaces the pulsemixer dependency the chrome volume item currently shells out
 to. Supports both PipeWire and PulseAudio through whichever control command is
 present, and degrades to a clear message rather than an exception when neither
 is.
+
+Bare invocation, --compact, --settings, and --full open the mixer. Screenshot
+mode writes one frame and exits. get, set, mute, unmute, and sinks read or
+change the default sink without opening the mixer.
 """
 from __future__ import annotations
 
 import curses
-import subprocess
-
 import os
 import sys
 
-sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "src"))
+_TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.join(os.path.dirname(os.path.dirname(_TOOL_DIR)), "src")
+sys.path.insert(0, _TOOL_DIR)
+sys.path.insert(0, _SRC)
 
 from kilix_tui import app, keys as keymap, proc, shell  # noqa: E402
+from kilix_volume import cli as volume_cli  # noqa: E402
+from kilix_volume import control as backend  # noqa: E402
 
-CONTROLS = ("pactl", "wpctl")
+CONTROLS = backend.CONTROLS
 
 
 def control() -> str | None:
-    for name in CONTROLS:
-        from shutil import which
-        if which(name):
-            return name
-    return None
-
-
-def _pactl(args: list[str]) -> str:
-    try:
-        return subprocess.run(["pactl", *args], capture_output=True, text=True,
-                              timeout=10, check=False).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    return backend.which_control()
 
 
 def sinks() -> list[dict[str, object]]:
+    try:
+        found = backend.sinks()
+    except backend.VolumeError:
+        return []
     rows: list[dict[str, object]] = []
-    default = _pactl(["get-default-sink"]).strip()
-    current: dict[str, object] | None = None
-    for line in _pactl(["list", "sinks"]).splitlines():
-        text = line.strip()
-        if text.startswith("Sink #"):
-            current = {"index": text.split("#", 1)[1], "name": "",
-                       "description": "", "volume": 0, "muted": False}
-            rows.append(current)
-        elif current is None:
-            continue
-        elif text.startswith("Name:"):
-            current["name"] = text.split(":", 1)[1].strip()
-            current["default"] = current["name"] == default
-        elif text.startswith("Description:"):
-            current["description"] = text.split(":", 1)[1].strip()
-        elif text.startswith("Mute:"):
-            current["muted"] = "yes" in text
-        elif text.startswith("Volume:") and "%" in text:
-            for token in text.split():
-                if token.endswith("%"):
-                    try:
-                        current["volume"] = int(token.rstrip("%"))
-                    except ValueError:
-                        pass
-                    break
+    for sink in found:
+        target = sink.target or sink.name
+        rows.append({
+            "index": target,
+            "name": target,
+            "description": sink.description or sink.name or target,
+            "volume": sink.percent,
+            "muted": sink.muted,
+            "default": sink.default,
+        })
     return rows
 
 
 def set_volume(name: str, percent: int) -> None:
-    percent = max(0, min(150, percent))
-    _pactl(["set-sink-volume", name, f"{percent}%"])
+    try:
+        backend.set_target(name, percent)
+    except backend.VolumeError:
+        return
 
 
 def toggle_mute(name: str) -> None:
-    _pactl(["set-sink-mute", name, "toggle"])
+    try:
+        backend.toggle_mute(name)
+    except backend.VolumeError:
+        return
 
 
 def make_default(name: str) -> None:
-    _pactl(["set-default-sink", name])
+    try:
+        backend.set_default(name)
+    except backend.VolumeError:
+        return
 
 
 class State:
@@ -122,7 +112,7 @@ def render(surface, state: State) -> None:
         shell.put(surface, body.top, body.left,
                   "No PulseAudio or PipeWire control command found.")
         shell.put(surface, body.top + 1, body.left,
-                  "Install pulseaudio-utils (pactl).",
+                  "Install pulseaudio-utils (pactl) or wireplumber (wpctl).",
                   shell.tango.attr("muted"))
         return
     row = body.top
@@ -260,6 +250,8 @@ def handle(key: int, state: State) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if volume_cli.command_requested(argv):
+        return volume_cli.main(argv)
     mode = "settings" if "--settings" in argv else (
         "compact" if "--compact" in argv else "full")
     state = State(mode)

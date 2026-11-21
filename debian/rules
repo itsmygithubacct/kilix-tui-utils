@@ -16,6 +16,7 @@ override_dh_auto_test:
 override_dh_auto_install:
 	install -d $(SHARE)
 	cp -a src tools kilix-tui kilix-qemu-manager kilix-virtualbox-manager VERSION $(SHARE)/
+	rm -rf $(SHARE)/tools/volume/tests
 	find $(SHARE) -depth -name __pycache__ -type d -exec rm -rf {} +
 	find $(SHARE) -type f -name '*.pyc' -delete
 	KILIX_TUI_UTILS_PREFIX=$(PREFIX) \
